@@ -832,9 +832,16 @@ fn mark(this: This, heap: This, kind: u32, index: u32, begin: bool) {
     #[cfg(windows)]
     if matches!(kind, OCCLUSION | BINARY)
         && let Some(list) = host_list(this)
-        && let Some((host, query)) = crate::query::host(heap)
+        // The query type is the title's argument; the heap only says whether
+        // it measures on the host (`crate::query::host`).
+        && let Some((host, query)) = crate::query::host(heap, kind, index)
     {
-        // SAFETY: an open list and the quarter the heap was made with.
+        // A mark the host would refuse (an end without a begin) is not
+        // recorded, so the resolve does not read a query it never ended.
+        if crate::query::mark(heap, index, begin).is_none() {
+            return;
+        }
+        // SAFETY: an open list and the heap the query belongs to.
         unsafe {
             if begin {
                 list.list.BeginQuery(&host, query, index);
@@ -879,7 +886,11 @@ pub(crate) extern "system" fn resolve_queries(
     #[cfg(windows)]
     if measured
         && let Some(list) = host_list(this)
-        && let Some((host, query)) = crate::query::host(heap)
+        // Every index has to be inside the heap and ended: D3D12 refuses to
+        // resolve an open query, and one never marked has no value to read.
+        && let Some((host, query)) = crate::query::host(heap, kind, first)
+        && crate::query::count(heap).is_some_and(|n| first.saturating_add(count) <= n)
+        && crate::query::resolved(heap, first, count).is_some()
         && let Some(readback) =
             crate::host::host().and_then(|h| h.readback_buffer(u64::from(count.max(1)) * 8))
     {

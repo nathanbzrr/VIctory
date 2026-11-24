@@ -2529,6 +2529,26 @@ mod tests {
             "the rest of the buffer stays untouched"
         );
 
+        // The heap type is not a query type: a timestamp heap measures
+        // nothing on the host, and an occlusion query on it is refused.
+        if let Some(stamps) = crate::query::occlusion_for_test(1 /* TIMESTAMP heap */, COUNT) {
+            assert!(
+                crate::query::host(stamps, OCCLUSION, 0).is_none(),
+                "a timestamp heap takes no occlusion query"
+            );
+        }
+        // A query that was never ended is not resolved, and neither is one
+        // outside the heap: D3D12 refuses both, and the readback of a query
+        // never run has no value to write into title memory.
+        assert!(
+            crate::query::resolved(heap, 0, 1).is_none(),
+            "a query never marked has no value"
+        );
+        assert!(
+            crate::query::host(heap, OCCLUSION, COUNT).is_none(),
+            "an index at the count is outside the heap"
+        );
+
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
