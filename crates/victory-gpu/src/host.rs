@@ -650,6 +650,14 @@ enum Step {
     Memory(usize),
 }
 
+/// A piece of a query result: the title's address, the offset it has in
+/// the read-back buffer, and its width.
+type Target = (usize, u64, usize);
+
+/// A read-back buffer and the pieces of its resolved queries that go back
+/// into the title's memory.
+type Resolved = (ID3D12Resource, Vec<Target>);
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -670,6 +678,10 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Query results the list resolved into a read-back buffer, written to
+    /// the title's memory once the list has run: the buffer, then each
+    /// (destination, offset in the buffer, bytes).
+    resolves: Vec<Resolved>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
@@ -1005,6 +1017,41 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
         for list in runs {
+            // Query results first: a bottom-of-pipe write may name the same
+            // memory (a buffer the title both resolves into and advances).
+            for (readback, targets) in &list.deferred().resolves {
+                let mut data = std::ptr::null_mut();
+                let end = targets
+                    .iter()
+                    .map(|&(_, offset, bytes)| offset + bytes as u64)
+                    .max()
+                    .unwrap_or(0);
+                let range = D3D12_RANGE {
+                    Begin: 0,
+                    End: end as usize,
+                };
+                // SAFETY: a read-back buffer the finished list resolved
+                // into; `end` is inside it (the resolve checked the
+                // title's own buffer, and the buffer was made that size).
+                if unsafe { readback.Map(0, Some(&range), Some(&mut data)) }.is_err() {
+                    continue;
+                }
+                for &(at, offset, bytes) in targets {
+                    // SAFETY: reading a u64 at a checked offset of the
+                    // mapped buffer, and writing into title memory.
+                    unsafe {
+                        let value =
+                            std::ptr::read_unaligned(data.add(offset as usize).cast::<u64>());
+                        if bytes == 4 {
+                            (at as *mut u32).write_unaligned(value as u32);
+                        } else {
+                            (at as *mut u64).write_unaligned(value);
+                        }
+                    }
+                }
+                // SAFETY: the same buffer, unmapped once.
+                unsafe { readback.Unmap(0, None) };
+            }
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
@@ -1684,6 +1731,18 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
+    /// Records that the list resolved query results into `readback`, and
+    /// that each (destination, offset, bytes) of `targets` is written from
+    /// it once the list has run. The buffer is kept until the list is
+    /// reset, because its contents are only valid after the wait.
+    pub(crate) fn defer_resolve(
+        &self,
+        readback: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        targets: Vec<Target>,
+    ) {
+        self.deferred().resolves.push((readback, targets));
+    }
+
     /// A mapped upload buffer of `size` bytes, alive until the list is
     /// reset.
     ///
@@ -2252,6 +2311,48 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
+                None
+            }
+        }
+    }
+
+    /// A buffer in the read-back heap, not mapped: what the GPU resolved
+    /// into it is read after the submission that filled it has finished.
+    pub(crate) fn readback_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(8),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a read-back buffer; nothing maps it
+        // until the submission that resolved into it has finished.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no read-back buffer");
                 None
             }
         }

@@ -816,22 +816,50 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
     }
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+/// `BeginQuery`/`EndQuery(heap, type, index)`: an occlusion query marks the
+/// host list between the two, so the draws in between are what it counts.
+pub(crate) extern "system" fn query_begin(this: This, heap: This, kind: u32, index: u32) {
+    mark(this, heap, kind, index, true);
+}
+
+pub(crate) extern "system" fn query_end(this: This, heap: This, kind: u32, index: u32) {
+    mark(this, heap, kind, index, false);
+}
+
+fn mark(this: This, heap: This, kind: u32, index: u32, begin: bool) {
+    const OCCLUSION: u32 = 0;
+    const BINARY: u32 = 1;
+    #[cfg(windows)]
+    if matches!(kind, OCCLUSION | BINARY)
+        && let Some(list) = host_list(this)
+        && let Some((host, query)) = crate::query::host(heap)
+    {
+        // SAFETY: an open list and the quarter the heap was made with.
+        unsafe {
+            if begin {
+                list.list.BeginQuery(&host, query, index);
+            } else {
+                list.list.EndQuery(&host, query, index);
+            }
+        }
+        return;
+    }
+    let _ = (this, heap, kind, index, begin);
+}
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
-/// each query's result into the buffer once the list has run. Timestamps
-/// (type 2) are the GPU clock then; occlusion counts (0) say a million
-/// samples passed and binary occlusion (1) visible, so nothing is culled
-/// by a query.
-/// shortcut: no query runs on the host GPU; results are plausible values,
-/// not measured ones (time spans come out as the submission's length).
-extern "system" fn resolve_queries(
+/// each query's result into the buffer once the list has run. Occlusion
+/// counts and binary occlusion are resolved on the host into a read-back
+/// buffer, so the title reads what its draws actually passed; timestamps
+/// (type 2) are the GPU clock then, and pipeline statistics are zero.
+/// shortcut: no query of the other kinds runs on the host GPU; results
+/// are plausible values, not measured ones (time spans come out as the
+/// submission's length).
+pub(crate) extern "system" fn resolve_queries(
     this: This,
-    _heap: This,
+    heap: This,
     kind: u32,
-    _first: u32,
+    first: u32,
     count: u32,
     buffer: This,
     offset: u64,
@@ -843,6 +871,31 @@ extern "system" fn resolve_queries(
     let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
         return;
     };
+    // Occlusion results are one 64-bit count each.
+    let measured = matches!(kind, OCCLUSION | BINARY)
+        && offset
+            .checked_add(u64::from(count) * 8)
+            .is_some_and(|end| end <= size);
+    #[cfg(windows)]
+    if measured
+        && let Some(list) = host_list(this)
+        && let Some((host, query)) = crate::query::host(heap)
+        && let Some(readback) =
+            crate::host::host().and_then(|h| h.readback_buffer(u64::from(count.max(1)) * 8))
+    {
+        // SAFETY: an open list, our heap and a buffer made for exactly
+        // these results, in the state a resolve needs.
+        unsafe {
+            list.list
+                .ResolveQueryData(&host, query, first, count, &readback, 0);
+        }
+        let targets = (0..u64::from(count))
+            .map(|i| (data as usize + (offset + i * 8) as usize, i * 8, 8usize))
+            .collect();
+        list.defer_resolve(readback, targets);
+        return;
+    }
+    let _ = (this, heap, measured);
     let (what, bytes) = match kind {
         OCCLUSION => (Written::Value(1 << 20), 8),
         BINARY => (Written::Value(1), 8),
@@ -859,9 +912,9 @@ extern "system" fn resolve_queries(
     for i in 0..u64::from(count) {
         // Wider results are written as 8-byte pieces.
         for piece in 0..bytes / 8 {
+            let what = if piece == 0 { what } else { Written::Value(0) };
             // SAFETY: inside the buffer, checked above.
             let at = unsafe { data.add((offset + i * bytes + piece * 8) as usize) };
-            let what = if piece == 0 { what } else { Written::Value(0) };
             defer_write(this, at as u64, what, 8);
         }
     }
@@ -1480,8 +1533,8 @@ const MORE_METHODS: [(usize, *const ()); 12] = [
     (53, state::clear_unordered_uint as *const ()), // 0x1a8
     (54, state::clear_unordered_float as *const ()), // 0x1b0
     (55, ignored_state as *const ()),               // 0x1b8 DiscardResource
-    (28, query_mark as *const ()),                  // 0xe0 BeginQuery
-    (29, query_mark as *const ()),                  // 0xe8 EndQuery
+    (28, query_begin as *const ()),                 // 0xe0 BeginQuery
+    (29, query_end as *const ()),                   // 0xe8 EndQuery
     (30, resolve_queries as *const ()),             // 0xf0
     (78, dispatch_x as *const ()),                  // 0x270
     (98, state::dispatch_mesh_x as *const ()),      // 0x310
