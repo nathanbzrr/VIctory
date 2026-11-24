@@ -2720,8 +2720,16 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
-        if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
-            return self.code_smem(inst, a);
+        if let Some(a) = self.scalar.get(&site).copied() {
+            if a.param == CODE {
+                return self.code_smem(inst, a);
+            }
+            if matches!(
+                self.x.native.layout.get(a.param).map(|p| p.root),
+                Some(RootType::Descriptor | RootType::Constants)
+            ) {
+                return self.root_smem(inst, site, a);
+            }
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
@@ -3004,6 +3012,101 @@ impl<'a> Lower<'a> {
             let off = self.s.m.i32(4 * k);
             let at = self.s.m.bin(c, Bin::Add, addr, off);
             let x = self.code_dword(at)?;
+            self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+        Ok(())
+    }
+
+    /// `s_load_dword*` from a root descriptor (CBV or SRV) or an address
+    /// passed in two root constants (bound as a raw root SRV so it shares the
+    /// same handle as `global_load_*` without CBV size/alignment limits).
+    fn root_smem(&mut self, inst: &Inst, site: Site, a: Address) -> Result<(), Why> {
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return Err("a scalar load");
+        };
+        let count = match inst.name().strip_prefix("s_load_dword") {
+            Some("") => 1u32,
+            Some("x2") => 2,
+            Some("x4") => 4,
+            Some("x8") => 8,
+            Some("x16") => 16,
+            _ => return Err("a scalar memory access through a root view"),
+        };
+        let rp = self.x.native.layout[a.param];
+        let used_kind = self
+            .x
+            .native
+            .used
+            .iter()
+            .find(|u| u.user_data == rp.user_data)
+            .map(|u| u.kind);
+        let src = Source::Built {
+            address: a,
+            bits: 0,
+            words: [0, 0],
+        };
+        let c = self.cur;
+        // `resource::track` already folded `offset` and `soffset` into `a`.
+        let mut addr = self.s.m.i32(a.offset);
+        if let Some(d) = a.dynamic {
+            let d = self.i32_of(d)?;
+            addr = self.s.m.bin(c, Bin::Add, addr, d);
+        }
+        if matches!(
+            (rp.root, used_kind),
+            (RootType::Descriptor, Some(ResourceType::Cbv) | None)
+        ) {
+            let h = self.handle(site, &src, false, (13, 0x1_0000))?;
+            let mut rows: HashMap<u32, V> = HashMap::new();
+            for k in 0..count {
+                let x = if a.dynamic.is_none() {
+                    let byte = a.offset.wrapping_add(4 * k);
+                    let row = match rows.get(&(byte >> 4)) {
+                        Some(&r) => r,
+                        None => {
+                            let ri = self.s.m.i32(byte >> 4);
+                            let r = self.s.op(
+                                c,
+                                "cbufferLoadLegacy.i32",
+                                Attr::ReadOnly,
+                                self.s.t.cbuf_ret,
+                                59,
+                                &[h, ri],
+                            );
+                            rows.insert(byte >> 4, r);
+                            r
+                        }
+                    };
+                    self.s.m.extract(c, row, (byte >> 2) & 3)
+                } else {
+                    let off = self.s.m.i32(4 * k);
+                    let at = self.s.m.bin(c, Bin::Add, addr, off);
+                    self.cbuffer_dword(h, at)
+                };
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
+        let h = self.handle(site, &src, false, (11, 0))?;
+        for k in 0..count {
+            let off = self.s.m.i32(4 * k);
+            let at = self.s.m.bin(c, Bin::Add, addr, off);
+            let mask = self.s.m.i8(1);
+            let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, at, u, mask, al],
+            );
+            let x = self.s.m.extract(c, r, 0);
+            let x = self.as_int(x);
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
@@ -6733,5 +6836,214 @@ mod tests {
         assert_eq!(buffer_format(0), None);
         assert_eq!(buffer_format(36), None);
         assert_eq!(buffer_format(78), None);
+    }
+
+    #[test]
+    fn scalar_load_from_two_root_constants_shares_root_srv_with_global_load() {
+        // Root constants at user data 8 (slot 3): s9 (dword 1) is a dynamic byte offset,
+        // s[10:11] holds a 64-bit buffer address (dwords 2 and 3). Both
+        // `s_load_dword*` and `global_load_dword` share the same raw root SRV.
+        let words = [
+            0xF408_0005,
+            0xFA00_0010, // s_load_dwordx4 s[0:3], s[10:11], 0x10
+            0xF400_0105,
+            0x1200_0000, // s_load_dword s4, s[10:11], s9
+            0x7E00_0280, // v_mov_b32 v0, 0
+            (0x37 << 26) | (0x0C << 18) | (2 << 14) | 0x20,
+            (1 << 24) | (10 << 16), // global_load_dword v1, v0, s[10:11] offset:0x20
+            (0x25 << 25) | (1 << 17) | (1 << 9), // v_add_nc_u32 v1, s0, v1
+            (0x25 << 25) | (1 << 17) | (1 << 9) | 4, // v_add_nc_u32 v1, s4, v1
+            0x7D84_0280,            // v_cmp_eq_u32 vcc, 0, v1
+            0xBF87_0001,            // s_cbranch_vccnz -> s_endpgm
+            0xBE85_0380,            // s_mov_b32 s5, 0
+            S_ENDPGM,
+        ];
+        let constants = crate::native::RootParam {
+            root: crate::native::RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 8,
+            slot: 3,
+        };
+        let l = lowered(&words, vec![constants]).unwrap();
+        let view = super::RootView {
+            slot: 3,
+            dword: Some(2),
+        };
+        assert_eq!(l.root_srvs, [view.register()]);
+        assert!(l.root_cbvs.is_empty());
+        #[cfg(windows)]
+        {
+            use super::super::validator::Validator;
+            let mut dxil = l.dxil.clone();
+            if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
+                v.validate(&mut dxil).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_load_from_root_descriptor_selects_srv_or_cbv_and_refuses_uav_and_store() {
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+
+        let run =
+            |words: &[u32], layout: Vec<RootParam>, used: Vec<UsedResource>, user_sgprs: u32| {
+                let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                let native = NativeProgram {
+                    stage: HwStage::Cs,
+                    wave64: false,
+                    vgprs: 256,
+                    layout,
+                    used,
+                    io: StageIo::Cs(ComputeIo {
+                        rsrc2: user_sgprs << 1,
+                        threads: [1, 1, 1],
+                    }),
+                    code,
+                };
+                let p = ir::build(&native.code, false, 256).unwrap();
+                let res = resource::track(&p, &native.layout, native.stage).unwrap();
+                let io = io::raise(&p, &native).unwrap();
+                let st = structure::structure(&p).unwrap();
+                lower(&Parts {
+                    native: &native,
+                    p: &p,
+                    st: &st,
+                    io: &io,
+                    res: &res,
+                    inputs: vec![],
+                    outputs: vec![],
+                    prims: vec![],
+                    mesh_stride: 0,
+                })
+            };
+
+        let layout = vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 6,
+                slot: 4,
+            },
+        ];
+
+        // (a) Root CBV descriptor: s_load_dwordx2 (const offset) + s_load_dword (dynamic soffset s5, dword 1).
+        let cbv_words = [
+            0xF404_0003,
+            0xFA00_0010, // s_load_dwordx2 s[0:1], s[6:7], 0x10
+            0xF400_0083,
+            0x0A00_0000, // s_load_dword s2, s[6:7], s5
+            0x8000_0200, // s_add_u32 s0, s0, s2
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        let cbv_used = vec![UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 2,
+            user_data: 6,
+            slot: 4,
+        }];
+        let cbv = run(&cbv_words, layout.clone(), cbv_used, 8).unwrap();
+        assert_eq!(cbv.root_cbvs, [4]);
+        assert!(cbv.root_srvs.is_empty());
+
+        // (b) Root SRV descriptor: s_load_dwordx4.
+        let srv_words = [
+            0xF408_0003,
+            0xFA00_0020, // s_load_dwordx4 s[0:3], s[6:7], 0x20
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE85_0380, // s_mov_b32 s5, 0
+            S_ENDPGM,
+        ];
+        let srv_used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 2,
+            user_data: 6,
+            slot: 4,
+        }];
+        let srv = run(&srv_words, layout.clone(), srv_used, 8).unwrap();
+        assert_eq!(srv.root_srvs, [4]);
+        assert!(srv.root_cbvs.is_empty());
+
+        #[cfg(windows)]
+        {
+            use super::super::validator::Validator;
+            if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
+                for mut dxil in [cbv.dxil, srv.dxil] {
+                    v.validate(&mut dxil).unwrap();
+                }
+            }
+        }
+
+        // (c) Root UAV descriptor: still refused.
+        let uav_words = [
+            0xF400_0003,
+            0xFA00_0000, // s_load_dword s0, s[6:7], null
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE81_0380, // s_mov_b32 s1, 0
+            S_ENDPGM,
+        ];
+        let uav_used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 2,
+            user_data: 6,
+            slot: 4,
+        }];
+        assert!(matches!(
+            run(&uav_words, layout, uav_used, 8),
+            Err(crate::ShaderError::Unsupported {
+                what: "a root UAV or typed root view",
+                ..
+            })
+        ));
+
+        // (d) s_store_dword through root constants: refused.
+        let store_words = [
+            0xF440_0205,
+            0xFA00_0000, // s_store_dword s8, s[10:11], null
+            S_ENDPGM,
+        ];
+        let store_layout = vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 8,
+            slot: 3,
+        }];
+        assert!(matches!(
+            run(&store_words, store_layout, vec![], 12),
+            Err(crate::ShaderError::Unsupported {
+                what: "a scalar memory access through a root view",
+                ..
+            })
+        ));
     }
 }

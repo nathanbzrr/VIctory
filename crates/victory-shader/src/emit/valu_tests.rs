@@ -673,3 +673,316 @@ fn bfe_signed_and_unsigned_match_rdna2() {
         );
     });
 }
+
+/// SMEM `s_load_dword{,x2}`: `op = 0` (`s_load_dword`) or `1` (`x2`), `soffset = 125` for null.
+const fn smem_load(op: u32, dst: u8, base: u8, soffset: u8, offset: u32) -> [u32; 2] {
+    [
+        (0x3D << 26)
+            | ((op & 0xFF) << 18)
+            | ((dst as u32 & 0x7F) << 6)
+            | ((base as u32 >> 1) & 0x3F),
+        ((soffset as u32 & 0x7F) << 25) | (offset & 0x1F_FFFF),
+    ]
+}
+
+/// GLOBAL `global_load_dword vdst, vaddr, s[saddr:saddr+1] offset:offset`.
+const fn global_load_dword(vdst: u8, vaddr: u8, saddr: u8, offset: u16) -> [u32; 2] {
+    [
+        (0x37 << 26) | (0x0C << 18) | (2 << 14) | (offset as u32 & 0xFFF),
+        ((vdst as u32) << 24) | ((saddr as u32 & 0x7F) << 16) | vaddr as u32,
+    ]
+}
+
+fn build_root_smem_cs(
+    body: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+    user_sgprs: u32,
+) -> HostShader {
+    let mut words = Vec::new();
+    // Output UAV descriptor at heap index 0 via table root parameter in s0.
+    words.push(s_mov_b32(1, 0x80)); // inline constant 0
+    words.extend_from_slice(&s_load_dwordx4(8, 0));
+    words.extend_from_slice(body);
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: user_sgprs << 1,
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let st = structure::structure(&p).expect("structure");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    shader
+}
+
+#[test]
+fn root_view_scalar_loads_execute_correctly() {
+    let uav_table = RootParam {
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: 0,
+        slot: 0,
+    };
+    let uav_used = UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    };
+
+    let run_case = |name: &str,
+                    shader: &HostShader,
+                    dynamic_offset: u32,
+                    const_slot: u8,
+                    srv: bool,
+                    data: Vec<u32>,
+                    want: &[u32]| {
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("{name}: no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{name} ({label}): compute_pipeline failed: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot, u.dword) {
+                    (RootType::Table, 0, _) => 0,
+                    (RootType::Constants, s, 1) if s == const_slot => dynamic_offset,
+                    (RootType::Constants, s, _) if s == const_slot => 0,
+                    other => panic!("{name}: unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::View {
+                                    srv,
+                                    data: data.clone(),
+                                },
+                            ),
+                        ],
+                        views: &[View::RawUav(want.len() as u32)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{name} ({label}): dispatch failed: {e}"));
+            assert_eq!(out[0], want, "{name} ({label})");
+            ran += 1;
+        }
+        assert!(
+            ran > 0,
+            "{name}: neither hardware nor WARP SM 6.6 device available"
+        );
+    };
+
+    // 1. Root-constant address pair in s[4:5] shared by s_load_dwordx2,
+    //    s_load_dword (dynamic soffset s3, dword 1), and global_load_dword.
+    let mut const_pair_body = Vec::new();
+    const_pair_body.extend_from_slice(&smem_load(1, 12, 4, 125, 8)); // s[12:13] = data[2..4]
+    const_pair_body.extend_from_slice(&smem_load(0, 14, 4, 3, 0)); // s14 = data[s3 / 4]
+    const_pair_body.push(vop1(0x001, 2, 0x80)); // v_mov_b32 v2, 0
+    const_pair_body.extend_from_slice(&global_load_dword(3, 2, 4, 28)); // v3 = data[7]
+    const_pair_body.push(vop1(0x001, 0, sgpr(12)));
+    const_pair_body.push(vop1(0x001, 1, sgpr(13)));
+    const_pair_body.push(vop1(0x001, 2, sgpr(14)));
+    const_pair_body.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    const_pair_body.extend_from_slice(&buffer_store_dword(1, 8, 4));
+    const_pair_body.extend_from_slice(&buffer_store_dword(2, 8, 8));
+    const_pair_body.extend_from_slice(&buffer_store_dword(3, 8, 12));
+
+    let const_pair_shader = build_root_smem_cs(
+        &const_pair_body,
+        vec![
+            uav_table,
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 2,
+                slot: 1,
+            },
+        ],
+        vec![uav_used],
+        6,
+    );
+    assert_eq!(
+        const_pair_shader.root_srvs,
+        [super::RootView {
+            slot: 1,
+            dword: Some(2),
+        }
+        .register()]
+    );
+    assert!(const_pair_shader.root_cbvs.is_empty());
+    run_case(
+        "root_constants_smem_and_global_shared",
+        &const_pair_shader,
+        20,
+        1,
+        true,
+        vec![10, 20, 30, 40, 50, 60, 70, 80],
+        &[30, 40, 60, 80],
+    );
+
+    // 2. Root SRV descriptor in s[4:5].
+    let mut root_desc_body = Vec::new();
+    root_desc_body.extend_from_slice(&smem_load(1, 12, 4, 125, 4)); // s[12:13] = data[1..3]
+    root_desc_body.extend_from_slice(&smem_load(0, 14, 4, 3, 0)); // s14 = data[s3 / 4]
+    root_desc_body.push(vop1(0x001, 0, sgpr(12)));
+    root_desc_body.push(vop1(0x001, 1, sgpr(13)));
+    root_desc_body.push(vop1(0x001, 2, sgpr(14)));
+    root_desc_body.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    root_desc_body.extend_from_slice(&buffer_store_dword(1, 8, 4));
+    root_desc_body.extend_from_slice(&buffer_store_dword(2, 8, 8));
+
+    let root_desc_layout = vec![
+        uav_table,
+        RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 2,
+            slot: 1,
+        },
+        RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 4,
+            slot: 2,
+        },
+    ];
+    let root_srv_shader = build_root_smem_cs(
+        &root_desc_body,
+        root_desc_layout.clone(),
+        vec![
+            uav_used,
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 2,
+                user_data: 4,
+                slot: 2,
+            },
+        ],
+        6,
+    );
+    assert_eq!(root_srv_shader.root_srvs, [2]);
+    assert!(root_srv_shader.root_cbvs.is_empty());
+    run_case(
+        "root_srv_smem",
+        &root_srv_shader,
+        16,
+        1,
+        true,
+        vec![11, 22, 33, 44, 55, 66],
+        &[22, 33, 55],
+    );
+
+    // 3. Root CBV descriptor in s[4:5] (constant offset -> cbufferLoadLegacy,
+    //    dynamic soffset -> cbuffer_dword).
+    let mut root_cbv_body = Vec::new();
+    root_cbv_body.extend_from_slice(&smem_load(1, 12, 4, 125, 16)); // s[12:13] = data[4..6]
+    root_cbv_body.extend_from_slice(&smem_load(0, 14, 4, 3, 0)); // s14 = data[s3 / 4]
+    root_cbv_body.push(vop1(0x001, 0, sgpr(12)));
+    root_cbv_body.push(vop1(0x001, 1, sgpr(13)));
+    root_cbv_body.push(vop1(0x001, 2, sgpr(14)));
+    root_cbv_body.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    root_cbv_body.extend_from_slice(&buffer_store_dword(1, 8, 4));
+    root_cbv_body.extend_from_slice(&buffer_store_dword(2, 8, 8));
+
+    let root_cbv_shader = build_root_smem_cs(
+        &root_cbv_body,
+        root_desc_layout,
+        vec![
+            uav_used,
+            UsedResource {
+                kind: ResourceType::Cbv,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 2,
+                user_data: 4,
+                slot: 2,
+            },
+        ],
+        6,
+    );
+    assert_eq!(root_cbv_shader.root_cbvs, [2]);
+    assert!(root_cbv_shader.root_srvs.is_empty());
+    let cbv_data: Vec<u32> = (0..64).map(|i| 100 + i * 7).collect();
+    run_case(
+        "root_cbv_smem",
+        &root_cbv_shader,
+        28,
+        1,
+        false,
+        cbv_data,
+        &[100 + 4 * 7, 100 + 5 * 7, 100 + 7 * 7],
+    );
+}
