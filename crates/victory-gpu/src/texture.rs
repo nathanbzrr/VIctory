@@ -53,7 +53,7 @@ pub(crate) struct Staging {
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not tracked), with room to read tracked memory into.
+/// (memory not tracked), with room to copy title memory into.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
@@ -299,6 +299,9 @@ impl Staging {
     /// Returns the bytes of title memory read, and whether it detiled.
     fn refresh_now(&self) -> (usize, bool) {
         let size = self.layout.size as usize;
+        if size == 0 {
+            return (0, false);
+        }
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
@@ -315,7 +318,10 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return (size, true);
         }
-        if !committed(self.memory, size) {
+        last.read.resize(size, 0);
+        let resident = read_mapped(self.memory, &mut last.read);
+        if resident == 0 {
+            last.hash = None;
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -325,19 +331,17 @@ impl Staging {
             );
             return (0, false);
         }
-        // SAFETY: committed memory of the texture's layout size.
-        let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = blake3::hash(&last.read);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        crate::copystat::add(crate::copystat::C::TexHashed, resident as u64);
         if last.hash == Some(hash) {
-            return (size, false);
+            return (resident, false);
         }
         last.hash = Some(hash);
-        self.detile(tiled);
+        self.detile(&last.read);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        (size, true)
+        crate::copystat::add(crate::copystat::C::TexChanged, resident as u64);
+        (resident, true)
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
@@ -382,6 +386,87 @@ fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64)
         .saturating_mul(depth as usize);
     let remaining = usize::try_from(total.saturating_sub(offset)).unwrap_or(usize::MAX);
     padded.min(remaining)
+}
+
+/// Copies committed, readable regions of `[src, src + dst.len())` into `dst`,
+/// zeroing unreadable gaps, and returns how many bytes were read.
+///
+/// The fast path copies in one kernel read with no `VirtualQuery` overhead and
+/// avoids the TOCTOU race of reading title memory through a raw slice.
+fn read_mapped(src: *const u8, dst: &mut [u8]) -> usize {
+    if dst.is_empty() {
+        return 0;
+    }
+    if crate::host::read_into(src, dst) {
+        return dst.len();
+    }
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    const PAGE_SIZE: usize = 4096;
+
+    let base = src as usize;
+    let Some(end) = base.checked_add(dst.len()) else {
+        dst.fill(0);
+        return 0;
+    };
+    let mut p = base;
+    let mut resident = 0usize;
+
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            dst[p - base..].fill(0);
+            break;
+        }
+        let region_end = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .min(end);
+        let region_len = region_end.saturating_sub(p);
+        if region_len == 0 {
+            dst[p - base..].fill(0);
+            break;
+        }
+        let offset = p - base;
+        let unreadable = info.Protect == 0 || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0;
+        if info.State != MEM_COMMIT || unreadable {
+            dst[offset..offset + region_len].fill(0);
+            p = region_end;
+            continue;
+        }
+        if crate::host::read_into(p as *const u8, &mut dst[offset..offset + region_len]) {
+            resident += region_len;
+        } else {
+            // Concurrent unmap inside a committed region: fall back to 4 KiB pages.
+            let mut q = p;
+            while q < region_end {
+                let page_end = (q & !(PAGE_SIZE - 1))
+                    .saturating_add(PAGE_SIZE)
+                    .min(region_end);
+                let page_len = page_end.saturating_sub(q);
+                if page_len == 0 {
+                    dst[q - base..offset + region_len].fill(0);
+                    break;
+                }
+                let page_offset = q - base;
+                if crate::host::read_into(
+                    q as *const u8,
+                    &mut dst[page_offset..page_offset + page_len],
+                ) {
+                    resident += page_len;
+                } else {
+                    dst[page_offset..page_offset + page_len].fill(0);
+                }
+                q = page_end;
+            }
+        }
+        p = region_end;
+    }
+
+    resident
 }
 
 /// Whether `[at, at + len)` is committed, readable memory (streamed textures
@@ -519,5 +604,202 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    /// RAII guard for a `VirtualAlloc(..., MEM_RESERVE, ...)` address range.
+    struct VirtualRegion {
+        ptr: *mut u8,
+        len: usize,
+    }
+
+    impl VirtualRegion {
+        fn reserve(len: usize) -> Self {
+            use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc};
+            // SAFETY: reserves uncommitted virtual address space of `len` bytes, released on drop.
+            let ptr = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE, PAGE_NOACCESS) }
+                .cast::<u8>();
+            assert!(!ptr.is_null(), "VirtualAlloc MEM_RESERVE failed");
+            Self { ptr, len }
+        }
+
+        fn commit(&self, offset: usize, len: usize, protect: u32) {
+            use windows_sys::Win32::System::Memory::{MEM_COMMIT, VirtualAlloc};
+            assert!(offset.checked_add(len).is_some_and(|end| end <= self.len));
+            // SAFETY: commits pages within our reserved virtual address range.
+            let ptr =
+                unsafe { VirtualAlloc(self.ptr.add(offset).cast(), len, MEM_COMMIT, protect) };
+            assert!(!ptr.is_null(), "VirtualAlloc MEM_COMMIT failed");
+        }
+
+        fn decommit(&self, offset: usize, len: usize) {
+            use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+            assert!(offset.checked_add(len).is_some_and(|end| end <= self.len));
+            // SAFETY: decommits pages within our reserved virtual address range.
+            let ok = unsafe { VirtualFree(self.ptr.add(offset).cast(), len, MEM_DECOMMIT) };
+            assert_ne!(ok, 0, "VirtualFree MEM_DECOMMIT failed");
+        }
+
+        /// Writes `bytes` at `offset`; caller must ensure `[offset..offset + bytes.len())` is committed.
+        unsafe fn write_slice(&self, offset: usize, bytes: &[u8]) {
+            assert!(
+                offset
+                    .checked_add(bytes.len())
+                    .is_some_and(|end| end <= self.len)
+            );
+            // SAFETY: caller guarantees the destination range is committed and writable.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(offset), bytes.len());
+            }
+        }
+    }
+
+    impl Drop for VirtualRegion {
+        fn drop(&mut self) {
+            use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+            // SAFETY: `self.ptr` was allocated with `VirtualAlloc(..., MEM_RESERVE, ...)` and not yet freed.
+            unsafe { VirtualFree(self.ptr.cast(), 0, MEM_RELEASE) };
+        }
+    }
+
+    #[test]
+    fn read_mapped_handles_unmapped_partial_eviction_and_overflow() {
+        use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READWRITE};
+
+        const TILE: usize = 64 * 1024;
+        const TOTAL: usize = 256 * 1024;
+
+        let mut small = [0xAAu8; 16];
+        assert_eq!(read_mapped(usize::MAX as *const u8, &mut small), 0);
+        assert!(small.iter().all(|&b| b == 0));
+        assert_eq!(read_mapped(std::ptr::null(), &mut []), 0);
+
+        let region = VirtualRegion::reserve(TOTAL);
+        let mut dst = vec![0xAAu8; TOTAL];
+        assert_eq!(read_mapped(region.ptr, &mut dst), 0);
+        assert!(dst.iter().all(|&b| b == 0));
+
+        // Committed `PAGE_NOACCESS` pages must also be treated as unreadable and zeroed.
+        region.commit(0, TILE, PAGE_NOACCESS);
+        dst.fill(0xBB);
+        assert_eq!(read_mapped(region.ptr, &mut dst), 0);
+        assert!(dst.iter().all(|&b| b == 0));
+
+        // Commit tile 0 readable and write data; remaining tiles stay unmapped.
+        region.commit(0, TILE, PAGE_READWRITE);
+        let tile0: Vec<u8> = (0..TILE)
+            .map(|i| ((i * 37 + 11) & 0xff) as u8 | 1)
+            .collect();
+        // SAFETY: `[0..TILE)` was committed read-write above.
+        unsafe { region.write_slice(0, &tile0) };
+        dst.fill(0x55);
+        assert_eq!(read_mapped(region.ptr, &mut dst), TILE);
+        assert_eq!(dst[..TILE], tile0[..]);
+        assert!(dst[TILE..].iter().all(|&b| b == 0));
+
+        // Commit a disjoint tile 2, then evict it: stale bytes in `dst` must be zeroed.
+        region.commit(2 * TILE, TILE, PAGE_READWRITE);
+        let tile2: Vec<u8> = (0..TILE)
+            .map(|i| ((i * 53 + 29) & 0xff) as u8 | 1)
+            .collect();
+        // SAFETY: `[2 * TILE..3 * TILE)` was committed read-write above.
+        unsafe { region.write_slice(2 * TILE, &tile2) };
+        assert_eq!(read_mapped(region.ptr, &mut dst), 2 * TILE);
+        assert_eq!(dst[..TILE], tile0[..]);
+        assert!(dst[TILE..2 * TILE].iter().all(|&b| b == 0));
+        assert_eq!(dst[2 * TILE..3 * TILE], tile2[..]);
+        assert!(dst[3 * TILE..].iter().all(|&b| b == 0));
+
+        region.decommit(2 * TILE, TILE);
+        assert_eq!(read_mapped(region.ptr, &mut dst), TILE);
+        assert_eq!(dst[..TILE], tile0[..]);
+        assert!(dst[TILE..].iter().all(|&b| b == 0));
+
+        // Committing the remaining gaps takes the single-read fast path.
+        region.commit(TILE, 3 * TILE, PAGE_READWRITE);
+        assert_eq!(read_mapped(region.ptr, &mut dst), TOTAL);
+        assert_eq!(dst[..TILE], tile0[..]);
+    }
+
+    #[test]
+    fn untracked_refresh_now_handles_zero_size_partial_residency_and_remap() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+        use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+
+        let tex = Texture::new(&TextureDesc {
+            dimension: Dimension::Tex2d,
+            width: 256,
+            height: 256,
+            depth_or_array: 1,
+            mips: 3,
+            format: DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_S,
+        })
+        .unwrap();
+        let layout = tex.planes[0].layout.clone();
+        let size = layout.size as usize;
+        let region = VirtualRegion::reserve(size);
+        let (buffer, data) = host.upload_buffer(16).unwrap();
+
+        // Zero-sized layout must short-circuit even with a null pointer.
+        let mut zero_layout = layout.clone();
+        zero_layout.size = 0;
+        let zero_staging = Staging {
+            buffer: buffer.clone(),
+            size: 16,
+            data,
+            footprints: Vec::new(),
+            rows: Vec::new(),
+            layout: zero_layout,
+            mips: 3,
+            memory: std::ptr::null(),
+            tracked: None,
+            last: Mutex::default(),
+        };
+        assert_eq!(zero_staging.refresh_now(), (0, false));
+
+        let staging = Staging {
+            buffer,
+            size: 16,
+            data,
+            footprints: Vec::new(),
+            rows: Vec::new(),
+            layout,
+            mips: 3,
+            memory: region.ptr,
+            tracked: None,
+            last: Mutex::default(),
+        };
+
+        assert_eq!(staging.refresh_now(), (0, false));
+
+        region.commit(0, 65536, PAGE_READWRITE);
+        assert_eq!(staging.refresh_now(), (65536, true));
+        assert_eq!(staging.refresh_now(), (65536, false));
+
+        // SAFETY: `[0..65536)` was committed read-write above.
+        unsafe { region.write_slice(0, &[1, 2, 3, 4]) };
+        assert_eq!(staging.refresh_now(), (65536, true));
+        assert_eq!(staging.refresh_now(), (65536, false));
+
+        // Full decommit clears cached hash so remapping identical bytes triggers an upload.
+        region.decommit(0, 65536);
+        assert_eq!(staging.refresh_now(), (0, false));
+        region.commit(0, 65536, PAGE_READWRITE);
+        // SAFETY: `[0..65536)` was committed read-write above.
+        unsafe { region.write_slice(0, &[1, 2, 3, 4]) };
+        assert_eq!(staging.refresh_now(), (65536, true));
+        assert_eq!(staging.refresh_now(), (65536, false));
+
+        // Committing remaining pages and writing new data transitions to full residency.
+        region.commit(65536, size - 65536, PAGE_READWRITE);
+        // SAFETY: `[65536..size)` was committed read-write above.
+        unsafe { region.write_slice(65536, &[5, 6, 7, 8]) };
+        assert_eq!(staging.refresh_now(), (size, true));
+        assert_eq!(staging.refresh_now(), (size, false));
     }
 }
