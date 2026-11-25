@@ -137,13 +137,29 @@ pub(crate) fn host(
     Some((heap.host.clone()?, query))
 }
 
-/// How many queries the heap holds; `None` if it is not one of ours.
-pub(crate) fn count(this: This) -> Option<u32> {
-    if this.is_null() {
+fn check_resolve(
+    state: &mut [State],
+    first: u32,
+    count: u32,
+) -> Option<&mut [State]> {
+    let end = first.checked_add(count)?;
+    let range = state.get_mut(first as usize..end as usize)?;
+    if range.iter().any(|&s| s != State::Ended) {
         return None;
     }
+    Some(range)
+}
+
+/// Whether queries `first .. first + count` are all ended, without changing
+/// their state.
+pub(crate) fn can_resolve(this: This, first: u32, count: u32) -> bool {
+    if this.is_null() {
+        return false;
+    }
     // SAFETY: the title passes a heap it created here.
-    Some(unsafe { &*this.cast::<Heap>() }.desc.count)
+    let heap = unsafe { &*this.cast::<Heap>() };
+    let mut state = heap.state.lock().unwrap_or_else(|e| e.into_inner());
+    check_resolve(&mut state, first, count).is_some()
 }
 
 /// Tracks a mark: `begin` opens a query, and `end` closes it. Returns
@@ -158,7 +174,7 @@ pub(crate) fn mark(this: This, index: u32, begin: bool) -> Option<()> {
     let mut state = heap.state.lock().unwrap_or_else(|e| e.into_inner());
     let at = state.get_mut(index as usize)?;
     match (begin, *at) {
-        (true, State::Idle) => *at = State::Open,
+        (true, State::Idle | State::Ended) => *at = State::Open,
         (false, State::Open) => *at = State::Ended,
         // An end without a begin, or a begin on an open one: the title's
         // own mistake, and the marks would not be what it thinks.
@@ -169,7 +185,7 @@ pub(crate) fn mark(this: This, index: u32, begin: bool) -> Option<()> {
 
 /// Whether queries `first .. first + count` are all ended, so they may be
 /// resolved: D3D12 refuses to resolve one that is open, and one that was
-/// never marked has no value.
+/// never marked has no value. Atomic across the whole range.
 pub(crate) fn resolved(this: This, first: u32, count: u32) -> Option<()> {
     if this.is_null() {
         return None;
@@ -177,17 +193,8 @@ pub(crate) fn resolved(this: This, first: u32, count: u32) -> Option<()> {
     // SAFETY: the title passes a heap it created here.
     let heap = unsafe { &*this.cast::<Heap>() };
     let mut state = heap.state.lock().unwrap_or_else(|e| e.into_inner());
-    let end = first.checked_add(count)?;
-    if end > heap.desc.count {
-        return None;
-    }
-    for index in first..end {
-        let at = state.get_mut(index as usize)?;
-        if *at != State::Ended {
-            return None;
-        }
-        *at = State::Idle;
-    }
+    let range = check_resolve(&mut state, first, count)?;
+    range.fill(State::Idle);
     Some(())
 }
 
@@ -310,5 +317,34 @@ mod tests {
         for left in [5, 4, 3, 2, 1, 0] {
             assert_eq!(release(heap), left);
         }
+    }
+
+    #[test]
+    fn mark_allows_rebegin_on_ended_and_resolved_is_atomic() {
+        let desc = Desc {
+            kind: 0,
+            count: 2,
+            nodes: 0,
+        };
+        let mut heap = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), &desc, &HEAP_IIDS[0], &mut heap), S_OK);
+        assert!(!heap.is_null());
+
+        assert!(mark(heap, 0, true).is_some());
+        assert!(mark(heap, 0, false).is_some());
+        // Beginning an ended, unresolved query again is allowed in D3D12.
+        assert!(mark(heap, 0, true).is_some());
+        assert!(mark(heap, 0, true).is_none());
+        assert!(mark(heap, 0, false).is_some());
+
+        // Slot 0 is Ended while slot 1 is Idle: resolving 0..2 must fail
+        // without consuming slot 0.
+        assert!(resolved(heap, 0, 2).is_none());
+        assert!(can_resolve(heap, 0, 1));
+        assert!(resolved(heap, 0, 1).is_some());
+        assert!(!can_resolve(heap, 0, 1));
+
+        let release = slot::<extern "system" fn(This) -> u32>(heap, 0x10);
+        assert_eq!(release(heap), 0);
     }
 }

@@ -2472,11 +2472,13 @@ mod tests {
 
         // The heap type is not a query type: a timestamp heap measures
         // nothing on the host, and an occlusion query on it is refused.
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         if let Some(stamps) = crate::query::occlusion_for_test(1 /* TIMESTAMP heap */, COUNT) {
             assert!(
                 crate::query::host(stamps, OCCLUSION, 0).is_none(),
                 "a timestamp heap takes no occlusion query"
             );
+            assert_eq!(release(stamps), 0);
         }
         // A query that was never ended is not resolved, and neither is one
         // outside the heap: D3D12 refuses both, and the readback of a query
@@ -2490,11 +2492,97 @@ mod tests {
             "an index at the count is outside the heap"
         );
 
-        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
         assert_eq!(release(queue), 0);
         assert_eq!(release(heap), 0);
+        assert_eq!(release(results), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_occlusion_query_survives_early_heap_release_and_rebegin() {
+        let Some(_host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        const OCCLUSION: u32 = 0;
+        let Some(heap) = crate::query::occlusion_for_test(OCCLUSION, 2) else {
+            return;
+        };
+        let mut results = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(16),
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut results,
+            ),
+            S_OK
+        );
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+            S_OK
+        );
+
+        // End then immediately re-begin query 0 without resolving first.
+        crate::list::query_begin(list, heap, OCCLUSION, 0);
+        crate::list::query_end(list, heap, OCCLUSION, 0);
+        crate::list::query_begin(list, heap, OCCLUSION, 0);
+        crate::list::query_end(list, heap, OCCLUSION, 0);
+        crate::list::resolve_queries(list, heap, OCCLUSION, 0, 1, results, 0);
+
+        // Title releases the query heap before closing/submitting the list:
+        // the list retains the host ID3D12QueryHeap until reset/drop.
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(heap), 0);
+
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+
+        let (data, _) = buffer_bytes(results).unwrap();
+        // SAFETY: submission completed; first u64 was resolved.
+        let counts = unsafe { std::slice::from_raw_parts(data.cast::<u64>(), 2) };
+        assert_eq!(counts[0], 0);
+
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+        assert_eq!(release(queue), 0);
         assert_eq!(release(results), 0);
     }
 

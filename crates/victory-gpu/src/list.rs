@@ -849,6 +849,9 @@ fn mark(this: This, heap: This, kind: u32, index: u32, begin: bool) {
                 list.list.EndQuery(&host, query, index);
             }
         }
+        // Keep the host heap alive until the list is reset in case the title
+        // releases it before submitting the recorded commands.
+        list.keep(&host);
         return;
     }
     let _ = (this, heap, kind, index, begin);
@@ -888,11 +891,13 @@ pub(crate) extern "system" fn resolve_queries(
         && let Some(list) = host_list(this)
         // Every index has to be inside the heap and ended: D3D12 refuses to
         // resolve an open query, and one never marked has no value to read.
+        // Validate non-destructively before readback allocation so an
+        // allocation failure cannot wipe query states before the stub path.
         && let Some((host, query)) = crate::query::host(heap, kind, first)
-        && crate::query::count(heap).is_some_and(|n| first.saturating_add(count) <= n)
-        && crate::query::resolved(heap, first, count).is_some()
+        && crate::query::can_resolve(heap, first, count)
         && let Some(readback) =
             crate::host::host().and_then(|h| h.readback_buffer(u64::from(count.max(1)) * 8))
+        && crate::query::resolved(heap, first, count).is_some()
     {
         // SAFETY: an open list, our heap and a buffer made for exactly
         // these results, in the state a resolve needs.
@@ -900,6 +905,7 @@ pub(crate) extern "system" fn resolve_queries(
             list.list
                 .ResolveQueryData(&host, query, first, count, &readback, 0);
         }
+        list.keep(&host);
         let targets = (0..u64::from(count))
             .map(|i| (data as usize + (offset + i * 8) as usize, i * 8, 8usize))
             .collect();
