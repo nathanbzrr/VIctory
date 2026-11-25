@@ -569,11 +569,13 @@ impl Structured {
         let &m = self.masks.get(&lo)?;
         let def = def_block.unwrap_or(self.entry);
         if self.same_iter.contains(&lo) {
-            return Some(if def == read_block {
-                BallotSite::Read
+            return if def == read_block {
+                Some(BallotSite::Read)
+            } else if !self.div_loops.get(def).copied().unwrap_or(true) {
+                Some(BallotSite::Def)
             } else {
-                BallotSite::Def
-            });
+                None
+            };
         }
         if def == read_block {
             return self.covers(lo, m, read_block).then_some(BallotSite::Read);

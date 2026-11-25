@@ -10997,4 +10997,37 @@ mod tests {
                 .expect("DXIL validation failed for inner-if loop mask");
         }
     }
+
+    #[test]
+    fn divergent_loop_vcmp_read_after_reconvergence_is_refused() {
+        // A same-iteration compare mask (`vcc_lo`) defined inside a divergent
+        // loop and read after the loop reconverges cannot safely place its
+        // ballot at the definition block (early-exiting lanes keep an earlier
+        // iteration's ballot) or at the reading block (falling through to
+        // `covers` would ballot all exited lanes instead of the last wave
+        // iteration). It must be refused.
+        let body = [
+            0x4A02_0098, // v_add_nc_u32 v1, 24, v0
+            0x2C02_0285, // v_lshrrev_b32 v1, 5, v1   (0 for lanes 0..7, 1 for lanes 8..31)
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1    (1 for lanes 0..7, 2 for lanes 8..31)
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            // loop (block 1):
+            0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1 (iter 0: lanes 0..7; iter 1: lanes 8..31)
+            0x880A_0A6A, // s_or_b32 s10, vcc_lo, s10
+            0x8A7E_0A7E, // s_andn2_b32 exec_lo, exec_lo, s10
+            0xBF89_FFFB, // s_cbranch_execnz loop
+            // post-loop reconvergence (block 2):
+            0x887E_0A7E, // s_or_b32 exec_lo, exec_lo, s10
+            0xBE89_0F6A, // s_bcnt1_i32_b32 s9, vcc_lo (reads loop-body v_cmp after reconvergence)
+            0x7E04_0209, // v_mov_b32 v2, s9
+        ];
+        match lower_uav_cs(&body, false) {
+            Err(crate::ShaderError::Unsupported { what, .. }) => {
+                assert_eq!(what, "a lane mask holding lanes elsewhere read as data");
+            }
+            Ok(_) => panic!("must refuse same_iter mask defined in divergent loop and read after"),
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
 }
