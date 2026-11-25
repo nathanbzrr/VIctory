@@ -2382,65 +2382,6 @@ mod tests {
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
         }
     }
-
-    #[test]
-    fn committed_and_placed_resources_map_at_their_gpu_address() {
-        let null = std::ptr::null();
-        let mut committed = null;
-        let hr = create_committed(
-            null,
-            &PROPERTIES,
-            0,
-            &buffer(256),
-            0,
-            null.cast(),
-            &RESOURCE_IIDS[0],
-            &mut committed,
-        );
-        assert_eq!(hr, S_OK);
-        let mut data = std::ptr::null_mut();
-        assert_eq!(
-            slot::<Map>(committed, 0x40)(committed, 0, null.cast(), &mut data),
-            S_OK
-        );
-        assert_eq!(slot::<Address>(committed, 0x58)(committed), data as u64);
-        // SAFETY: the buffer is at least 256 zeroed bytes.
-        assert_eq!(unsafe { *data.add(255) }, 0);
-        assert_eq!(slot::<Release>(committed, 0x10)(committed), 0);
-
-        let heap = heap(4 * KIB_64);
-        let place = |offset, desc: &ResourceDesc, out: &mut This| {
-            create_placed(
-                null,
-                heap,
-                offset,
-                desc,
-                0,
-                null.cast(),
-                &RESOURCE_IIDS[0],
-                out,
-            )
-        };
-        let mut placed = null;
-        assert_eq!(place(KIB_64, &buffer(KIB_64), &mut placed), S_OK);
-        // SAFETY: a heap we made.
-        let base = unsafe { (*heap.cast::<Heap>()).memory.ptr.as_ptr() } as u64;
-        assert_eq!(slot::<Address>(placed, 0x58)(placed), base + KIB_64);
-        let mut other = null;
-        assert_eq!(
-            place(4 * KIB_64, &buffer(1), &mut other),
-            E_INVALIDARG,
-            "past the end"
-        );
-        assert_eq!(
-            place(100, &buffer(1), &mut other),
-            E_INVALIDARG,
-            "misaligned"
-        );
-        // The resource keeps the heap alive.
-        assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
-        assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
-    }
     /// An occlusion query around no draws reports zero samples, not the
     /// million the stub used to: the heap measures on the host, the list
     /// marks it, `ResolveQueryData` brings the count back, and the title's
@@ -2555,5 +2496,64 @@ mod tests {
         assert_eq!(release(queue), 0);
         assert_eq!(release(heap), 0);
         assert_eq!(release(results), 0);
+    }
+
+    #[test]
+    fn committed_and_placed_resources_map_at_their_gpu_address() {
+        let null = std::ptr::null();
+        let mut committed = null;
+        let hr = create_committed(
+            null,
+            &PROPERTIES,
+            0,
+            &buffer(256),
+            0,
+            null.cast(),
+            &RESOURCE_IIDS[0],
+            &mut committed,
+        );
+        assert_eq!(hr, S_OK);
+        let mut data = std::ptr::null_mut();
+        assert_eq!(
+            slot::<Map>(committed, 0x40)(committed, 0, null.cast(), &mut data),
+            S_OK
+        );
+        assert_eq!(slot::<Address>(committed, 0x58)(committed), data as u64);
+        // SAFETY: the buffer is at least 256 zeroed bytes.
+        assert_eq!(unsafe { *data.add(255) }, 0);
+        assert_eq!(slot::<Release>(committed, 0x10)(committed), 0);
+
+        let heap = heap(4 * KIB_64);
+        let place = |offset, desc: &ResourceDesc, out: &mut This| {
+            create_placed(
+                null,
+                heap,
+                offset,
+                desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                out,
+            )
+        };
+        let mut placed = null;
+        assert_eq!(place(KIB_64, &buffer(KIB_64), &mut placed), S_OK);
+        // SAFETY: a heap we made.
+        let base = unsafe { (*heap.cast::<Heap>()).memory.ptr.as_ptr() } as u64;
+        assert_eq!(slot::<Address>(placed, 0x58)(placed), base + KIB_64);
+        let mut other = null;
+        assert_eq!(
+            place(4 * KIB_64, &buffer(1), &mut other),
+            E_INVALIDARG,
+            "past the end"
+        );
+        assert_eq!(
+            place(100, &buffer(1), &mut other),
+            E_INVALIDARG,
+            "misaligned"
+        );
+        // The resource keeps the heap alive.
+        assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
+        assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
     }
 }
