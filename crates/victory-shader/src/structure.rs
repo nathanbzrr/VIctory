@@ -439,6 +439,62 @@ pub enum LaneExit {
     Indirect,
 }
 
+/// Where `waveActiveBallot` may be emitted when a lane mask is read as data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BallotSite {
+    /// At the mask's definition block (not inside a divergent loop, holding
+    /// every lane that could set a bit in the mask).
+    Def,
+    /// At the reading block (after divergent control flow reconverges, outside
+    /// divergent loops).
+    Read,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Writers {
+    /// Only lanes active in these blocks can hold a `1` bit (empty: always 0).
+    Blocks(Vec<usize>),
+    /// Any lane in the wave may hold a `1` bit.
+    Wave,
+}
+
+impl Writers {
+    fn union(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Wave, _) | (_, Self::Wave) => Self::Wave,
+            (Self::Blocks(a), Self::Blocks(b)) => {
+                let mut out = a.clone();
+                for &x in b {
+                    if !out.contains(&x) {
+                        out.push(x);
+                        if out.len() > 32 {
+                            return Self::Wave;
+                        }
+                    }
+                }
+                out.sort_unstable();
+                Self::Blocks(out)
+            }
+        }
+    }
+
+    fn and(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Blocks(a), _) if a.is_empty() => Self::Blocks(Vec::new()),
+            (_, Self::Blocks(b)) if b.is_empty() => Self::Blocks(Vec::new()),
+            (Self::Wave, b) => b.clone(),
+            (a, Self::Wave) => a.clone(),
+            (Self::Blocks(a), Self::Blocks(b)) => {
+                if a.len() <= b.len() {
+                    Self::Blocks(a.clone())
+                } else {
+                    Self::Blocks(b.clone())
+                }
+            }
+        }
+    }
+}
+
 /// A [`Program`] as one lane runs it: same blocks, per-lane branches.
 #[derive(Debug, Clone)]
 pub struct Structured {
@@ -466,12 +522,26 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// Masks (low dwords) provably holding 1 bits only in lanes active in EXEC at their definition block on the same iteration.
+    same_iter: HashSet<Value>,
     /// `v_readlane_b32` results of a constant lane: the SGPR value that
     /// `v_writelane_b32` spilled to that lane, the same along every path.
     pub restored: HashMap<Value, Value>,
     /// A pixel's discards, by block and instruction: the lanes (EXEC there)
     /// the instruction takes out of the live mask, which here stay in it.
     pub discards: HashMap<(usize, usize), Bool>,
+    /// Entry block index.
+    entry: usize,
+    /// Immediate post-dominator per block (`blocks.len()` = virtual exit,
+    /// `usize::MAX` = cannot reach exit).
+    ipdom: Vec<usize>,
+    /// Per block: whether the block lies inside a divergent loop.
+    div_loops: Vec<bool>,
+    /// Per block: lanes from entry that reach it, ignoring uniform branches
+    /// and loop-exit atoms across post-dominated loop exits.
+    wave_reach: Vec<Bool>,
+    /// Blocks whose active lanes can contribute a `1` bit to each mask.
+    writers: HashMap<Value, Writers>,
 }
 
 impl Structured {
@@ -481,6 +551,76 @@ impl Structured {
             None => self.masks.get(&low),
         }
         .copied()
+    }
+
+    pub(crate) fn phi_mask(&self, low: Value) -> Option<Bool> {
+        self.masks.get(&low).or_else(|| self.other.get(&low)).copied()
+    }
+
+    /// Chooses where `waveActiveBallot` may be emitted when `lo` is read as
+    /// data at `read_block`, or `None` if `lo` may hold `1` bits in lanes not
+    /// active/reconverged there or at `def_block`.
+    pub(crate) fn ballot_site(
+        &self,
+        lo: Value,
+        def_block: Option<usize>,
+        read_block: usize,
+    ) -> Option<BallotSite> {
+        let &m = self.masks.get(&lo)?;
+        let def = def_block.unwrap_or(self.entry);
+        if self.same_iter.contains(&lo) {
+            return Some(if def == read_block {
+                BallotSite::Read
+            } else {
+                BallotSite::Def
+            });
+        }
+        if def == read_block {
+            return self.covers(lo, m, read_block).then_some(BallotSite::Read);
+        }
+        if self.covers(lo, m, def) {
+            return Some(BallotSite::Def);
+        }
+        if self.covers(lo, m, read_block) {
+            return Some(BallotSite::Read);
+        }
+        None
+    }
+
+    fn covers(&self, lo: Value, m: Bool, block: usize) -> bool {
+        if self.div_loops.get(block).copied().unwrap_or(true) {
+            return false;
+        }
+        if !self
+            .bools
+            .meet(&[(m, true), (self.wave_reach[block], false)])
+        {
+            return true;
+        }
+        match self.writers.get(&lo) {
+            Some(Writers::Blocks(ws)) => ws.iter().all(|&w| {
+                self.postdoms(w, block)
+                    || !self
+                        .bools
+                        .meet(&[(self.wave_reach[w], true), (self.wave_reach[block], false)])
+            }),
+            Some(Writers::Wave) | None => self.wave_reach[block] == Bool::TRUE,
+        }
+    }
+
+    fn postdoms(&self, mut w: usize, target: usize) -> bool {
+        let n = self.wave_reach.len();
+        while w < n {
+            if w == target {
+                return true;
+            }
+            let next = self.ipdom[w];
+            if next == w {
+                break;
+            }
+            w = next;
+        }
+        false
     }
 }
 
@@ -547,6 +687,8 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// See [`Structured::same_iter`], keyed to each mask's defining block.
+    same_iter: Map<Value, usize>,
     /// See [`Structured::restored`].
     restored: Map<Value, Value>,
     /// A pixel's discards (see [`Structured::discards`]) by block and
@@ -615,6 +757,7 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            same_iter: Map::default(),
             restored: Map::default(),
             kills: HashSet::new(),
         };
@@ -693,6 +836,7 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
+        self.same_iter.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -708,6 +852,8 @@ impl<'a> Lanes<'a> {
             };
             self.masks.insert((lo, hi), Bool::TRUE);
             self.active.insert(lo);
+            self.same_iter
+                .insert(lo, self.order.first().copied().unwrap_or(0));
         }
         let mut execs: Vec<Vec<Option<Bool>>> =
             p.blocks.iter().map(|b| vec![None; b.insts.len()]).collect();
@@ -726,6 +872,7 @@ impl<'a> Lanes<'a> {
             for phi in &p.blocks[b].phis {
                 if phi.reg == Reg::S(EXEC) {
                     self.active.insert(phi.value);
+                    self.same_iter.insert(phi.value, b);
                 }
             }
             // EXEC where known in this block (read or written so far).
@@ -736,7 +883,7 @@ impl<'a> Lanes<'a> {
                     execs[b][i] = Some(e);
                     now = Some(e);
                 }
-                self.step(inst, now);
+                self.step(b, inst, now);
                 if self.kills.contains(&(b, i))
                     && let Fields::Sop {
                         dst: Some(Operand::Scalar { code, .. }),
@@ -821,6 +968,12 @@ impl<'a> Lanes<'a> {
         execs: &[Vec<Option<Bool>>],
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
+        self.promote_phi_masks();
+        let entry = self.order.first().copied().unwrap_or(0);
+        let ipdom = self.compute_ipdom();
+        let (loop_bodies, div_loops) = self.compute_loops(&ipdom);
+        let wave_reach = self.compute_wave_reach(&ipdom, &loop_bodies);
+        let writers = self.compute_writers();
         let blocks = &self.p.blocks;
         let b = &mut self.b;
         let guards = blocks
@@ -881,17 +1034,501 @@ impl<'a> Lanes<'a> {
                 .collect(),
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
+            same_iter: self.same_iter.into_keys().collect(),
             restored: self.restored.into_iter().collect(),
             discards: self
                 .kills
                 .iter()
                 .filter_map(|&(b, i)| execs[b][i].map(|e| ((b, i), e)))
                 .collect(),
+            entry,
+            ipdom,
+            div_loops,
+            wave_reach,
+            writers,
             bools: self.b,
             exits,
             guards,
             reach: cond.to_vec(),
         })
+    }
+
+    /// Promotes any phi in `other` that receives a derived mask on any edge
+    /// (including back edges) into `masks`.
+    fn promote_phi_masks(&mut self) {
+        loop {
+            let mut promoted = Vec::new();
+            for (&k, &m) in &self.other {
+                let (lo, hi) = (self.phis.get(&k.0).copied(), self.phis.get(&k.1).copied());
+                let block = match (lo, hi) {
+                    (Some((a, _)), Some((b, _))) if a != b => continue,
+                    (Some((b, _)), _) | (_, Some((b, _))) => b,
+                    _ => continue,
+                };
+                let target = &self.p.blocks[block];
+                let arg = |phi: Option<(usize, usize)>, own: Value, n: usize| {
+                    phi.map_or(own, |(_, i)| target.phis[i].args[n])
+                };
+                let has_derived = (0..target.preds.len())
+                    .any(|n| self.masks.contains_key(&(arg(lo, k.0, n), arg(hi, k.1, n))));
+                if has_derived {
+                    promoted.push((k, m));
+                }
+            }
+            if promoted.is_empty() {
+                break;
+            }
+            for (k, m) in promoted {
+                self.other.remove(&k);
+                self.masks.insert(k, m);
+            }
+        }
+    }
+
+    /// Immediate post-dominator per block (`blocks.len()` = virtual exit,
+    /// `usize::MAX` = cannot reach exit).
+    fn compute_ipdom(&self) -> Vec<usize> {
+        let n = self.p.blocks.len();
+        let exit = n;
+        let mut rev_succs = vec![Vec::new(); n + 1];
+        let mut fwd_succs = vec![Vec::new(); n];
+        for (b, fwd) in fwd_succs.iter_mut().enumerate() {
+            if self.index[b] == usize::MAX {
+                continue;
+            }
+            let succs = self.p.blocks[b].exit.successors();
+            if succs.is_empty() {
+                fwd.push(exit);
+                rev_succs[exit].push(b);
+            } else {
+                for s in succs {
+                    fwd.push(s);
+                    rev_succs[s].push(b);
+                }
+            }
+        }
+        let mut seen = vec![false; n + 1];
+        let mut post = Vec::with_capacity(n + 1);
+        let mut stack = vec![(exit, 0usize)];
+        seen[exit] = true;
+        while let Some(top) = stack.last_mut() {
+            let (u, i) = *top;
+            top.1 += 1;
+            match rev_succs[u].get(i) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(u);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        let mut rev_index = vec![usize::MAX; n + 1];
+        for (i, &u) in post.iter().enumerate() {
+            rev_index[u] = i;
+        }
+        let mut ipdom = vec![usize::MAX; n + 1];
+        ipdom[exit] = exit;
+        let intersect = |ipdom: &[usize], mut a: usize, mut b: usize| {
+            while a != b {
+                while rev_index[a] > rev_index[b] {
+                    a = ipdom[a];
+                }
+                while rev_index[b] > rev_index[a] {
+                    b = ipdom[b];
+                }
+            }
+            a
+        };
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in post.iter().skip(1) {
+                let mut new = usize::MAX;
+                for &s in fwd_succs[b].iter().filter(|&&s| ipdom[s] != usize::MAX) {
+                    new = if new == usize::MAX {
+                        s
+                    } else {
+                        intersect(&ipdom, s, new)
+                    };
+                }
+                if ipdom[b] != new {
+                    ipdom[b] = new;
+                    changed = true;
+                }
+            }
+        }
+        ipdom
+    }
+
+    fn compute_loops(&self, ipdom: &[usize]) -> (Vec<(usize, Vec<bool>)>, Vec<bool>) {
+        let n = self.p.blocks.len();
+        let mut loop_bodies = Vec::new();
+        let mut div_loops = vec![false; n];
+        for &h in &self.order {
+            let latches: Vec<usize> = self.p.blocks[h]
+                .preds
+                .iter()
+                .copied()
+                .filter(|&q| self.index[q] != usize::MAX && self.index[h] <= self.index[q])
+                .collect();
+            if latches.is_empty() {
+                continue;
+            }
+            let mut body = vec![false; n];
+            body[h] = true;
+            let mut stack = Vec::new();
+            for q in latches {
+                if !body[q] {
+                    body[q] = true;
+                    stack.push(q);
+                }
+            }
+            while let Some(u) = stack.pop() {
+                for &pred in &self.p.blocks[u].preds {
+                    if self.index[pred] != usize::MAX && !body[pred] {
+                        body[pred] = true;
+                        stack.push(pred);
+                    }
+                }
+            }
+            let other_exit = (0..n).any(|u| {
+                body[u]
+                    && u != h
+                    && (self.p.blocks[u].exit.successors().is_empty()
+                        || self.p.blocks[u]
+                            .exit
+                            .successors()
+                            .into_iter()
+                            .any(|s| !body[s]))
+            });
+            let divergent = (0..n).any(|q| {
+                if !body[q] {
+                    return false;
+                }
+                let Some(w) = self.when[q] else {
+                    return false;
+                };
+                let uniform = self
+                    .b
+                    .support(w)
+                    .iter()
+                    .all(|a| matches!(a, Atom::Uniform(_)));
+                if uniform {
+                    return false;
+                }
+                let p = ipdom[q];
+                p >= n || !body[p] || (p == h && q != h && other_exit)
+            });
+            if divergent {
+                for b in 0..n {
+                    if body[b] {
+                        div_loops[b] = true;
+                    }
+                }
+            }
+            loop_bodies.push((h, body));
+        }
+        (loop_bodies, div_loops)
+    }
+
+    fn compute_wave_reach(
+        &mut self,
+        ipdom: &[usize],
+        loop_bodies: &[(usize, Vec<bool>)],
+    ) -> Vec<Bool> {
+        let n = self.p.blocks.len();
+        let mut wave_reach = vec![Bool::FALSE; n];
+        if let Some(&entry) = self.order.first() {
+            wave_reach[entry] = Bool::TRUE;
+        }
+        let postdoms = |mut w: usize, target: usize| -> bool {
+            while w < n {
+                if w == target {
+                    return true;
+                }
+                let next = ipdom[w];
+                if next == w {
+                    break;
+                }
+                w = next;
+            }
+            false
+        };
+        let post_loop_headers: Vec<Vec<usize>> = (0..n)
+            .map(|s| {
+                loop_bodies
+                    .iter()
+                    .filter(|(h, body)| !body[s] && postdoms(*h, s))
+                    .map(|(h, _)| *h)
+                    .collect()
+            })
+            .collect();
+        for _ in 0..MAX_ROUNDS {
+            let mut changed = false;
+            for i in 1..self.order.len() {
+                let s = self.order[i];
+                let mut c = Bool::FALSE;
+                for k in 0..self.incoming[s].len() {
+                    let (q, taken) = self.incoming[s][k];
+                    if self.index[q] == usize::MAX {
+                        continue;
+                    }
+                    let mut e = match self.when[q] {
+                        Some(w)
+                            if self
+                                .b
+                                .support(w)
+                                .iter()
+                                .all(|a| matches!(a, Atom::Uniform(_))) =>
+                        {
+                            if (w == Bool::FALSE && taken) || (w == Bool::TRUE && !taken) {
+                                Bool::FALSE
+                            } else {
+                                wave_reach[q]
+                            }
+                        }
+                        _ => self.edge(wave_reach[q], q, taken),
+                    };
+                    if i <= self.index[q] {
+                        e = self.b.forget(e, i, &mut Map::default());
+                    }
+                    c = self.b.or(c, e);
+                }
+                for &h in &post_loop_headers[s] {
+                    c = self.b.or(c, wave_reach[h]);
+                }
+                if c != wave_reach[s] {
+                    wave_reach[s] = c;
+                    changed = true;
+                }
+            }
+            if self.b.overflow || !changed {
+                break;
+            }
+        }
+        wave_reach
+    }
+
+    fn compute_writers(&mut self) -> HashMap<Value, Writers> {
+        const EXACT_ROUNDS: usize = 16;
+        const MAX_WRITER_ROUNDS: usize = 64;
+        let mut writers: Map<Key, Writers> = Map::default();
+        let mut dynamic: Vec<Key> = Vec::new();
+        for (&k, &m) in &self.other {
+            if m == Bool::FALSE {
+                writers.insert(k, Writers::Blocks(Vec::new()));
+            } else if self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1) {
+                writers.insert(k, Writers::Blocks(Vec::new()));
+                dynamic.push(k);
+            } else {
+                writers.insert(k, Writers::Wave);
+            }
+        }
+        for (&k, &m) in &self.masks {
+            if m == Bool::FALSE {
+                writers.insert(k, Writers::Blocks(Vec::new()));
+                continue;
+            }
+            if self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1) {
+                writers.insert(k, Writers::Blocks(Vec::new()));
+                dynamic.push(k);
+                continue;
+            }
+            let Some(&(b, i)) = self.defs.get(&k.0) else {
+                writers.insert(k, Writers::Wave);
+                continue;
+            };
+            let inst = &self.p.blocks[b].insts[i];
+            match &inst.fields {
+                Fields::Valu(_) => {
+                    writers.insert(k, Writers::Blocks(vec![b]));
+                }
+                Fields::Sop { .. } => {
+                    writers.insert(k, Writers::Blocks(Vec::new()));
+                    dynamic.push(k);
+                }
+                _ => {
+                    writers.insert(k, Writers::Wave);
+                }
+            }
+        }
+        for round in 0..MAX_WRITER_ROUNDS {
+            let mut changed_keys = Vec::new();
+            for &k in &dynamic {
+                let mut next = self.step_writers(k, &writers);
+                if round >= EXACT_ROUNDS
+                    && let Some(old) = writers.get(&k)
+                {
+                    next = old.union(&next);
+                }
+                if writers.get(&k) != Some(&next) {
+                    writers.insert(k, next);
+                    changed_keys.push(k);
+                }
+            }
+            if changed_keys.is_empty() {
+                break;
+            }
+            if round + 1 == MAX_WRITER_ROUNDS {
+                for k in changed_keys {
+                    writers.insert(k, Writers::Wave);
+                }
+                for &k in &dynamic {
+                    let next = self.step_writers(k, &writers);
+                    if let Some(old) = writers.get(&k) {
+                        writers.insert(k, old.union(&next));
+                    }
+                }
+            }
+        }
+        writers.into_iter().map(|((lo, _), w)| (lo, w)).collect()
+    }
+
+    fn step_writers(&self, k: Key, writers: &Map<Key, Writers>) -> Writers {
+        let (lo, hi) = (self.phis.get(&k.0).copied(), self.phis.get(&k.1).copied());
+        if lo.is_some() || hi.is_some() {
+            let block = match (lo, hi) {
+                (Some((a, _)), Some((b, _))) if a != b => return Writers::Wave,
+                (Some((b, _)), _) | (_, Some((b, _))) => b,
+                _ => return Writers::Wave,
+            };
+            let target = &self.p.blocks[block];
+            let arg = |phi: Option<(usize, usize)>, own: Value, n: usize| {
+                phi.map_or(own, |(_, i)| target.phis[i].args[n])
+            };
+            let mut acc = Writers::Blocks(Vec::new());
+            for n in 0..target.preds.len() {
+                let ak = (arg(lo, k.0, n), arg(hi, k.1, n));
+                let w = writers.get(&ak).cloned().unwrap_or(Writers::Wave);
+                acc = acc.union(&w);
+            }
+            return acc;
+        }
+        let Some(&(b, i)) = self.defs.get(&k.0) else {
+            return Writers::Wave;
+        };
+        let inst = &self.p.blocks[b].insts[i];
+        self.sop_writers(inst, k, writers)
+    }
+
+    fn sop_writers(&self, inst: &Inst, k: Key, writers: &Map<Key, Writers>) -> Writers {
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return Writers::Wave;
+        };
+        let width = if self.p.wave64 { "_b64" } else { "_b32" };
+        let Some(op) = inst
+            .name()
+            .strip_prefix("s_")
+            .and_then(|s| s.strip_suffix(width))
+        else {
+            return Writers::Wave;
+        };
+        let (save, f) = match (op.strip_suffix("_saveexec"), op.strip_suffix("_wrexec")) {
+            (Some(f), _) => (Some(true), f),
+            (_, Some(f)) => (Some(false), f),
+            _ => (None, op),
+        };
+        let op_writers = |op: Option<&Operand>| -> Writers {
+            let Some(&op) = op else {
+                return Writers::Wave;
+            };
+            match op {
+                Operand::Scalar { code, .. } if code != NULL => {
+                    let Some(ok) = self.key(|r| inst.read(r), code) else {
+                        return Writers::Wave;
+                    };
+                    writers.get(&ok).cloned().unwrap_or(Writers::Wave)
+                }
+                Operand::Const(128) | Operand::Literal(0) => Writers::Blocks(Vec::new()),
+                Operand::Const(_) | Operand::Literal(_) => Writers::Wave,
+                _ => Writers::Wave,
+            }
+        };
+        let reg_writers = |code: u8| -> Writers {
+            match self.key(|r| inst.read(r), code) {
+                Some(ok) => writers.get(&ok).cloned().unwrap_or(Writers::Wave),
+                None => Writers::Wave,
+            }
+        };
+        if let Some(saveexec) = save {
+            let is_exec = self.key(|r| inst.write(r), EXEC) == Some(k);
+            if saveexec && !is_exec {
+                return reg_writers(EXEC);
+            }
+            return match f {
+                "and" => op_writers(src.first()).and(&reg_writers(EXEC)),
+                "andn2" => op_writers(src.first()),
+                "andn1" => reg_writers(EXEC),
+                "or" | "xor" => op_writers(src.first()).union(&reg_writers(EXEC)),
+                _ => Writers::Wave,
+            };
+        }
+        match f {
+            "mov" => op_writers(src.first()),
+            "and" => op_writers(src.first()).and(&op_writers(src.get(1))),
+            "andn2" => op_writers(src.first()),
+            "andn1" => op_writers(src.get(1)),
+            "or" | "xor" | "cselect" => op_writers(src.first()).union(&op_writers(src.get(1))),
+            _ => Writers::Wave,
+        }
+    }
+
+    fn sop_is_same_iter(&self, b: usize, inst: &Inst, k: Key) -> bool {
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return false;
+        };
+        let width = if self.p.wave64 { "_b64" } else { "_b32" };
+        let Some(op) = inst
+            .name()
+            .strip_prefix("s_")
+            .and_then(|s| s.strip_suffix(width))
+        else {
+            return false;
+        };
+        let (save, f) = match (op.strip_suffix("_saveexec"), op.strip_suffix("_wrexec")) {
+            (Some(f), _) => (Some(true), f),
+            (_, Some(f)) => (Some(false), f),
+            _ => (None, op),
+        };
+        let op_same_iter = |op: Option<&Operand>| -> bool {
+            let Some(&op) = op else {
+                return false;
+            };
+            match op {
+                Operand::Const(128) | Operand::Literal(0) => true,
+                Operand::Scalar { code, .. } if code != NULL => {
+                    code == EXEC
+                        || self
+                            .key(|r| inst.read(r), code)
+                            .is_some_and(|ok| self.same_iter.get(&ok.0) == Some(&b))
+                }
+                _ => false,
+            }
+        };
+        if let Some(saveexec) = save {
+            let is_exec = self.key(|r| inst.write(r), EXEC) == Some(k);
+            if saveexec && !is_exec {
+                return true;
+            }
+            return match f {
+                "and" | "andn1" => true,
+                "andn2" | "or" | "xor" => op_same_iter(src.first()),
+                _ => false,
+            };
+        }
+        match f {
+            "mov" => op_same_iter(src.first()),
+            "and" => op_same_iter(src.first()) || op_same_iter(src.get(1)),
+            "andn2" => op_same_iter(src.first()),
+            "andn1" => op_same_iter(src.get(1)),
+            "or" | "xor" | "cselect" => op_same_iter(src.first()) && op_same_iter(src.get(1)),
+            _ => false,
+        }
     }
 
     fn key(&self, value: impl Fn(Reg) -> Option<Value>, code: u8) -> Option<Key> {
@@ -1170,7 +1807,7 @@ impl<'a> Lanes<'a> {
     }
 
     /// Records the masks `inst` defines; `exec` is EXEC there, if known.
-    fn step(&mut self, inst: &Inst, exec: Option<Bool>) {
+    fn step(&mut self, b: usize, inst: &Inst, exec: Option<Bool>) {
         let name = inst.name();
         match &inst.fields {
             Fields::Sop { src, .. } => {
@@ -1197,6 +1834,9 @@ impl<'a> Lanes<'a> {
                             || exec.is_some_and(|e| self.b.implies(m, e))
                         {
                             self.active.insert(k.0);
+                        }
+                        if self.sop_is_same_iter(b, inst, k) {
+                            self.same_iter.insert(k.0, b);
                         }
                     }
                     if let (Some(scc), Some(m)) = (inst.write(Reg::Scc), r.scc) {
@@ -1232,6 +1872,7 @@ impl<'a> Lanes<'a> {
                     let m = l.b.and(exec, a);
                     l.masks.insert(k, m);
                     l.active.insert(k.0);
+                    l.same_iter.insert(k.0, b);
                 };
                 // A select reads a mask nothing else may: a join of compare
                 // results is resolved here, as for EXEC.
