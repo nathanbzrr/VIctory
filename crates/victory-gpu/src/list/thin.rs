@@ -166,7 +166,7 @@ static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
 static WORK: Condvar = Condvar::new();
 /// Lists of ours nobody uses, closed.
 static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-const BACKS_MOST: usize = 64;
+const BACKS_MOST: usize = 512;
 
 /// Active worker count translating thin recordings; unbounded during normal
 /// operation, throttled during low commit or Shared GPU spikes so 4+ command

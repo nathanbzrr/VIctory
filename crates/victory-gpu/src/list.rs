@@ -268,7 +268,7 @@ fn idle_most() -> usize {
 /// keeps scratch chunks over a reset only while lists do not share them,
 /// `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
-const IDLE_BYTES: u64 = 256 << 20;
+const IDLE_BYTES: u64 = 512 << 20;
 
 /// How long idle host lists none took may stay before some are let go, in
 /// milliseconds (0, by default: they stay, as before;
@@ -750,13 +750,11 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
-            }
-        }),
+        host: if !thin {
+            fresh_list()
+        } else {
+            None
+        },
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();

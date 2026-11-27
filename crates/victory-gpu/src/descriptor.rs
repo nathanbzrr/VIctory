@@ -883,6 +883,7 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
@@ -890,6 +891,52 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
         host.release(first, n);
+    }
+}
+
+/// Gives back a whole list's dynamic slot allocations under a single
+/// `SHADER_HEAPS` read lock and one `HostHeap::next` lock per heap.
+#[cfg(windows)]
+pub(crate) fn release_dynamic_batch(items: &[(usize, u32, u32)]) {
+    if items.is_empty() {
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    // Fast path: nearly every list touches a single view heap.
+    let first_heap = items[0].0;
+    if items.iter().all(|&(h, _, _)| h == first_heap) {
+        if heaps.iter().any(|&(_, _, h)| h == first_heap)
+            // SAFETY: registered heaps are live (removed when dropped).
+            && let Some(Some(host)) = unsafe { &*(first_heap as *const Heap) }.host.get()
+        {
+            let mut ranges = [(0u32, 0u32); 64];
+            let mut idx = 0;
+            while idx < items.len() {
+                let take = (items.len() - idx).min(ranges.len());
+                for (dst, &(_, first, n)) in ranges[..take].iter_mut().zip(&items[idx..idx + take]) {
+                    *dst = (first, n);
+                }
+                host.release_batch(&ranges[..take]);
+                idx += take;
+            }
+        }
+        return;
+    }
+    let mut grouped: Vec<(usize, Vec<(u32, u32)>)> = Vec::new();
+    for &(heap, first, n) in items {
+        if let Some((_, list)) = grouped.iter_mut().find(|(h, _)| *h == heap) {
+            list.push((first, n));
+        } else {
+            grouped.push((heap, vec![(first, n)]));
+        }
+    }
+    for (heap, ranges) in grouped {
+        if heaps.iter().any(|&(_, _, h)| h == heap)
+            // SAFETY: registered heaps are live (removed when dropped).
+            && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+        {
+            host.release_batch(&ranges);
+        }
     }
 }
 

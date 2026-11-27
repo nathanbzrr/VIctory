@@ -449,6 +449,10 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// Per-list bump slab of dynamic descriptor slots `(heap_ptr, next_slot, remaining)`
+    /// carved from `HostHeap::dynamic` in 128-slot chunks to avoid taking the
+    /// global `HostHeap::next` mutex on every table (~9.5k/frame -> ~500/frame).
+    dynamic_slab: Option<(usize, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -468,13 +472,43 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        self.dynamic_slab = None;
+        if !self.dynamic.is_empty() {
+            crate::descriptor::release_dynamic_batch(&self.dynamic);
         }
     }
 }
 
 impl State {
+    const DYNAMIC_SLAB: u32 = 128;
+
+    fn alloc_dynamic(
+        &mut self,
+        heap_ptr: usize,
+        host: &crate::descriptor::host::HostHeap,
+        n: u32,
+    ) -> Option<u32> {
+        if let Some((slab_heap, next, rem)) = &mut self.dynamic_slab
+            && *slab_heap == heap_ptr
+            && *rem >= n
+        {
+            let first = *next;
+            *next += n;
+            *rem -= n;
+            return Some(first);
+        }
+        if n <= Self::DYNAMIC_SLAB
+            && let Some(base) = host.dynamic(Self::DYNAMIC_SLAB)
+        {
+            self.dynamic.push((heap_ptr, base, Self::DYNAMIC_SLAB));
+            self.dynamic_slab = Some((heap_ptr, base + n, Self::DYNAMIC_SLAB - n));
+            return Some(base);
+        }
+        let first = host.dynamic(n)?;
+        self.dynamic.push((heap_ptr, first, n));
+        Some(first)
+    }
+
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -490,8 +524,10 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
+        self.dynamic_slab = None;
+        if !self.dynamic.is_empty() {
+            crate::descriptor::release_dynamic_batch(&self.dynamic);
+            self.dynamic.clear();
         }
         self.fresh_tables.clear();
         self.cbv_pages.clear();
@@ -2478,10 +2514,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = self.alloc_dynamic(key.0, host, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 if let Some((a, s)) = &shadow {
                     let offset = s.offset(*a);
                     // Raw views start on 16 bytes: from the 16 bytes
@@ -2549,10 +2584,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = self.alloc_dynamic(key.0, host, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -4155,6 +4189,7 @@ impl State {
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
             if let Some(known) = self.fresh_tables.get_mut(&key) {
+                let _p2_fhit = crate::phase2_prof::span(crate::phase2_prof::t::TBL_FRESH_HIT);
                 crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FRESH_HIT);
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
@@ -4207,15 +4242,17 @@ impl State {
                 continue;
             }
             crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FRESH_MISS);
-            let Some(first) = host.dynamic(n) else {
-                // No room: the draw must not run with the title's own
-                // offsets (slots never made for it); `bind` drops it.
-                made.push((slot, u32::MAX));
-                continue;
+            let first = {
+                let _p2_dyn = crate::phase2_prof::span(crate::phase2_prof::t::TBL_DYN);
+                let Some(first) = self.alloc_dynamic(std::ptr::from_ref(heap) as usize, host, n) else {
+                    // No room: the draw must not run with the title's own
+                    // offsets (slots never made for it); `bind` drops it.
+                    made.push((slot, u32::MAX));
+                    continue;
+                };
+                self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+                first
             };
-            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -4223,6 +4260,7 @@ impl State {
             // which may lie over slots shaders pick by index, only the ones
             // the shader names.)
             if let Some(title) = title_first {
+                let _p2_dyn = crate::phase2_prof::span(crate::phase2_prof::t::TBL_DYN);
                 let frame = crate::frame::current();
                 if n <= 64 {
                     host.slots_tabled(title, n, frame);
@@ -4339,6 +4377,7 @@ impl State {
                         && listed.texture
                         && listed.tabled != Some((title + k, kind.is_some()))
                     {
+                        let _p2_ma = crate::phase2_prof::span(crate::phase2_prof::t::TBL_MIR_AFTER);
                         listed.tabled = Some((title + k, kind.is_some()));
                         host.texture_slot_tabled(title + k, kind.is_some());
                         if kind.is_some() {

@@ -842,7 +842,7 @@ fn sweep() {
         card_steps::trim();
         crate::shadow::trim_snapshots();
         crate::list::trim_idle(128);
-        crate::list::thin::trim_backs(16);
+        crate::list::thin::trim_backs(64);
     } else {
         trim_upload_pool(upload_pool_budget());
     }

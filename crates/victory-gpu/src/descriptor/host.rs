@@ -2939,6 +2939,7 @@ impl HostHeap {
     /// returned).
     ///
     /// [`dynamic`]: HostHeap::dynamic
+    #[allow(dead_code)]
     pub(crate) fn release(&self, first: u32, n: u32) {
         let Some(at) = first.checked_sub(self.count) else {
             return;
@@ -2948,6 +2949,29 @@ impl HostHeap {
         if (at as usize) < end {
             let given = guard.1.clear_range(at as usize, end);
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
+            self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Gives back a batch of `(first, n)` dynamic slot ranges under a single
+    /// `self.next` lock acquisition.
+    pub(crate) fn release_batch(&self, ranges: &[(u32, u32)]) {
+        if ranges.is_empty() {
+            return;
+        }
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let mut given_total = 0u32;
+        for &(first, n) in ranges {
+            let Some(at) = first.checked_sub(self.count) else {
+                continue;
+            };
+            let end = (at + n).min(self.dynamic) as usize;
+            if (at as usize) < end {
+                given_total = given_total.saturating_add(guard.1.clear_range(at as usize, end));
+            }
+        }
+        if given_total > 0 {
+            self.free.fetch_add(given_total, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
         }
     }

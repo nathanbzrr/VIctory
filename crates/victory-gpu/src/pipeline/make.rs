@@ -507,22 +507,47 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// Per-frame compute wait cap once world startup has completed
+/// (`VICTORY_COMPUTE_LATE_WAIT_MS`, default 400 ms; 0 = use full `compute_budget`).
+/// Startup frames (`frame < 180`) and the head blend-shape shader
+/// (`61e54e90adccaf6a`) always keep the full `VICTORY_COMPUTE_WAIT_MS` budget.
+fn compute_late_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let millis = std::env::var("VICTORY_COMPUTE_LATE_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(400);
+        Duration::from_millis(millis)
+    })
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let compute = p.compute && !compute_budget().is_zero();
     let screen = !compute && p.screen && !screen_budget().is_zero();
-    // Critical once-only compute passes (such as the character head blend-shape
-    // map `61e54e90adccaf6a`) always keep an exclusive compute wait budget so
-    // they can never be starved by concurrent recording threads. Regular
-    // gameplay compute pipelines share the per-frame compute budget so a burst
-    // of new effect shaders never stacks 2x-4x (10+ second) freezes in one frame.
+    // Critical once-only compute passes (startup world frames and the character
+    // head blend-shape map `61e54e90adccaf6a`) always keep the full exclusive
+    // compute wait budget (`VICTORY_COMPUTE_WAIT_MS`). Later gameplay effect
+    // shaders use a capped shared budget so a single slow shader compiles in the
+    // background without freezing gameplay for 5 seconds.
     let critical_compute = compute
-        && (frame < 120
+        && (frame < 180
             || p.shaders
                 .iter()
                 .any(|s| s.hash == "61e54e90adccaf6a"));
     let (bucket, budget, shared) = if compute {
-        (2usize, compute_budget(), !critical_compute && shared_budget())
+        let b = if critical_compute {
+            compute_budget()
+        } else {
+            let late = compute_late_budget();
+            if late.is_zero() {
+                compute_budget()
+            } else {
+                compute_budget().min(late)
+            }
+        };
+        (2usize, b, !critical_compute && shared_budget())
     } else if screen {
         (1usize, screen_budget(), shared_budget())
     } else {
