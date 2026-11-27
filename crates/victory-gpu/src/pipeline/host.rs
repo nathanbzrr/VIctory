@@ -714,9 +714,20 @@ impl HostPipeline {
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
-                |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
+                |library, name| {
+                    let _p2_l = crate::phase2_prof::span(crate::phase2_prof::t::PSO_LOAD_CACHE);
+                    let r = unsafe { library.LoadComputePipeline(name, &desc) };
+                    if r.is_ok() {
+                        crate::phase2_prof::inc(crate::phase2_prof::c::PSO_CACHE_HITS);
+                    }
+                    r
+                },
                 // SAFETY: as above.
-                || unsafe { host.device.CreateComputePipelineState(&desc) },
+                || {
+                    let _p2_c = crate::phase2_prof::span(crate::phase2_prof::t::PSO_CREATE_CS);
+                    crate::phase2_prof::inc(crate::phase2_prof::c::PSO_LIVE_COMPILES);
+                    unsafe { host.device.CreateComputePipelineState(&desc) }
+                },
             );
             let pso = match made {
                 Ok(pso) => pso,
@@ -865,9 +876,20 @@ impl HostPipeline {
             super::library::pipeline(
                 name,
                 // SAFETY: the description points at live data.
-                |library, name| unsafe { library.LoadGraphicsPipeline(name, desc) },
+                |library, name| {
+                    let _p2_l = crate::phase2_prof::span(crate::phase2_prof::t::PSO_LOAD_CACHE);
+                    let r = unsafe { library.LoadGraphicsPipeline(name, desc) };
+                    if r.is_ok() {
+                        crate::phase2_prof::inc(crate::phase2_prof::c::PSO_CACHE_HITS);
+                    }
+                    r
+                },
                 // SAFETY: as above.
-                || unsafe { host.device.CreateGraphicsPipelineState(desc) },
+                || {
+                    let _p2_c = crate::phase2_prof::span(crate::phase2_prof::t::PSO_CREATE_GFX);
+                    crate::phase2_prof::inc(crate::phase2_prof::c::PSO_LIVE_COMPILES);
+                    unsafe { host.device.CreateGraphicsPipelineState(desc) }
+                },
             )
         };
         let mut made = make(&desc, &name(rect_gs.as_ref()));

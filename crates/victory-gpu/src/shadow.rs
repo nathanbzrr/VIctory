@@ -88,6 +88,11 @@ pub(crate) struct Shadow {
     unsized_asks: AtomicU64,
     /// Whether shaders were ever declared to write it.
     written: std::sync::atomic::AtomicBool,
+    /// Per-64 KiB page bitmap of pages ever declared GPU-written by a shader.
+    /// Enables lock-free range-aware `VICTORY_PORT_CBV_SHADOW=2` so read-only
+    /// CBV sub-ranges inside a large heap (e.g. the 174 MB heap) are not
+    /// blocked by skinning UAV writes in disjoint pages.
+    gpu_written_pages: Box<[AtomicU64]>,
     /// A number no other copy has had. Its address is no name for a copy:
     /// one let go and another made may share it.
     id: u64,
@@ -1569,7 +1574,7 @@ static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// for the big heap's, which then got another, until eight of them were
 /// reserved (1.4 GB in run 24).
 fn pooled(n: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pool = crate::phase2_prof::lock_mutex(crate::phase2_prof::lock::L_SHADOW_POOL, &POOL);
     let most = n.saturating_mul(4).max(1 << 20);
     let fit = pool
         .iter()
@@ -2965,6 +2970,14 @@ mod merge_tests {
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+pub(crate) fn live_stats() -> (u64, u64, u64) {
+    (
+        LIVE[0].load(Ordering::Relaxed),
+        LIVE[1].load(Ordering::Relaxed),
+        KEPT_BYTES.load(Ordering::Relaxed),
+    )
+}
+
 impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
@@ -3606,6 +3619,10 @@ impl Shadow {
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
             written: Default::default(),
+            gpu_written_pages: (0..(pages as usize).div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             id: {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -3635,6 +3652,52 @@ impl Shadow {
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
+    /// Marks all 64 KiB pages overlapping `[address, address + len)` as having
+    /// been declared GPU-written by a shader.
+    #[inline]
+    pub(crate) fn mark_gpu_written_range(&self, address: u64, len: u64) {
+        if len == 0 || self.gpu_written_pages.is_empty() {
+            return;
+        }
+        let (from, to) = self.inside(address as usize, len as usize);
+        if from >= to {
+            return;
+        }
+        let first = from / PAGE;
+        let last = (to - 1) / PAGE;
+        for p in first..=last {
+            if let Some(slot) = self.gpu_written_pages.get(p >> 6) {
+                let bit = 1u64 << (p & 63);
+                if slot.load(Ordering::Relaxed) & bit == 0 {
+                    slot.fetch_or(bit, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    /// Whether any 64 KiB page overlapping `[address, address + len)` has ever
+    /// been declared GPU-written by a shader.
+    #[inline]
+    pub(crate) fn is_gpu_written_in(&self, address: u64, len: u64) -> bool {
+        if len == 0 || self.gpu_written_pages.is_empty() {
+            return false;
+        }
+        let (from, to) = self.inside(address as usize, len as usize);
+        if from >= to {
+            return false;
+        }
+        let first = from / PAGE;
+        let last = (to - 1) / PAGE;
+        for p in first..=last {
+            if let Some(slot) = self.gpu_written_pages.get(p >> 6)
+                && (slot.load(Ordering::Acquire) & (1u64 << (p & 63))) != 0
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
@@ -3646,6 +3709,7 @@ impl Shadow {
         }
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
+        self.mark_gpu_written_range(address, len);
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -3661,6 +3725,7 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        self.mark_gpu_written_range(address as u64, len as u64);
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
@@ -5500,7 +5565,7 @@ struct Entry {
 static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
 fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    let map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
+    let map = crate::phase2_prof::write_rw(crate::phase2_prof::lock::L_BUFFERS_W, &BUFFERS);
     // What threads remember of it ([`FOUND`]) is of before.
     BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
     map
@@ -5560,7 +5625,7 @@ fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
 }
 
 fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.read().unwrap_or_else(|e| e.into_inner())
+    crate::phase2_prof::read_rw(crate::phase2_prof::lock::L_BUFFERS_R, &BUFFERS)
 }
 
 /// A title buffer exists at `start` (`len` bytes).
@@ -6072,7 +6137,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // 16.5% of their time in profile belobug-9), and the write lock is
     // taken only to make a window.
     {
-        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        let map = crate::phase2_prof::read_rw(crate::phase2_prof::lock::L_LOOSE_R, &LOOSE);
         let key = if unsized_ask && tails() {
             let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
             longest_tail(there, address, end)
@@ -6087,7 +6152,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             return Some(shadow.clone());
         }
     }
-    let map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let map = crate::phase2_prof::write_rw(crate::phase2_prof::lock::L_LOOSE_W, &LOOSE);
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
@@ -6242,14 +6307,14 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // Found (nearly always): under the shared lock, so that list threads
     // asking at once do not queue (6.7% of their time in profile belobug-10).
     {
-        let map = EXACT.read().unwrap_or_else(|e| e.into_inner());
+        let map = crate::phase2_prof::read_rw(crate::phase2_prof::lock::L_EXACT_R, &EXACT);
         if let Some((shadow, used)) = map.get(&(address, len)) {
             used.store(now, Ordering::Relaxed);
             shadow.used.store(crate::host::moment(), Ordering::Relaxed);
             return Some(shadow.clone());
         }
     }
-    let mut map = EXACT.write().unwrap_or_else(|e| e.into_inner());
+    let mut map = crate::phase2_prof::write_rw(crate::phase2_prof::lock::L_EXACT_W, &EXACT);
     if let Some((shadow, used)) = map.get(&(address, len)) {
         used.store(now, Ordering::Relaxed);
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);

@@ -246,12 +246,15 @@ pub(super) unsafe fn send(
     // landing thread's `give_back` does not contend with submission recording.
     drop(guard);
     // SAFETY: a fence of ours that the copy queue signals.
-    if let Err(e) = unsafe { drawing.Wait(&fence, sent) } {
-        // The drawing queue cannot be made to wait: wait here, so that
-        // what follows still finds the bytes.
-        tracing::warn!(error = %e, "the drawing queue could not wait for the up queue: waited on the CPU");
-        // SAFETY: as above; a null event waits until the value is reached.
-        let _ = unsafe { fence.SetEventOnCompletion(sent, windows::Win32::Foundation::HANDLE::default()) };
+    {
+        let _p2_dw = crate::phase2_prof::span(crate::phase2_prof::t::CB_UPQ_DRAW_WAIT);
+        if let Err(e) = unsafe { drawing.Wait(&fence, sent) } {
+            // The drawing queue cannot be made to wait: wait here, so that
+            // what follows still finds the bytes.
+            tracing::warn!(error = %e, "the drawing queue could not wait for the up queue: waited on the CPU");
+            // SAFETY: as above; a null event waits until the value is reached.
+            let _ = unsafe { fence.SetEventOnCompletion(sent, windows::Win32::Foundation::HANDLE::default()) };
+        }
     }
     let mut at = 0u64;
     let mut total_bytes = 0u64;

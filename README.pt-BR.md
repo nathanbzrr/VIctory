@@ -20,7 +20,7 @@ Medido em **Ryzen 5 5600 (6C/12T), Radeon RX 9060 XT 16 GB, 16 GB DDR4, Windows 
 | Tráfego copy-back | 27.0 MB / quadro | **0.5 MB / quadro** |
 | CPU `preparing` | 45.8 ms | **32.2 – 35.4 ms** |
 | Quadro real (mín / med) | 68.6 / 73.1 ms | **64.3 / 66.2 – 69.6 ms** |
-| FPS nativo e estabilidade (sem FG, 180 s) | 14.08 FPS (média 71.03 ms, p99 152.1 ms / 1% low 6.6 FPS, máx. 194.2 ms) | **14.23 FPS** (média **70.29 ms**, p50 **69.35 ms**, p99 **97.9 ms** / 1% low **10.2 FPS**, máx. **104.4 ms**) |
+| FPS nativo e estabilidade (sem FG, mundo aberto estável) | 14.08 FPS (média 71.03 ms, p99 152.1 ms / 1% low 6.6 FPS) | **16.6 – 19.5 FPS** (p50 **60.0 ms**, `victory-submit` **34.4 ms** vs 59.7 ms, `VirtualQuery` **0.00 ms**, `BufferSweep` **0.82 ms**, `0` OOM / `0` emergency reclaim) |
 | Passe `heap buffers` (máx. / picos >50 ms) | 821.1 ms (8 picos >50 ms) | **33.8 ms (0 picos >50 ms; estável 8.6–10.0 ms)** |
 | Esperas `settle` e `take()` (estável sem FG) | 0.2–2.6 ms settle / 0.75–1.07 ms `take()` | **0.0 ms settle / 0.31–0.47 ms `take()`** |
 | FPS exibido (FSR 3.1.6 FG) | 25–27 FPS (quedas VSync para 15–20) | **29.2 – 31.0 FPS** (sem quedas VSync) |
@@ -34,11 +34,12 @@ Medido em **Ryzen 5 5600 (6C/12T), Radeon RX 9060 XT 16 GB, 16 GB DDR4, Windows 
 - **Envio CPU e copy-back:** escritas write-combined mantidas em VRAM (`27 -> 0.5 MB/quadro`); skip AVX2 `vptest` de 128 B e `merge_piece` vetorizado; pool lock-free work-stealing em `land`; shards write-watch alinhados em 64 B; varredura fundida `ask_once`/`stale_under_flights`; `mirror` lock-free; `OnceLock` em assinaturas de comando; `Few<Barrier, 16>` na pilha; `PLACED_TEXTURES` em 64 shards; `unfold` sem lock e `wake()` lock-free; zeragem de `upload::ARENAS` fora do mutex; prioridade elevada em 6 núcleos; listas pré-planejadas; hash antes de detile; reuso de buffers de upload.
 - **Auto-VRAM dinâmico DXGI e redução de Shared GPU:** escalonamento automático 8 / 12 / 16 / 24+ GB via `DedicatedVideoMemory` e `DXGI_QUERY_VIDEO_MEMORY_INFO` ao vivo (`VICTORY_VRAM_MODE=auto|8gb|12gb|16gb|24gb|legacy`, suporte a `"auto"` e overrides manuais, detecção UMA e redução gradual por margem de Commit). Em GPUs de 16 GB adapta o limite à RAM: `<=20 GB` RAM usa `84%` keep / `90%` room (`12.11 GB` VRAM, `2.18 GB` Shared GPU, sem paginação de working set, `+55%` em 1% low FPS) e `>=32 GB` RAM usa `91%` keep / `95%` room (`~13.2–14.2 GB` VRAM). Janelas VRAM diretas sem staging (`CardCpu::Direct`), cópias CPU compactas (`CardCpu::Cpu`), fila `DIRTY_CARDED` O(dirty), descarte incremental de janelas com histerese (máx. 8/s), scratch compartilhado para depth-stencil (upstream `#2162`), correção do limiar `host_pressure` em 16 GB RAM (`send_allocs` `117/15s -> 0/15s`), autodetecção NVMe (`VICTORY_FILE_PHYSICAL=auto`) e contabilização apenas do título em `XMemGetWorkingSetStatistics`.
 - **Frame pacing e eliminação de picos (nativo sem FG):** `sweep()` assíncrono incremental (`victory-sweep`, `VICTORY_SWEEP_ASYNC=1`) removendo o dreno síncrono `settle(WHY_SYNC)` a cada 1.5 s; coletor em segundo plano `bury()` com throttling (`victory-bury`, `VICTORY_BURY_ASYNC=1`); esperas `WHY_FENCE`/`WHY_VALUE` via `Line.seq` sem travar `host.submitted`; omissão de `sync_heaps` redundante em `execute_own` (`0.0` rodadas sem marca); varredura de 64 bits `AtomicU64` em `port_descriptors::take()` (`2–3×` mais rápida); `frame::wait` preciso sem `Sleep(0)`; telemetria por quadro `present pacing` (`avg / p50 / p95 / p99 / 1% low / max / >50 ms / >100 ms`, `VICTORY_FRAME_TIMES_FILE`) e `heap buffers` plano (`VICTORY_TEXTURE_STAGE_MS=4`, `VICTORY_TEXTURE_CATCHUP=0`, `0` picos >50 ms).
-- **Correções e controles:** orçamento de espera compute (`5000 ms`) corrigindo rostos ausentes; skip do shader problemático em RDNA4 (`240cb516c1af0bc3`); filtro de probes roxos; flips assíncronos seguros; retry de detile; teclado e mouse PC (`F2`/`~` câmera, `F3` overlay FPS).
+- **Fase 2 — otimização de envio CPU e descritores (`feat/phase2-30fps`):** cache `VirtualQuery` `MappedCache` entre envios com invalidação por faixa em `card_steps` (`12.56 ms / 36 chamadas -> 0.00 ms / 0 chamadas`, `own_cs` `15.1 -> 2.7 ms`); tabela atômica lock-free por slot `ENTRY_GENS` + cache TLS de 8192 entradas para `descriptor::VIEWS` e `words_for` (`100.0%` de acerto); `BufferSweep` incremental por cópia e omissão de slots inalterados em `heap_buffer_pass` (`HBP_SPANS` `10.94 -> 0.82 ms`); pools ampliados `PRELUDES_MOST` `(256, 64)`, `send::SPARE` `(256/128 MiB)` e `VICTORY_LIST_IDLE_MOST=320` eliminando churn de listas/buffers D3D12 por quadro; cache `Batch::last_ahead`; bitmap por página de 64 KiB `gpu_written_pages` para `PORT_CBV`; HUD no canto superior direito (`VICTORY_PANEL_POS=top-right`); profiler opcional (`VICTORY_PHASE2_PROFILE=1`).
+- **Correções e controles:** orçamento de espera compute (`5000 ms`) corrigindo rostos ausentes; skip do shader problemático em RDNA4 (`240cb516c1af0bc3`); filtro de probes roxos; flips assíncronos seguros; retry de detile; teclado e mouse PC (`F2`/`~` câmera, `F3` overlay FPS no canto superior direito).
 
 ## Limites conhecidos (em andamento na `dev`)
 
-- 30 FPS nativos (`<= 33.3 ms`) ainda são limitados pela thread `victory-submit` (`49–60 ms/quadro`; GPU em 52–58%).
+- 30 FPS nativos (`<= 33.3 ms`) seguem em otimização na `dev`: `victory-submit` já caiu para `34.4 ms/quadro`; o próximo foco é a gravação paralela (`victory-list-0..3`) e cópias de CBV.
 - Picos de Commit na transição prólogo -> mundo aberto em arquivos de paginação apertados são mitigados na `dev` via `emergency_reclaim()` e autodetecção NVMe (`VICTORY_FILE_PHYSICAL=auto`).
 
 ## Início rápido
@@ -77,7 +78,7 @@ $env:RUSTFLAGS = "-C target-cpu=znver3"
 cargo build --release --locked -p victory
 ```
 
-SHA-256 de `RAZDA4A_XEN.exe`: `e90b23f05f6d3caa488beaf3afc4cd0e94151b75a33606bfd75594a373e4f18b`
+SHA-256 de `RAZDA4A_XEN.exe`: `044366d1ddc3e72c815273f600d1fce5ce6efad3af42ac3a5d0155080964be77`
 
 ## Branches e licença
 

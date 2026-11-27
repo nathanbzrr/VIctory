@@ -604,15 +604,134 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     (place(reader)? >= cut).then_some(cut)
 }
 
-/// Per-submission cache of verified readable memory regions and pages, using a
-/// single `VirtualQuery` to verify whole committed spans (e.g. the 174 MB heap)
-/// instead of hundreds of per-page `ReadProcessMemory` syscalls.
+/// Cross-submission cache of verified readable memory regions and pages, using
+/// a single `VirtualQuery` to verify whole committed spans (e.g. the 174 MB
+/// heap) instead of repeating kernel `VirtualQuery` walks every submission.
+/// Range-granularly invalidated by [`invalidate_mapped_range`] whenever title
+/// memory is unmapped, freed, or remapped — so unrelated texture streaming
+/// remaps never evict the static buffer heap spans.
 #[derive(Default)]
 struct MappedCache {
-    /// Verified committed readable regions `(start, end)`.
+    /// Sorted, non-overlapping verified committed readable regions `(start, end)`.
     regions: Vec<(usize, usize)>,
     /// Verified individual pages (fallback when a region is guarded or mixed).
     pages: HashMap<usize, ()>,
+}
+
+impl MappedCache {
+    /// Returns the end of the cached region covering `addr`, if any.
+    #[inline]
+    fn find_end(&self, addr: usize) -> Option<usize> {
+        let idx = self.regions.partition_point(|&(lo, _)| lo <= addr);
+        if idx == 0 {
+            return None;
+        }
+        let (_, hi) = self.regions[idx - 1];
+        (addr < hi).then_some(hi)
+    }
+
+    #[inline]
+    fn covers(&self, from: usize, to: usize) -> bool {
+        self.find_end(from).is_some_and(|hi| to <= hi)
+    }
+
+    fn insert_region(&mut self, lo: usize, hi: usize) {
+        if lo >= hi {
+            return;
+        }
+        const MAX_REGIONS: usize = 512;
+        if self.regions.len() >= MAX_REGIONS {
+            self.regions.clear();
+        }
+        let mut idx = self.regions.partition_point(|&(r_lo, _)| r_lo < lo);
+        let mut new_lo = lo;
+        let mut new_hi = hi;
+        if idx > 0 && self.regions[idx - 1].1 >= new_lo {
+            idx -= 1;
+            new_lo = new_lo.min(self.regions[idx].0);
+            new_hi = new_hi.max(self.regions[idx].1);
+        }
+        let mut end = idx;
+        while end < self.regions.len() && self.regions[end].0 <= new_hi {
+            new_hi = new_hi.max(self.regions[end].1);
+            end += 1;
+        }
+        self.regions.splice(idx..end, std::iter::once((new_lo, new_hi)));
+    }
+
+    /// Removes only `[at, at + len)` from cached readable regions and pages.
+    /// When `len == 0` (whole-allocation free), removes any region containing `at`
+    /// and clears fallback pages.
+    fn invalidate_range(&mut self, at: usize, len: usize) {
+        if len == 0 {
+            if at == 0 {
+                self.regions.clear();
+                self.pages.clear();
+                return;
+            }
+            let idx = self.regions.partition_point(|&(lo, _)| lo <= at);
+            if idx > 0 && self.regions[idx - 1].1 > at {
+                self.regions.remove(idx - 1);
+            }
+            self.pages.clear();
+            return;
+        }
+        let u_lo = at;
+        let u_hi = at.saturating_add(len);
+        if !self.regions.is_empty() {
+            let mut idx = self.regions.partition_point(|&(lo, _)| lo < u_lo);
+            if idx > 0 && self.regions[idx - 1].1 > u_lo {
+                idx -= 1;
+            }
+            let mut end = idx;
+            while end < self.regions.len() && self.regions[end].0 < u_hi {
+                end += 1;
+            }
+            if idx < end {
+                let first_lo = self.regions[idx].0;
+                let last_hi = self.regions[end - 1].1;
+                let mut replacement = [None, None];
+                let mut n = 0;
+                if first_lo < u_lo {
+                    replacement[n] = Some((first_lo, u_lo));
+                    n += 1;
+                }
+                if last_hi > u_hi {
+                    replacement[n] = Some((u_hi, last_hi));
+                    n += 1;
+                }
+                self.regions.splice(idx..end, replacement[..n].iter().flatten().copied());
+            }
+        }
+        if !self.pages.is_empty() {
+            let first_p = u_lo / 4096;
+            let last_p = u_hi.div_ceil(4096);
+            self.pages.retain(|&p, _| p < first_p || p >= last_p);
+        }
+    }
+}
+
+/// Fast atomic flag so `invalidate_mapped_range` skips locking before first use.
+static MAPPED_HAS_DATA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Persistent readable-span cache shared across submissions (locked once per
+/// `take_steps` call under the submission lock).
+static PERSISTENT_MAPPED: Mutex<MappedCache> = Mutex::new(MappedCache {
+    regions: Vec::new(),
+    pages: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+});
+
+/// Evicts `[at, at + len)` (or the allocation containing `at` when `len == 0`)
+/// from the cross-submission `VirtualQuery` readable-span cache.
+pub(crate) fn invalidate_mapped_range(at: usize, len: usize) {
+    if !MAPPED_HAS_DATA.load(Ordering::Acquire) {
+        return;
+    }
+    let mut cache = PERSISTENT_MAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    cache.invalidate_range(at, len);
+    if cache.regions.is_empty() && cache.pages.is_empty() {
+        MAPPED_HAS_DATA.store(false, Ordering::Release);
+    }
 }
 
 /// Whether every page of `[from, to)` can be read.
@@ -629,15 +748,20 @@ fn mapped(from: usize, to: usize, cache: &mut MappedCache) -> bool {
         | PAGE_EXECUTE_READ
         | PAGE_EXECUTE_READWRITE
         | PAGE_EXECUTE_WRITECOPY;
-    if cache.regions.iter().any(|&(lo, hi)| from >= lo && to <= hi) {
+    if cache.covers(from, to) {
+        crate::phase2_prof::inc(crate::phase2_prof::c::CS_MAPPED_HITS);
         return true;
     }
     let mut cur = from;
     while cur < to {
-        if let Some(&(_, hi)) = cache.regions.iter().find(|&&(lo, hi)| cur >= lo && cur < hi) {
+        if let Some(hi) = cache.find_end(cur) {
+            crate::phase2_prof::inc(crate::phase2_prof::c::CS_MAPPED_HITS);
             cur = hi;
             continue;
         }
+        crate::phase2_prof::inc(crate::phase2_prof::c::CS_MAPPED_MISSES);
+        crate::phase2_prof::inc(crate::phase2_prof::c::CS_VQ_CALLS);
+        crate::phase2_prof::inc(crate::phase2_prof::c::OS_VIRTUAL_QUERY);
         let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let ok = unsafe {
             VirtualQuery(
@@ -650,9 +774,8 @@ fn mapped(from: usize, to: usize, cache: &mut MappedCache) -> bool {
             let r_lo = mbi.BaseAddress as usize;
             let r_hi = r_lo.saturating_add(mbi.RegionSize);
             if r_hi > cur {
-                if cache.regions.len() < 64 {
-                    cache.regions.push((r_lo, r_hi));
-                }
+                cache.insert_region(r_lo, r_hi);
+                MAPPED_HAS_DATA.store(true, Ordering::Release);
                 cur = r_hi;
                 continue;
             }
@@ -663,7 +786,11 @@ fn mapped(from: usize, to: usize, cache: &mut MappedCache) -> bool {
             if !read_into(cur as *const u8, &mut [0]) {
                 return false;
             }
+            if cache.pages.len() >= 4096 {
+                cache.pages.clear();
+            }
             cache.pages.insert(page, ());
+            MAPPED_HAS_DATA.store(true, Ordering::Release);
         }
         cur = (page + 1) * PAGE;
     }
@@ -840,8 +967,10 @@ impl Host {
         if stage() == 0 || !relay_exact() {
             return None;
         }
+        let _p2_cs = crate::phase2_prof::span(crate::phase2_prof::t::CS_TOTAL);
         let began = std::time::Instant::now();
         let written = {
+            let _p2_ll = crate::phase2_prof::span(crate::phase2_prof::t::CS_LOCK_LINE);
             let line = line();
             if line.written.is_empty() {
                 return None;
@@ -849,12 +978,20 @@ impl Host {
             line.written.clone()
         };
         let looked = crate::timeline::span("steps on the card: whether in the way");
-        blocked_by(&written, runs, false)?;
-        let copies = {
-            let line = line();
-            copies(&line)
+        {
+            let _p2_bb = crate::phase2_prof::span(crate::phase2_prof::t::CS_BLOCKED_BY);
+            blocked_by(&written, runs, false)?;
+        }
+        let (copies, read) = {
+            let _p2_cp = crate::phase2_prof::span(crate::phase2_prof::t::CS_COPIES);
+            let copies = {
+                let line = line();
+                copies(&line)
+            };
+            let read = copied_read(&copies, runs);
+            (copies, read)
         };
-        let read = copied_read(&copies, runs);
+        let _ = &copies;
         looked.end();
         let taken = if read {
             Err("a copy done on the card is read through another host copy")
@@ -877,13 +1014,20 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
-        let (does, steps, mut targets) = does_of(written, runs);
-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
+        let (does, steps, mut targets) = {
+            let _p2_do = crate::phase2_prof::span(crate::phase2_prof::t::CS_DOES_OF);
+            does_of(written, runs)
+        };
+        let chosen = {
+            let _p2_pl = crate::phase2_prof::span(crate::phase2_prof::t::CS_PLAN);
+            plan(&does, stage(), placed_order(), &mut None)?
+        };
         if chosen.is_empty() {
             return Ok(None);
         }
         spent.next("steps on the card: what holds their bytes");
         let mut writers = {
+            let _p2_ll = crate::phase2_prof::span(crate::phase2_prof::t::CS_LOCK_LINE);
             let line = line();
             let mut all = writers(&line.line);
             all.extend(line.landing.iter().map(|w| Writer {
@@ -893,14 +1037,12 @@ impl Host {
             all
         };
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
-        // The places read (host copy, address, bytes, level): where in the
-        // buffer between their bytes are.
         let mut places: HashMap<(usize, usize, usize, u32), u64> = HashMap::default();
-        // Some 2,800 fills a frame, of a few hundred places: what holds each
-        // is looked for once, as long as no copy is added to the writers.
         let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
-        let mut room = MappedCache::default();
+        let mut room = PERSISTENT_MAPPED.lock().unwrap_or_else(|e| e.into_inner());
         let mut end = 0u64;
+        let (mut p2_holder_us, mut p2_mapped_us, mut p2_else_us) = (0u64, 0u64, 0u64);
+        let p2_on = crate::phase2_prof::on();
         for &(i, level) in &chosen {
             let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
                 continue;
@@ -914,7 +1056,11 @@ impl Host {
             let from = match held.get(&(src, len)) {
                 Some(from) => from.clone(),
                 None => {
+                    let t0 = p2_on.then(std::time::Instant::now);
                     let from = holder(&writers, src, src + len)?;
+                    if let Some(t0) = t0 {
+                        p2_holder_us += t0.elapsed().as_micros() as u64;
+                    }
                     held.insert((src, len), from.clone());
                     from
                 }
@@ -926,7 +1072,12 @@ impl Host {
                     if end + len as u64 > BETWEEN {
                         return Err("too much at once");
                     }
-                    if !mapped(src, src + len, &mut room) {
+                    let t0 = p2_on.then(std::time::Instant::now);
+                    let ok = mapped(src, src + len, &mut room);
+                    if let Some(t0) = t0 {
+                        p2_mapped_us += t0.elapsed().as_micros() as u64;
+                    }
+                    if !ok {
                         return Err("not all of what it reads is mapped");
                     }
                     let at = end;
@@ -937,15 +1088,28 @@ impl Host {
             };
             let to = match does[i] {
                 Does::Copy { .. } => {
+                    crate::phase2_prof::inc(crate::phase2_prof::c::CS_COPIES);
+                    let t0 = p2_on.then(std::time::Instant::now);
                     let to = holder(&writers, dst, dst + len)?;
-                    if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
+                    if let Some(t0) = t0 {
+                        p2_holder_us += t0.elapsed().as_micros() as u64;
+                    }
+                    let t0 = p2_on.then(std::time::Instant::now);
+                    let els = elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len);
+                    if let Some(t0) = t0 {
+                        p2_else_us += t0.elapsed().as_micros() as u64;
+                    }
+                    if els {
                         return Err("another host copy of what it writes is read");
                     }
-                    if !mapped(dst, dst + len, &mut room) {
+                    let t0 = p2_on.then(std::time::Instant::now);
+                    let ok = mapped(dst, dst + len, &mut room);
+                    if let Some(t0) = t0 {
+                        p2_mapped_us += t0.elapsed().as_micros() as u64;
+                    }
+                    if !ok {
                         return Err("not all of what it writes is mapped");
                     }
-                    // What the steps behind it read of it is in that host
-                    // copy, or nowhere.
                     writers.push(Writer {
                         shadow: Some(to.clone()),
                         from: dst,
@@ -955,11 +1119,14 @@ impl Host {
                     held.retain(|&(s, l), _| !meet((s, s + l), (dst, dst + len)));
                     To::Copy(to, dst)
                 }
-                _ => match targets[i].take() {
-                    Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
-                    Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
-                    None => continue,
-                },
+                _ => {
+                    crate::phase2_prof::inc(crate::phase2_prof::c::CS_FILLS);
+                    match targets[i].take() {
+                        Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
+                        Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
+                        None => continue,
+                    }
+                }
             };
             ops.push(Op {
                 from: (from, src),
@@ -968,6 +1135,11 @@ impl Host {
                 level,
                 to,
             });
+        }
+        if p2_on {
+            crate::phase2_prof::record_time(crate::phase2_prof::t::CS_HOLDER, p2_holder_us);
+            crate::phase2_prof::record_time(crate::phase2_prof::t::CS_MAPPED_VQ, p2_mapped_us);
+            crate::phase2_prof::record_time(crate::phase2_prof::t::CS_ELSEWHERE, p2_else_us);
         }
         // The staged bytes feed copies and descriptor slots. If any source or
         // destination is out of range, leave the whole plan to the normal path
@@ -997,56 +1169,56 @@ impl Host {
             }
         }
         spent.next("steps on the card: the list");
-        let Some(own) = self.own_list() else {
-            return Err("no host list or buffer for it");
-        };
-        // First every refresh, then the writes: the bytes compared with are
-        // the title's. (One step for each host copy, over all that is read of
-        // it: a flush brings a copy up to date from the first range asked for
-        // to the last, whatever the steps.)
-        let mut spans: ByCopy<(Arc<Shadow>, usize, usize)> = ByCopy::default();
-        for op in &ops {
-            let to = match &op.to {
-                To::Copy(to, dst) => Some((to, *dst)),
-                _ => None,
+        let (copies_recorded, fills_recorded) = {
+            let _p2_rec = crate::phase2_prof::span(crate::phase2_prof::t::CS_RECORD);
+            let Some(own) = self.own_list() else {
+                return Err("no host list or buffer for it");
             };
-            for (shadow, at) in std::iter::once((&op.from.0, op.from.1)).chain(to) {
-                let span = spans.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| (shadow.clone(), at, at + op.len));
-                (span.1, span.2) = (span.1.min(at), span.2.max(at + op.len));
-            }
-        }
-        for (shadow, from, to) in spans.into_values() {
-            shadow.refresh(&own.list, from as u64, (to - from) as u64);
-        }
-        let mut copied = Vec::new();
-        for op in &ops {
-            if let To::Copy(to, dst) = &op.to {
-                to.gpu_writes(&own.list, *dst as u64, op.len as u64);
-                copied.push((to.clone(), *dst, *dst + op.len));
-            }
-        }
-        #[cfg(feature = "diagnostics")]
-        own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
-        let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
-        for level in 0..=levels {
-            let mut reads = Vec::new();
-            let mut writes = Vec::new();
-            for op in ops.iter().filter(|op| op.level == level) {
-                let len = op.len as u64;
-                let read = (&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len);
-                // (Each place once.)
-                if places.remove(&(Arc::as_ptr(&op.from.0) as usize, op.from.1, op.len, level)).is_some() {
-                    reads.push(read);
-                }
-                match &op.to {
-                    To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
-                    To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
-                    To::Slot(..) => {}
+            let mut spans: ByCopy<(Arc<Shadow>, usize, usize)> = ByCopy::default();
+            for op in &ops {
+                let to = match &op.to {
+                    To::Copy(to, dst) => Some((to, *dst)),
+                    _ => None,
+                };
+                for (shadow, at) in std::iter::once((&op.from.0, op.from.1)).chain(to) {
+                    let span = spans.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| (shadow.clone(), at, at + op.len));
+                    (span.1, span.2) = (span.1.min(at), span.2.max(at + op.len));
                 }
             }
-            record(level == 0, &own.list.list, &own.between, &reads, &writes);
-        }
-        own.list.close();
+            for (shadow, from, to) in spans.into_values() {
+                shadow.refresh(&own.list, from as u64, (to - from) as u64);
+            }
+            let mut copied = Vec::new();
+            for op in &ops {
+                if let To::Copy(to, dst) = &op.to {
+                    to.gpu_writes(&own.list, *dst as u64, op.len as u64);
+                    copied.push((to.clone(), *dst, *dst + op.len));
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
+            let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
+            for level in 0..=levels {
+                let mut reads = Vec::new();
+                let mut writes = Vec::new();
+                for op in ops.iter().filter(|op| op.level == level) {
+                    let len = op.len as u64;
+                    let read = (&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len);
+                    if places.remove(&(Arc::as_ptr(&op.from.0) as usize, op.from.1, op.len, level)).is_some() {
+                        reads.push(read);
+                    }
+                    match &op.to {
+                        To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
+                        To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
+                        To::Slot(..) => {}
+                    }
+                }
+                record(level == 0, &own.list.list, &own.between, &reads, &writes);
+            }
+            own.list.close();
+            (copied, own)
+        };
+        let (copied, own) = (copies_recorded, fills_recorded);
         // SAFETY: a live buffer.
         let gpu = unsafe { own.between.GetGPUVirtualAddress() };
         spent.next("steps on the card: the slots");
@@ -1054,18 +1226,21 @@ impl Host {
         // several threads, a slot always on the same one, in the steps'
         // order.)
         let parts = if ops.len() < 256 { 1 } else { 4 };
-        crate::land::each_under(parts, &|part| {
-            crate::descriptor::constant_slots_batch(&own.between, gpu, |set_slot| {
-                for op in &ops {
-                    if let To::Slot(heap, index) = &op.to
-                        && *index as usize / 4 % parts == part
-                    {
-                        // (A heap that is gone: nothing can read the slot.)
-                        set_slot(*heap, *index, op.at, op.len as u32);
+        {
+            let _p2_cs = crate::phase2_prof::span(crate::phase2_prof::t::CS_CONST_SLOTS);
+            crate::land::each_under(parts, &|part| {
+                crate::descriptor::constant_slots_batch(&own.between, gpu, |set_slot| {
+                    for op in &ops {
+                        if let To::Slot(heap, index) = &op.to
+                            && *index as usize / 4 % parts == part
+                        {
+                            // (A heap that is gone: nothing can read the slot.)
+                            set_slot(*heap, *index, op.at, op.len as u32);
+                        }
                     }
-                }
+                });
             });
-        });
+        }
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
         let fills = (ops.len() - copies) as u64;
         let bytes: u64 = ops.iter().map(|op| op.len as u64).sum();
@@ -1614,5 +1789,36 @@ mod tests {
         eprintln!("{done} of 48 copies were done on the card, {} submissions waited", DONE[3].load(Ordering::Relaxed));
         eprintln!("settles for title memory under shader writes: {}", LATE_STATS[WHY_STALE].load(Ordering::Relaxed));
         assert!(done >= 20, "only {done} copies were done on the card");
+    }
+
+    #[test]
+    fn mapped_cache_merges_and_invalidates_on_epoch_change() {
+        let mut cache = MappedCache::default();
+        cache.insert_region(0x10000, 0x20000);
+        cache.insert_region(0x30000, 0x40000);
+        cache.insert_region(0x20000, 0x30000); // bridges both spans
+        assert_eq!(cache.regions, vec![(0x10000, 0x40000)]);
+        assert!(cache.covers(0x12000, 0x3F000));
+        assert!(!cache.covers(0x0F000, 0x20000));
+        assert!(!cache.covers(0x30000, 0x41000));
+        assert_eq!(cache.find_end(0x15000), Some(0x40000));
+        assert_eq!(cache.find_end(0x40000), None);
+
+        // Unrelated texture remap outside cached buffer heap leaves cache intact!
+        cache.invalidate_range(0x80000, 0x20000);
+        assert_eq!(cache.regions, vec![(0x10000, 0x40000)]);
+
+        // Punching a hole splits the span cleanly.
+        cache.invalidate_range(0x20000, 0x10000);
+        assert_eq!(cache.regions, vec![(0x10000, 0x20000), (0x30000, 0x40000)]);
+        assert!(cache.covers(0x10000, 0x20000));
+        assert!(!cache.covers(0x20000, 0x21000));
+        assert!(cache.covers(0x30000, 0x40000));
+
+        // Whole-allocation free (`len == 0`) drops only the containing span.
+        cache.pages.insert(0x123, ());
+        cache.invalidate_range(0x15000, 0);
+        assert_eq!(cache.regions, vec![(0x30000, 0x40000)]);
+        assert!(cache.pages.is_empty());
     }
 }

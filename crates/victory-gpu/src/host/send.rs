@@ -129,7 +129,7 @@ fn kept() -> u64 {
     match asked {
         Some(mb) => mb.saturating_mul(1 << 20),
         None if on_card() => 256 << 20,
-        None if crate::residency::limited_host_ram() => 128 << 20,
+        None if crate::residency::limited_host_ram() => 256 << 20,
         None => 768 << 20,
     }
 }
@@ -201,10 +201,10 @@ pub(super) fn trim() {
         drop(dropped);
         return;
     }
-    // Under moderate host pressure, keep up to 64 MiB of warm upload ring
-    // buffers so active frames do not thrash `CreateCommittedResource` 100+
-    // times every 15 seconds.
-    const WARM_CAP: u64 = 64 << 20;
+    // Under moderate host pressure, keep up to 128 MiB of warm upload ring
+    // buffers so active frames do not thrash `CreateCommittedResource` across
+    // in-flight submissions.
+    const WARM_CAP: u64 = 128 << 20;
     spare.sort_by_key(|m| std::cmp::Reverse(m.size));
     let mut dropped = Vec::new();
     while spare.iter().map(|m| m.size).sum::<u64>() > WARM_CAP {
@@ -295,7 +295,10 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     if at == 0 {
         return None;
     }
-    let memory = memory(host, at)?;
+    let memory = {
+        let _p2_sm = crate::phase2_prof::span(crate::phase2_prof::t::SEND_MEM);
+        memory(host, at)?
+    };
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
     let mut direct_moves: Vec<(usize, usize, usize)> = Vec::new();
     for ((shadow, _), copy) in dirty.iter().zip(&copies) {
@@ -338,16 +341,21 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
             }
         }
     };
-    crate::land::each_under(work.len(), &one);
+    if !work.is_empty() {
+        let _p2_sp = crate::phase2_prof::span(crate::phase2_prof::t::SEND_PAIRS);
+        crate::land::each_under(work.len(), &one);
+    }
     let total_moved: u64 = moves.iter().chain(&direct_moves).map(|m| m.2 as u64).sum();
     STATS[0].fetch_add(total_moved, Ordering::Relaxed);
     STATS[1].fetch_add((moves.len() + direct_moves.len()) as u64, Ordering::Relaxed);
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
     if !moves.is_empty() {
+        let _p2_ca = crate::phase2_prof::span(crate::phase2_prof::t::CB_SEND_COPY_ALL);
         crate::shadow::copy_all(moves);
     }
     let direct_total: u64 = direct_moves.iter().map(|m| m.2 as u64).sum();
     if !direct_moves.is_empty() {
+        let _p2_sd = crate::phase2_prof::span(crate::phase2_prof::t::SEND_DIRECT);
         const CHUNK: usize = 256 << 10;
         let direct_bytes = direct_total as usize;
         if direct_bytes >= CHUNK {

@@ -503,6 +503,10 @@ fn begun_before(view: &View) -> Option<u64> {
 /// more when their time came.
 static LATE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+pub(crate) fn neutral_hits() -> u64 {
+    LATE[3].load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// What a texture slot showed before its last write: its record (0: null or
 /// the neutral texture), when (ms), and the submissions begun and finished.
 #[cfg(feature = "diagnostics")]
@@ -2990,34 +2994,57 @@ impl HostHeap {
                 let view = super::view_at(words[1], words[2])?;
                 let at = 2 * views.made.len() as u32;
                 if at >= ListViews::SLOTS {
+                    crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_LISTVIEWS_FULL);
                     return None;
                 }
                 if let View::Constant(address, size) = view {
-                    if !crate::port_cbv::in_place_on() || !twins {
+                    if !crate::port_cbv::on() {
+                        crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_PORT_OFF);
+                        return None;
+                    }
+                    if !crate::port_cbv::in_place_on() {
+                        crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_PLACE_OFF);
+                        return None;
+                    }
+                    if !twins {
+                        crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_NO_TWINS);
                         return None;
                     }
                     let smode = crate::port_cbv::shadow_mode();
-                    let shadow = crate::shadow::find(address, u64::from(size))?;
+                    let Some(shadow) = crate::shadow::find(address, u64::from(size)) else {
+                        crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_FIND_NONE);
+                        return None;
+                    };
                     let direct_kind = if shadow.in_place() {
                         1u8
                     } else if smode == 1 && shadow.carded() {
                         2u8
                     } else if smode == 2
                         && shadow.carded()
-                        && !crate::port_cbv::is_gpu_written(shadow.id())
-                        && !shadow.writes_pending()
+                        && !shadow.is_gpu_written_in(address, u64::from(size))
                     {
                         2u8
                     } else {
+                        if smode == 0 {
+                            crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_NOT_INPLACE_SM0);
+                        } else if !shadow.carded() {
+                            crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_NOT_CARDED);
+                        } else if shadow.is_gpu_written_in(address, u64::from(size)) {
+                            crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_GPU_WRITTEN);
+                        } else {
+                            crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_WRITES_PENDING);
+                        }
                         return None;
                     };
                     let offset = shadow.offset(address);
                     let width = shadow.width();
                     if offset >= width || !crate::port_cbv::raw_ok(offset) {
+                        crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_UNALIGNED);
                         return None;
                     }
                     let bytes = u64::from(constant_bytes(size)).min(width - offset) & !3;
                     if bytes == 0 {
+                        crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_UNALIGNED);
                         return None;
                     }
                     let host = host()?;
@@ -3041,6 +3068,8 @@ impl HostHeap {
                         },
                     };
                     // SAFETY: slots in this thread's ListViews heap; live shadow buffer.
+                    crate::phase2_prof::inc(crate::phase2_prof::c::COM_CREATE_CBV);
+                    crate::phase2_prof::inc(crate::phase2_prof::c::COM_CREATE_SRV);
                     unsafe {
                         if cbv_size > 0 {
                             let cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC {
@@ -3092,15 +3121,16 @@ impl HostHeap {
                 }
             }
             let made = &views.made[&words];
-            // In shadow_mode == 2, if this cached shadow later acquired GPU
+            // In shadow_mode == 2, if this cached CBV range later acquired GPU
             // writes, fall back to the normal CBV path for this draw.
             if made.listed.cbv_direct == 2
                 && crate::port_cbv::shadow_mode() == 2
                 && made
                     .cbv_shadow
                     .as_ref()
-                    .is_some_and(|(s, _, _)| crate::port_cbv::is_gpu_written(s.id()) || s.writes_pending())
+                    .is_some_and(|(s, addr, sz)| s.is_gpu_written_in(*addr, u64::from(*sz)))
             {
+                crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_LISTED_RECHECK);
                 return None;
             }
             batch.push_main(self, index, views.slot(made.at));
@@ -3146,6 +3176,7 @@ impl HostHeap {
             }
             let run_len = end - i;
             if run_len == 1 {
+                crate::phase2_prof::inc(crate::phase2_prof::c::COM_COPY_DESC_SIMPLE);
                 // SAFETY: a slot of our heap, and one of this thread's ListViews heap.
                 unsafe {
                     host.device.CopyDescriptorsSimple(
@@ -3156,6 +3187,7 @@ impl HostHeap {
                     );
                 }
             } else {
+                crate::phase2_prof::inc(crate::phase2_prof::c::COM_COPY_DESC);
                 let mut srcs = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); CopyBatch::CAP];
                 for (k, &(_, src)) in entries[i..end].iter().enumerate() {
                     srcs[k] = src;
@@ -3621,6 +3653,29 @@ impl HostHeap {
         out.sort_unstable();
         out.dedup();
         out
+    }
+
+    /// Lock-free check whether title slot `index` still holds `expected_key`,
+    /// its host descriptor is already mirrored to `expected_key`, and the
+    /// underlying view entry is still live. Allows `heap_buffer_pass` to skip
+    /// `mirror()` and `buffer_copy()` on unchanged slots.
+    #[inline]
+    pub(crate) fn quick_record_matches(&self, index: u32, handle: u64, expected_key: u64) -> bool {
+        if expected_key == 0 || !quick_mirror() {
+            return false;
+        }
+        // SAFETY: `handle` is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG {
+            return false;
+        }
+        let key = u64::from(generation) << 32 | u64::from(i);
+        key == expected_key
+            && self
+                .quick
+                .get(index as usize)
+                .is_some_and(|k| k.load(std::sync::atomic::Ordering::Acquire) == key)
+            && super::is_record_live(i, generation)
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -4680,6 +4735,7 @@ fn constant_twinned(
     };
     let bytes = u64::from(constant_bytes(size)).min(room) & !3;
     // SAFETY: slots of our heaps; the ranges lie in the live buffer.
+    crate::phase2_prof::inc(crate::phase2_prof::c::COM_CREATE_CBV);
     unsafe {
         host.device.CreateConstantBufferView(Some(&cbv), at);
         if let Some(twin) = twin {
@@ -4699,6 +4755,7 @@ fn constant_twinned(
             if bytes == 0 {
                 null_buffer_view(twin);
             } else {
+                crate::phase2_prof::inc(crate::phase2_prof::c::COM_CREATE_SRV);
                 host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
             }
             crate::port_cbv::twinned();

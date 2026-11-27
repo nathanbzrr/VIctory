@@ -623,6 +623,7 @@ fn heap_spread() -> bool {
 
 /// The host copy and range the buffer view of each of a heap's slots reads
 /// ([`State::heap_buffers`]), by slot.
+#[cfg(test)]
 #[derive(Default)]
 struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>);
 
@@ -637,15 +638,98 @@ fn sweep_per_heap() -> bool {
 
 /// What the heap buffer pass keeps of a view heap, on the heap
 /// ([`crate::descriptor::host::HostHeap`]), so that a heap made where one was
+/// Per-copy incrementally maintained span across all active heap slots.
+/// Updating or removing a slot touches ONLY its own copy (typically ~5 slots)
+/// instead of rescanning all 80,000 slots across all 16 parts every frame.
+struct CopySpans {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    /// Active `slot -> (from, to)` entries referencing this copy.
+    slots: crate::host::ByCopy<(u64, u64)>,
+    /// Cached union `(min_from, max_to)` across `slots`.
+    merged: (u64, u64),
+    /// True only when a boundary slot was removed/shrunk and `merged` needs recompute.
+    dirty: bool,
+}
+
+impl CopySpans {
+    fn new(shadow: std::sync::Arc<crate::shadow::Shadow>) -> Self {
+        Self {
+            shadow,
+            slots: Default::default(),
+            merged: (u64::MAX, 0),
+            dirty: false,
+        }
+    }
+
+    #[inline]
+    fn insert_slot(&mut self, slot: u32, from: u64, to: u64) -> bool {
+        let prev = self.slots.insert(slot as usize, (from, to));
+        if let Some((old_from, old_to)) = prev {
+            if !self.dirty && (old_from <= self.merged.0 || old_to >= self.merged.1) {
+                if from <= old_from && to >= old_to {
+                    // Strictly widened or kept the boundary: no rescan needed!
+                    self.merged.0 = self.merged.0.min(from);
+                    self.merged.1 = self.merged.1.max(to);
+                    return false;
+                }
+                self.dirty = true;
+                return true;
+            }
+        }
+        if !self.dirty {
+            self.merged.0 = self.merged.0.min(from);
+            self.merged.1 = self.merged.1.max(to);
+        }
+        false
+    }
+
+    /// Removes `slot`. Returns `(now_empty, became_dirty)`.
+    #[inline]
+    fn remove_slot(&mut self, slot: u32) -> (bool, bool) {
+        let Some((old_from, old_to)) = self.slots.remove(&(slot as usize)) else {
+            return (self.slots.is_empty(), false);
+        };
+        if self.slots.is_empty() {
+            self.merged = (u64::MAX, 0);
+            self.dirty = false;
+            return (true, false);
+        }
+        if !self.dirty && (old_from <= self.merged.0 || old_to >= self.merged.1) {
+            self.dirty = true;
+            return (false, true);
+        }
+        (false, false)
+    }
+
+    #[inline]
+    fn recompute_if_dirty(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
+        let mut lo = u64::MAX;
+        let mut hi = 0u64;
+        for &(f, t) in self.slots.values() {
+            lo = lo.min(f);
+            hi = hi.max(t);
+        }
+        self.merged = (lo, hi);
+    }
+}
+
 /// let go starts afresh (codec-d/cool_fox c64fc9b4).
 pub(crate) struct BufferSweep {
     passes: u64,
-    ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
-    // Per-part (`slot % HEAP_ROUND`) cached spans and view counts, so each
-    // frame does not rescan every slot in `ranges`.
-    part_spans: [crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>; HEAP_ROUND as usize],
-    part_views: [u32; HEAP_ROUND as usize],
-    dirty_parts: u16,
+    /// Per-slot lightweight record `(copy_key, from, to)` (no per-slot `Arc` clone/drop).
+    slot_info: Vec<Option<(usize, u64, u64)>>,
+    /// Per-slot last mirrored descriptor record key and whether it was a UAV.
+    slot_meta: Vec<(u64, bool)>,
+    /// Active copies and their incrementally maintained spans.
+    copies: crate::host::ByCopy<CopySpans>,
+    /// Copy keys whose boundary shrunk since the last `flush_dirty`.
+    dirty_copies: Vec<usize>,
+    /// Total active buffer-view slots tracked.
+    active_views: u32,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
 }
@@ -654,10 +738,11 @@ impl Default for BufferSweep {
     fn default() -> Self {
         Self {
             passes: 0,
-            ranges: HeapRanges(Vec::new()),
-            part_spans: std::array::from_fn(|_| Default::default()),
-            part_views: [0; HEAP_ROUND as usize],
-            dirty_parts: 0,
+            slot_info: Vec::new(),
+            slot_meta: Vec::new(),
+            copies: Default::default(),
+            dirty_copies: Vec::new(),
+            active_views: 0,
             unwatched: Default::default(),
         }
     }
@@ -665,92 +750,153 @@ impl Default for BufferSweep {
 
 impl BufferSweep {
     fn clear_all(&mut self) {
-        self.ranges.0.clear();
-        for spans in &mut self.part_spans {
-            spans.clear();
-        }
-        self.part_views = [0; HEAP_ROUND as usize];
-        self.dirty_parts = 0;
+        self.slot_info.clear();
+        self.slot_meta.clear();
+        self.copies.clear();
+        self.dirty_copies.clear();
+        self.active_views = 0;
     }
 
-    fn forget_part(&mut self, part: u32) {
-        self.ranges.forget_part(part, HEAP_ROUND as u32);
-        let p = part as usize;
-        self.part_spans[p].clear();
-        self.part_views[p] = 0;
-        self.dirty_parts &= !(1u16 << p);
+    #[inline]
+    fn has_slot(&self, slot: u32) -> bool {
+        self.slot_info.get(slot as usize).is_some_and(Option::is_some)
     }
 
-    fn set(&mut self, slot: u32, range: Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>) {
-        let p = (slot as usize) % (HEAP_ROUND as usize);
-        let old = self.ranges.replace(slot, range.clone());
-        match (&old, &range) {
-            (None, Some(_)) => self.part_views[p] += 1,
-            (Some(_), None) => self.part_views[p] -= 1,
-            _ => {}
-        }
-        if self.dirty_parts & (1u16 << p) != 0 {
-            return;
-        }
-        if let Some((old_shadow, old_from, old_to)) = old {
-            let old_key = std::sync::Arc::as_ptr(&old_shadow) as usize;
-            if let Some((new_shadow, new_from, new_to)) = &range {
-                let new_key = std::sync::Arc::as_ptr(new_shadow) as usize;
-                if old_key == new_key && old_from == *new_from && old_to == *new_to {
-                    return;
+    #[inline]
+    fn meta(&self, slot: u32) -> (u64, bool) {
+        self.slot_meta.get(slot as usize).copied().unwrap_or((0, false))
+    }
+
+    #[inline]
+    fn cached_range(&self, slot: u32) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+        let (key, from, to) = self.slot_info.get(slot as usize).copied().flatten()?;
+        let entry = self.copies.get(&key)?;
+        Some((entry.shadow.clone(), from, to))
+    }
+
+    /// Evicts only slots in `part` whose title record or live status no longer matches,
+    /// keeping unchanged slots intact so they skip `mirror()` and `buffer_copy()`.
+    fn prune_stale_in_part(
+        &mut self,
+        part: u32,
+        heap: &crate::descriptor::Heap,
+        host: &crate::descriptor::host::HostHeap,
+    ) {
+        let step = HEAP_ROUND as usize;
+        let mut idx = part as usize;
+        while idx < self.slot_info.len() {
+            if let Some((old_key, _, _)) = self.slot_info[idx] {
+                let expected = self.slot_meta.get(idx).map_or(0, |m| m.0);
+                let still_valid = expected != 0
+                    && heap
+                        .handle(idx as u32)
+                        .is_some_and(|h| host.quick_record_matches(idx as u32, h, expected));
+                if !still_valid {
+                    self.slot_info[idx] = None;
+                    if let Some(m) = self.slot_meta.get_mut(idx) {
+                        *m = (0, false);
+                    }
+                    self.active_views = self.active_views.saturating_sub(1);
+                    if let Some(entry) = self.copies.get_mut(&old_key) {
+                        let (empty, became_dirty) = entry.remove_slot(idx as u32);
+                        if empty {
+                            self.copies.remove(&old_key);
+                        } else if became_dirty {
+                            self.dirty_copies.push(old_key);
+                        }
+                    }
                 }
-                if old_key == new_key
-                    && let Some(span) = self.part_spans[p].get_mut(&old_key)
-                    && span.1 < old_from
-                    && old_to < span.2
-                {
-                    span.1 = span.1.min(*new_from);
-                    span.2 = span.2.max(*new_to);
-                    return;
-                }
             }
-            self.dirty_parts |= 1u16 << p;
-            return;
-        }
-        if let Some((shadow, from, to)) = range {
-            let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            let span = self.part_spans[p].entry(key).or_insert_with(|| (shadow, from, to));
-            span.1 = span.1.min(from);
-            span.2 = span.2.max(to);
+            idx += step;
         }
     }
 
-    fn spans(&mut self) -> (crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>, u32) {
-        let mut dirty = self.dirty_parts;
-        self.dirty_parts = 0;
-        while dirty != 0 {
-            let p = dirty.trailing_zeros() as usize;
-            dirty &= dirty - 1;
-            let part = &mut self.part_spans[p];
-            part.clear();
-            let mut count = 0u32;
-            for (shadow, from, to) in self.ranges.part_ranges(p as u32, HEAP_ROUND as u32) {
-                count += 1;
-                let key = std::sync::Arc::as_ptr(shadow) as usize;
-                let span = part.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-                span.1 = span.1.min(*from);
-                span.2 = span.2.max(*to);
-            }
-            self.part_views[p] = count;
+    fn set(
+        &mut self,
+        slot: u32,
+        range: Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+        record_key: u64,
+        is_uav: bool,
+    ) {
+        crate::phase2_prof::inc(crate::phase2_prof::c::SWEEP_SET_CALLS);
+        let sidx = slot as usize;
+        if range.is_some() && sidx >= self.slot_meta.len() {
+            self.slot_meta.resize(sidx + 1, (0, false));
         }
-        let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
-        for part in &self.part_spans {
-            for (&key, (shadow, from, to)) in part {
-                let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-                span.1 = span.1.min(*from);
-                span.2 = span.2.max(*to);
+        if let Some(m) = self.slot_meta.get_mut(sidx) {
+            *m = if range.is_some() { (record_key, is_uav) } else { (0, false) };
+        }
+        let old = self.slot_info.get(sidx).copied().flatten();
+        match (old, range) {
+            (None, None) => {
+                crate::phase2_prof::inc(crate::phase2_prof::c::SWEEP_SET_NOOP);
+                return;
+            }
+            (Some((ok, of, ot)), Some((ns, nf, nt))) if ok == std::sync::Arc::as_ptr(&ns) as usize && of == nf && ot == nt => {
+                crate::phase2_prof::inc(crate::phase2_prof::c::SWEEP_SET_NOOP);
+                return;
+            }
+            (old_opt, new_opt) => {
+                if new_opt.is_some() && sidx >= self.slot_info.len() {
+                    self.slot_info.resize(sidx + 1, None);
+                }
+                let new_key_opt = new_opt.as_ref().map(|(ns, _, _)| std::sync::Arc::as_ptr(ns) as usize);
+                if let Some((ok, _, _)) = old_opt {
+                    if new_key_opt != Some(ok) {
+                        if let Some(entry) = self.copies.get_mut(&ok) {
+                            let (empty, became_dirty) = entry.remove_slot(slot);
+                            if empty {
+                                self.copies.remove(&ok);
+                            } else if became_dirty {
+                                self.dirty_copies.push(ok);
+                            }
+                        }
+                    }
+                }
+                match (old_opt, new_opt) {
+                    (None, Some((ns, nf, nt))) => {
+                        let nk = std::sync::Arc::as_ptr(&ns) as usize;
+                        self.slot_info[sidx] = Some((nk, nf, nt));
+                        self.active_views += 1;
+                        let entry = self.copies.entry(nk).or_insert_with(|| CopySpans::new(ns));
+                        if entry.insert_slot(slot, nf, nt) {
+                            self.dirty_copies.push(nk);
+                        }
+                    }
+                    (Some(_), Some((ns, nf, nt))) => {
+                        let nk = std::sync::Arc::as_ptr(&ns) as usize;
+                        self.slot_info[sidx] = Some((nk, nf, nt));
+                        let entry = self.copies.entry(nk).or_insert_with(|| CopySpans::new(ns));
+                        if entry.insert_slot(slot, nf, nt) {
+                            self.dirty_copies.push(nk);
+                        }
+                    }
+                    (Some(_), None) => {
+                        self.slot_info[sidx] = None;
+                        self.active_views = self.active_views.saturating_sub(1);
+                    }
+                    (None, None) => {}
+                }
             }
         }
-        let views: u32 = self.part_views.iter().sum();
-        (spans, views)
+    }
+
+    fn flush_dirty(&mut self) -> u32 {
+        let mut recomp = 0u64;
+        for key in self.dirty_copies.drain(..) {
+            if let Some(entry) = self.copies.get_mut(&key)
+                && entry.dirty
+            {
+                entry.recompute_if_dirty();
+                recomp += 1;
+            }
+        }
+        crate::phase2_prof::inc_by(crate::phase2_prof::c::SWEEP_DIRTY_RECOMP, recomp);
+        self.active_views
     }
 }
 
+#[cfg(test)]
 impl<T> HeapRanges<T> {
     #[cfg(test)]
     fn set(&mut self, slot: u32, range: Option<(T, u64, u64)>) {
@@ -770,6 +916,7 @@ impl<T> HeapRanges<T> {
 
     /// Forgets the slots of one of `parts` parts
     /// (`HostHeap::buffer_slots_of`).
+    #[cfg(test)]
     fn forget_part(&mut self, part: u32, parts: u32) {
         self.0.iter_mut().skip(part as usize).step_by(parts as usize).for_each(|r| *r = None);
     }
@@ -812,6 +959,40 @@ mod heap_range_tests {
         assert!(ranges.ranges().all(|r| r.1 != 0), "a slot not looked at in a round");
         ranges.set(3, None);
         assert_eq!(ranges.ranges().count(), SLOTS.div_ceil(3) as usize - 1);
+    }
+
+    #[test]
+    fn copy_spans_incremental_merge_and_clear() {
+        let mut active = 0u16;
+        let mut parts = [(u64::MAX, 0u64); HEAP_ROUND as usize];
+        let mut merged = (u64::MAX, 0u64);
+        let expand = |active: &mut u16, parts: &mut [(u64, u64); HEAP_ROUND as usize], merged: &mut (u64, u64), p: usize, f: u64, t: u64| {
+            let bit = 1u16 << p;
+            if *active & bit == 0 {
+                *active |= bit;
+                parts[p] = (f, t);
+            } else {
+                parts[p].0 = parts[p].0.min(f);
+                parts[p].1 = parts[p].1.max(t);
+            }
+            merged.0 = merged.0.min(f);
+            merged.1 = merged.1.max(t);
+        };
+        expand(&mut active, &mut parts, &mut merged, 2, 100, 300);
+        expand(&mut active, &mut parts, &mut merged, 5, 50, 200);
+        expand(&mut active, &mut parts, &mut merged, 2, 120, 450);
+        assert_eq!(merged, (50, 450));
+        // Clear part 5 -> merged should tighten to part 2's (100, 450).
+        active &= !(1u16 << 5);
+        parts[5] = (u64::MAX, 0);
+        let (mut lo, mut hi, mut m) = (u64::MAX, 0u64, active);
+        while m != 0 {
+            let p = m.trailing_zeros() as usize;
+            m &= m - 1;
+            lo = lo.min(parts[p].0);
+            hi = hi.max(parts[p].1);
+        }
+        assert_eq!((lo, hi), (100, 450));
     }
 
     /// The spans of 4,400 copies from the ranges of 72,000 slots, as a pass
@@ -1002,6 +1183,7 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 /// ([`State::heap_buffers`]): their host slots are made, and the host copies
 /// they show are to be refreshed.
 fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> Vec<crate::host::aside::Refresh> {
+    let _p2_hbp = crate::phase2_prof::span(crate::phase2_prof::t::HBP_TOTAL);
     let started = std::time::Instant::now();
     // Per host heap: the host copy and range each slot's buffer view
     // reads, kept from pass to pass. Only the slots written since the
@@ -1010,32 +1192,79 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // released resource goes stale without a write, and a slot written
     // before its memory had a host copy is only made then.
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
-    let changed = host.buffer_changes();
+    let changed = {
+        let _p2_chg = crate::phase2_prof::span(crate::phase2_prof::t::HBP_CHANGES);
+        host.buffer_changes()
+    };
     let all = kept.passes == 0 || (kept.passes % HEAP_ROUND == 0 && !heap_spread());
-    let slots = if all {
-        kept.clear_all();
-        host.buffer_slots()
-    } else if heap_spread() {
-        // The written ones, and this pass's part of the others (deduplicated so
-        // slots in both `part` and `changed` are not looked up twice).
-        let part = (kept.passes % HEAP_ROUND) as u32;
-        kept.forget_part(part);
-        let mut slots = host.buffer_slots_of::<{ HEAP_ROUND as u32 }>(part);
-        if !changed.is_empty() {
-            slots.extend(changed);
-            slots.sort_unstable();
-            slots.dedup();
+    let spread = !all && heap_spread();
+    crate::phase2_prof::inc(if all {
+        crate::phase2_prof::c::HBP_PASS_ALL
+    } else if spread {
+        crate::phase2_prof::c::HBP_PASS_SPREAD
+    } else {
+        crate::phase2_prof::c::HBP_PASS_CHANGED
+    });
+    let mut unordered = Vec::new();
+    let picked_on = crate::picked::on();
+    let slots = {
+        let _p2_sl = crate::phase2_prof::span(crate::phase2_prof::t::HBP_SLOTS);
+        let mut slots = if all {
+            kept.clear_all();
+            host.buffer_slots()
+        } else if spread {
+            let part = (kept.passes % HEAP_ROUND) as u32;
+            kept.prune_stale_in_part(part, heap, host);
+            let mut slots = host.buffer_slots_of::<{ HEAP_ROUND as u32 }>(part);
+            if !changed.is_empty() {
+                slots.extend(changed);
+                slots.sort_unstable();
+                slots.dedup();
+            }
+            slots
+        } else {
+            changed
+        };
+        // Pre-filter slots owned by a draw table (`copied_tabled`) AND slots
+        // whose descriptor record + host mirror + live generation are completely
+        // unchanged since the last pass (skipping ~85% of `mirror()` + `buffer_copy()`!).
+        let mut skipped = 0u64;
+        slots.retain(|&index| {
+            if host.copied_tabled(index, frame) {
+                if kept.has_slot(index) {
+                    kept.set(index, None, 0, false);
+                }
+                skipped += 1;
+                return false;
+            }
+            let (expected_key, was_uav) = kept.meta(index);
+            if expected_key != 0
+                && heap
+                    .handle(index)
+                    .is_some_and(|h| host.quick_record_matches(index, h, expected_key))
+            {
+                if was_uav
+                    && picked_on
+                    && let Some(r) = kept.cached_range(index)
+                {
+                    unordered.push(r);
+                }
+                skipped += 1;
+                return false;
+            }
+            true
+        });
+        if skipped > 0 {
+            crate::phase2_prof::inc_by(crate::phase2_prof::c::HBP_SLOTS_SKIP_TABLED, skipped);
         }
         slots
-    } else {
-        changed
     };
+    crate::phase2_prof::inc_by(crate::phase2_prof::c::HBP_SLOTS_SCANNED, slots.len() as u64);
     kept.passes += 1;
     // Whether the device was there before the pass: a view that removes
     // it is named below.
     static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
-    let mut unordered = Vec::new();
     /// The title's heap, for the threads that look.
     struct Shared<'a>(&'a crate::descriptor::Heap);
     // SAFETY: a heap is free-threaded (its methods are called by any thread of
@@ -1052,89 +1281,116 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let look = |index: u32| {
         // A draw's table's: the draw brings what it reads up to date.
         if host.copied_tabled(index, frame) {
+            crate::phase2_prof::inc(crate::phase2_prof::c::HBP_SLOTS_SKIP_TABLED);
             return None;
         }
-        let view = host.mirror(index, heap.handle(index)?, true)?;
+        let handle = heap.handle(index)?;
+        let rkey = crate::descriptor::record_key(handle);
+        let view = {
+            let _p2_m = crate::phase2_prof::span(crate::phase2_prof::t::HBP_MIRROR);
+            host.mirror(index, handle, true)?
+        };
+        crate::phase2_prof::inc(crate::phase2_prof::c::HBP_SLOTS_MIRRORED);
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
-        let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
+        let (shadow, address, len) = {
+            let _p2_bc = crate::phase2_prof::span(crate::phase2_prof::t::HBP_BUF_COPY);
+            crate::descriptor::host::buffer_copy(&view)?
+        };
+        crate::phase2_prof::inc(crate::phase2_prof::c::HBP_SLOTS_COPIED);
         #[cfg(feature = "diagnostics")]
         if host.shows(index, &shadow.buffer) == Some(false) {
             HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
         }
-        let written = crate::picked::on() && view_kind(&view) == Some(ResourceType::Uav);
-        Some(((shadow, address, address + len), written))
+        let written = picked_on && view_kind(&view) == Some(ResourceType::Uav);
+        Some(((shadow, address, address + len), rkey, written))
     };
     // Some slots at a time, on several threads.
     const AT_A_TIME: usize = 256;
     let parts: Vec<&[u32]> = slots.chunks(AT_A_TIME).collect();
     let found: Vec<std::sync::OnceLock<Vec<_>>> = parts.iter().map(|_| Default::default()).collect();
-    crate::land::each_view(false, parts.len(), &|n| {
-        let looked: Vec<_> = parts[n].iter().map(|&index| (index, look(index))).collect();
-        // (After each piece while the device lives: a cheap query.)
-        if alive
-            && let Some(why) = crate::descriptor::host::device_removed()
-            && !GONE.swap(true, Ordering::Relaxed)
-        {
-            let last: Vec<String> = parts[n]
-                .iter()
-                .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
-                .map(|s| s.chars().take(200).collect())
-                .collect();
-            tracing::error!(why, "the host device went while buffer views of the heap were made; perhaps one of: {last:#?}");
-            crate::host::log_removal_context();
-        }
-        let _ = found[n].set(looked);
-    });
-    for (index, shows) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
-        let range = shows.map(|(range, written)| {
-            if written {
-                unordered.push(range.clone());
+    if !parts.is_empty() {
+        let _p2_sl = crate::phase2_prof::span(crate::phase2_prof::t::HBP_SLOTS);
+        crate::land::each_view(false, parts.len(), &|n| {
+            let looked: Vec<_> = parts[n].iter().map(|&index| (index, look(index))).collect();
+            // (After each piece while the device lives: a cheap query.)
+            if alive
+                && let Some(why) = crate::descriptor::host::device_removed()
+                && !GONE.swap(true, Ordering::Relaxed)
+            {
+                let last: Vec<String> = parts[n]
+                    .iter()
+                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                    .map(|s| s.chars().take(200).collect())
+                    .collect();
+                tracing::error!(why, "the host device went while buffer views of the heap were made; perhaps one of: {last:#?}");
+                crate::host::log_removal_context();
             }
-            range
+            let _ = found[n].set(looked);
         });
-        kept.set(index, range);
+    }
+    for (index, shows) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
+        match shows {
+            Some((range, rkey, written)) => {
+                if written {
+                    unordered.push(range.clone());
+                }
+                kept.set(index, Some(range), rkey, written);
+            }
+            None => {
+                kept.set(index, None, 0, false);
+            }
+        }
     }
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
     }
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
-    // Per host copy, the span its picked views cover (merged from the cached
-    // per-part spans rather than rescanning every slot in `ranges`).
-    let (spans, views) = kept.spans();
-    let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+    // Per host copy, the span its picked views cover (incrementally maintained
+    // per copy without rescanning all slots or rebuilding HashMaps every frame).
+    let views = {
+        let _p2_sp = crate::phase2_prof::span(crate::phase2_prof::t::HBP_SPANS);
+        kept.flush_dirty()
+    };
+    let active_copies = kept.copies.len();
+    crate::phase2_prof::inc_by(crate::phase2_prof::c::HBP_SPANS_BUILT, active_copies as u64);
     // Memory that is not write-watched is copied whole by every refresh.
-    // It was once refreshed only every 120 frames (unmapped pages read
-    // one by one cost 14 GB a frame in run 11, before they were
-    // remembered): streamed geometry then drew from stale buffers, and
-    // the garbage ended runs (the card stopped answering 14-90 frames
-    // into the opening cutscene; with every frame it ran on). The pass
-    // costs some 30 ms a frame this way.
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let every = *EVERY.get_or_init(|| {
         std::env::var("VICTORY_UNWATCHED_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
     });
-    let mut found = Vec::with_capacity(spans.len());
+    let mut found = Vec::with_capacity(active_copies);
+    let mut bytes = 0u64;
     let mut next_unwatched = std::collections::HashMap::new();
-    for (shadow, from, to) in spans.values() {
+    for entry in kept.copies.values() {
+        if entry.slots.is_empty() {
+            continue;
+        }
+        let (from, to) = entry.merged;
+        bytes += to.saturating_sub(from);
+        let shadow = &entry.shadow;
         if every > 1 && shadow.unwatched() {
             let id = shadow.id();
             if let Some(&(last, low, high)) = kept.unwatched.get(&id)
-                && frame >= last && frame - last < every && low <= *from && *to <= high
+                && frame >= last && frame - last < every && low <= from && to <= high
             {
                 next_unwatched.insert(id, (last, low, high));
                 continue;
             }
-            next_unwatched.insert(id, (frame, *from, *to));
+            next_unwatched.insert(id, (frame, from, to));
         }
-        found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
+        found.push((shadow.clone(), from, to.min(from + shadow.left(from))));
     }
     kept.unwatched = next_unwatched;
     drop(kept);
     #[cfg(feature = "diagnostics")]
     let refreshed = std::time::Instant::now();
-    crate::watch::look_at_holes();
+    {
+        let _p2_ho = crate::phase2_prof::span(crate::phase2_prof::t::HBP_HOLES);
+        crate::watch::look_at_holes();
+    }
+    crate::phase2_prof::flush_tls();
     #[cfg(feature = "diagnostics")]
     for (sum, time) in HEAP_SPLIT.iter().zip([looked - started, refreshed - looked]) {
         sum.fetch_add(time.as_nanos() as u64, Ordering::Relaxed);
@@ -1147,7 +1403,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         tracing::info!(
             slots = slots.len(),
             views,
-            copies = spans.len(),
+            copies = active_copies,
             mb = bytes >> 20,
             ms = started.elapsed().as_millis(),
             "buffer views of the heap made ready for shaders that pick them by index"
@@ -1839,12 +2095,16 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let _p2_bind = crate::phase2_prof::span(crate::phase2_prof::t::DRAW_BIND_TOTAL);
         if !compute && self.incompatible_depth_target && p.requires_depth_target {
             return false;
         }
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
-        self.early_textures(list, p, compute);
+        {
+            let _p2_et = crate::phase2_prof::span(crate::phase2_prof::t::DRAW_EARLY_TEX);
+            self.early_textures(list, p, compute);
+        }
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -2352,6 +2612,7 @@ impl State {
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
+        let _p2_hb = crate::phase2_prof::span(crate::phase2_prof::t::HB_STATE_TOTAL);
         let heap = self
             .heaps
             .iter()
@@ -2367,6 +2628,7 @@ impl State {
         const ONCE: usize = usize::MAX - 0x5e;
         let per_heap = sweep_per_heap();
         if !list.first_use(if per_heap { gpu as usize | 1 } else { ONCE }) {
+            crate::phase2_prof::inc(crate::phase2_prof::c::HB_EARLY_RET);
             return Some(gpu);
         }
         // The list may outlive the title's heap object, which owns the table.
@@ -2382,11 +2644,13 @@ impl State {
         let frame = crate::frame::current();
         let last = if per_heap { &host.buffer_frame } else { &FRAME };
         if last.swap(frame, Ordering::Relaxed) == frame {
+            crate::phase2_prof::inc(crate::phase2_prof::c::HB_EARLY_RET);
             return Some(gpu);
         }
         let started = std::time::Instant::now();
         let mut stage = crate::timeline::span("the heap pass: begun, or done here");
         if crate::host::aside::on() {
+            let _p2_ab = crate::phase2_prof::span(crate::phase2_prof::t::HB_ASIDE_BEGIN);
             let at = std::ptr::from_ref(heap) as usize;
             list.refreshes_coming(move || {
                 crate::descriptor::with_heap(at, |heap| {
@@ -2407,7 +2671,10 @@ impl State {
         #[cfg(feature = "diagnostics")]
         let refreshed = std::time::Instant::now();
         stage.next("the heap pass: textures");
-        self.heap_textures(list, heap, host);
+        {
+            let _p2_ht = crate::phase2_prof::span(crate::phase2_prof::t::HB_TEXTURES);
+            self.heap_textures(list, heap, host);
+        }
         stage.end();
         #[cfg(feature = "diagnostics")]
         HEAP_SPLIT[2].fetch_add(refreshed.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -2592,6 +2859,7 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
+        let _p2_ht_bk = crate::phase2_prof::span(crate::phase2_prof::t::HT_BOOKKEEP);
         let memory = crate::host::host().and_then(|h| h.video_memory());
         // `VICTORY_TEXTURE_STAGE_MB` sets it: a backlog of tens of thousands of
         // textures (a scene's first minutes) then drains in fewer frames.
@@ -2735,6 +3003,9 @@ impl State {
                 crate::texture::live_staging_bytes(),
             )
         };
+        drop(_p2_ht_bk);
+        crate::phase2_prof::inc_by(crate::phase2_prof::c::HT_SLOTS_SCANNED, due.len() as u64);
+        let _p2_ht_up = crate::phase2_prof::span(crate::phase2_prof::t::HT_LOOP_UPLOAD);
         let began = std::time::Instant::now();
         BAKE_SERVED.store(0, Ordering::Relaxed);
         let mut served = true;
@@ -3215,6 +3486,7 @@ impl State {
             }
         }
         // SAFETY: an open list with everything set.
+        crate::phase2_prof::inc(crate::phase2_prof::c::COM_DISPATCH);
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -3791,6 +4063,7 @@ impl State {
         plan: &TablePlan,
         compute: bool,
     ) -> Few<(u8, u32), 16> {
+        let _p2_tbl = crate::phase2_prof::span(crate::phase2_prof::t::DRAW_TABLES_TOTAL);
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
         for group in &plan.groups {
@@ -3877,6 +4150,7 @@ impl State {
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
             if let Some(known) = self.fresh_tables.get_mut(&key) {
+                crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FRESH_HIT);
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
@@ -3973,12 +4247,20 @@ impl State {
                 // coalesced batch, and nothing more if nothing changed since.
                 if list_views
                     && words[0] == crate::descriptor::VIEW_TAG
-                    && let Some(mut listed) = host.make_listed_into(recording, words, index, &mut copy_batch)
+                    && let Some(mut listed) = {
+                        let _p2_li = crate::phase2_prof::span(crate::phase2_prof::t::DRAW_LISTED);
+                        host.make_listed_into(recording, words, index, &mut copy_batch)
+                    }
                 {
                     if listed.cbv_direct != 0 {
                         if listed.cbv_direct == 1 {
+                            crate::phase2_prof::inc(crate::phase2_prof::c::CBV_SEEN_IN_PLACE);
+                            crate::phase2_prof::inc(crate::phase2_prof::c::CBV_OK_PLACE);
                             crate::port_cbv::in_place(listed.cbv_size);
                         } else {
+                            crate::phase2_prof::inc(crate::phase2_prof::c::CBV_SEEN_SHADOW_DIRECT);
+                            crate::phase2_prof::inc(crate::phase2_prof::c::CBV_OK_SHADOW);
+                            crate::phase2_prof::inc_by(crate::phase2_prof::c::CBV_OK_SHADOW_BYTES, u64::from(listed.cbv_size));
                             let epoch = list.epoch();
                             let wgen = GPU_WRITE_GEN.get() as usize;
                             if listed.ready.0 != epoch || listed.ready.1 != wgen {
@@ -3993,6 +4275,9 @@ impl State {
                             crate::port_cbv::shadow_direct(listed.cbv_size);
                         }
                         continue;
+                    }
+                    if listed.kind == Some(victory_shader::native::ResourceType::Cbv) {
+                        crate::phase2_prof::inc(crate::phase2_prof::c::CBV_SEEN_LISTED_COPY);
                     }
                     let kind = group
                         .entry(k)
@@ -4033,37 +4318,68 @@ impl State {
                 let used = group.entry(k);
                 match crate::descriptor::view_from_words(words) {
                     Some(View::Constant(address, size)) => {
+                        crate::phase2_prof::inc(crate::phase2_prof::c::CBV_SEEN_FALLBACK);
                         // Renderer port 5: read table constant buffers directly
                         // through their raw SRV twin without per-draw scratch
                         // copies or `card_steps` GPU fills.
+                        if !crate::port_cbv::on() {
+                            crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_PORT_OFF);
+                        } else if !crate::port_cbv::in_place_on() {
+                            crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_PLACE_OFF);
+                        }
                         if crate::port_cbv::in_place_on() {
                             let smode = crate::port_cbv::shadow_mode();
-                            match crate::shadow::find(address, u64::from(size)).filter(|s| {
-                                s.in_place()
-                                    || (smode == 1 && s.carded())
-                                    || (smode == 2
-                                        && s.carded()
-                                        && !crate::port_cbv::is_gpu_written(s.id())
-                                        && !s.writes_pending())
-                            }) {
+                            let matched = match crate::shadow::find(address, u64::from(size)) {
+                                None => {
+                                    crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_FIND_NONE);
+                                    None
+                                }
+                                Some(s) => {
+                                    let ok = if s.in_place() {
+                                        true
+                                    } else if smode == 0 {
+                                        crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_NOT_INPLACE_SM0);
+                                        false
+                                    } else if !s.carded() {
+                                        crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_NOT_CARDED);
+                                        false
+                                    } else if smode == 1 {
+                                        true
+                                    } else if s.is_gpu_written_in(address, u64::from(size)) {
+                                        crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_GPU_WRITTEN);
+                                        false
+                                    } else {
+                                        true
+                                    };
+                                    ok.then_some(s)
+                                }
+                            };
+                            match matched {
                                 Some(shadow) => {
                                     let gpu = shadow.gpu(address);
                                     let offset = shadow.offset(address);
                                     let width = shadow.width();
                                     if host.constant_raw_at_known(index, &shadow.buffer, gpu, offset, width, size) {
                                         if shadow.in_place() {
+                                            crate::phase2_prof::inc(crate::phase2_prof::c::CBV_OK_PLACE);
                                             crate::port_cbv::in_place(size);
                                         } else {
+                                            crate::phase2_prof::inc(crate::phase2_prof::c::CBV_OK_SHADOW);
+                                            crate::phase2_prof::inc_by(crate::phase2_prof::c::CBV_OK_SHADOW_BYTES, u64::from(size));
                                             self.refresh_cbv_pages(list, &shadow, address, size);
                                             crate::port_cbv::shadow_direct(size);
                                         }
                                         continue;
                                     }
+                                    crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_UNALIGNED);
                                     crate::port_cbv::copied(false);
                                 }
                                 None => crate::port_cbv::copied(true),
                             }
                         }
+                        let _p2_cbv = crate::phase2_prof::span(crate::phase2_prof::t::DRAW_CBV_DEFER);
+                        crate::phase2_prof::inc(crate::phase2_prof::c::CBV_OK_COPY);
+                        crate::phase2_prof::inc_by(crate::phase2_prof::c::CBV_OK_COPY_BYTES, u64::from(size));
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -4230,6 +4546,7 @@ impl State {
                 self.record_framegen_camera(list, p);
             }
             // SAFETY: an open list with everything set.
+            crate::phase2_prof::inc(crate::phase2_prof::c::COM_DRAW);
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
@@ -4926,6 +5243,7 @@ impl RecordHash {
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
+    let _p2_rd = crate::phase2_prof::span(crate::phase2_prof::t::DRAW_READABLE);
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);

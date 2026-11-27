@@ -104,6 +104,7 @@ pub(crate) fn mark_gpu_written(shadow_id: u64) {
     }
 }
 
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn is_gpu_written(shadow_id: u64) -> bool {
     if shadow_id == 0 {

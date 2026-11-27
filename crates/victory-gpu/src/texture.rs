@@ -960,10 +960,11 @@ impl PreludeUpload {
         // A host copy made whole from the store (`crate::texstore`): its larger
         // levels, once, before the ones from title memory.
         let prefill = self.copy.prefill.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some((levels, bytes)) = prefill
-            && prefill_levels(host_list, cmd_list, &self.copy, levels, &bytes)
-        {
-            crate::texlate::whole(self.resource);
+        if let Some((levels, bytes)) = prefill {
+            let _p2_pf = crate::phase2_prof::span(crate::phase2_prof::t::PREL_PREFILL);
+            if prefill_levels(host_list, cmd_list, &self.copy, levels, &bytes) {
+                crate::texlate::whole(self.resource);
+            }
         }
         // The staging buffer lives as long as `self.staging`, which the list's
         // deferred steps hold until the list is reset after GPU completion.

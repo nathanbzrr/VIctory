@@ -490,10 +490,13 @@ impl Ahead {
 
 fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
     if let Ok(j) = JOURNAL.try_read() {
+        crate::phase2_prof::note_lock_contended(crate::phase2_prof::lock::L_WATCH_JR, 0);
         return j;
     }
     let began = std::time::Instant::now();
     let j = waited(1, || JOURNAL.read().unwrap_or_else(|e| e.into_inner()));
+    let us = began.elapsed().as_micros() as u64;
+    crate::phase2_prof::note_lock_contended(crate::phase2_prof::lock::L_WATCH_JR, us);
     port7_waited(P7_READ_WAITS, began);
     j
 }
@@ -501,10 +504,13 @@ fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
 fn journal_mut() -> std::sync::RwLockWriteGuard<'static, Journal> {
     port7_count(P7_ALONE, 1);
     if let Ok(j) = JOURNAL.try_write() {
+        crate::phase2_prof::note_lock_contended(crate::phase2_prof::lock::L_WATCH_JW, 0);
         return j;
     }
     let began = std::time::Instant::now();
     let j = waited(2, || JOURNAL.write().unwrap_or_else(|e| e.into_inner()));
+    let us = began.elapsed().as_micros() as u64;
+    crate::phase2_prof::note_lock_contended(crate::phase2_prof::lock::L_WATCH_JW, us);
     port7_waited(P7_ALONE_WAITS, began);
     j
 }
@@ -1156,8 +1162,7 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
     let mut written = Vec::new();
-    // Those not held by an asking ahead, each once.
-    let mut alone_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut candidates: Vec<(usize, usize)> = Vec::new();
     let mut held_ahead = Ahead::new();
     held_ahead.set(std::mem::take(&mut ahead));
     for &(start, end) in ranges {
@@ -1165,8 +1170,20 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !held_ahead.holds(first, last) && !alone_ranges.iter().any(|&(a, b)| a <= first && last <= b) {
+        if !held_ahead.holds(first, last) {
+            candidates.push((first, last));
+        }
+    }
+    // Sort by start ascending, end descending so wider ranges drop narrower
+    // contained sub-ranges in O(N log N) without merging across separate
+    // VirtualAlloc allocations.
+    candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    let mut alone_ranges: Vec<(usize, usize)> = Vec::with_capacity(candidates.len());
+    let mut max_end = 0usize;
+    for (first, last) in candidates {
+        if last > max_end {
             alone_ranges.push((first, last));
+            max_end = last;
         }
     }
     let mut ahead = held_ahead.take();
@@ -1179,11 +1196,19 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
         alone(first * PAGE, last * PAGE, found.as_ref().map_or(0, Vec::len), asking.elapsed());
         found
     });
+    crate::phase2_prof::inc_by(crate::phase2_prof::c::WATCH_ALONE_ASKED, alone_ranges.len() as u64);
+    let mut alone_empty = 0u64;
     for (&(first, last), found) in alone_ranges.iter().zip(answers) {
         if let Some(pages) = found {
+            if pages.is_empty() {
+                alone_empty += 1;
+            }
             written.extend(pages);
             ahead.push((first, last));
         }
+    }
+    if alone_empty > 0 {
+        crate::phase2_prof::inc_by(crate::phase2_prof::c::WATCH_ALONE_EMPTY, alone_empty);
     }
     note_hot(&written);
     // A number of its own, and the one this asking stands under: between
@@ -3844,7 +3869,25 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// next write to it an access violation nobody takes (`on_write` finds it
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
+/// Monotonic epoch bumped whenever title memory mappings are unmapped, freed,
+/// remapped, or split.
+static REMAP_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Current title-memory mapping epoch (`Acquire`).
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn remap_epoch() -> u64 {
+    REMAP_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[inline]
+fn bump_remap_epoch() {
+    REMAP_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
 pub fn title_memory_remapped(at: usize, len: usize) {
+    bump_remap_epoch();
+    crate::host::card_steps::invalidate_mapped_range(at, len);
     forget_holes(at, len);
     crate::texback::remapped(at, len);
     open(&title_memory_changed(at, len), at, at.saturating_add(len));
@@ -3856,6 +3899,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    bump_remap_epoch();
+    crate::host::card_steps::invalidate_mapped_range(at, len);
     forget_holes(at, len);
     crate::texback::remapped(at, len);
     forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
@@ -3882,6 +3927,8 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    bump_remap_epoch();
+    crate::host::card_steps::invalidate_mapped_range(at, len);
     if len != 0 {
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {

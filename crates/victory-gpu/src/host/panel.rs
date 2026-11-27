@@ -129,6 +129,40 @@ const fn glyph(c: u8) -> [u8; 7] {
     }
 }
 
+/// Corner where the HUD box is copied (`VICTORY_PANEL_POS=top-right|top-left|bottom-right|bottom-left`).
+/// Defaults to `top-right` so the overlay never obscures top-left quest objectives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Corner {
+    TopRight,
+    TopLeft,
+    BottomRight,
+    BottomLeft,
+}
+
+fn corner() -> Corner {
+    static CORNER: OnceLock<Corner> = OnceLock::new();
+    *CORNER.get_or_init(|| {
+        let v = std::env::var("VICTORY_PANEL_POS").unwrap_or_default();
+        match v.trim().to_ascii_lowercase().as_str() {
+            "top-left" | "tl" | "left" => Corner::TopLeft,
+            "bottom-right" | "br" => Corner::BottomRight,
+            "bottom-left" | "bl" => Corner::BottomLeft,
+            _ => Corner::TopRight,
+        }
+    })
+}
+
+fn panel_origin(corner: Corner, screen: (u32, u32), box_size: (u32, u32)) -> (u32, u32) {
+    let w = box_size.0.min(screen.0);
+    let h = box_size.1.min(screen.1);
+    match corner {
+        Corner::TopLeft => (0, 0),
+        Corner::TopRight => (screen.0.saturating_sub(w), 0),
+        Corner::BottomLeft => (0, screen.1.saturating_sub(h)),
+        Corner::BottomRight => (screen.0.saturating_sub(w), screen.1.saturating_sub(h)),
+    }
+}
+
 /// The box's size in pixels.
 const fn size(scale: u32) -> (u32, u32) {
     (BASE_W * scale, BASE_H * scale)
@@ -942,7 +976,8 @@ impl Panel {
                 bottom: h.min(height),
                 back: 1,
             };
-            list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&part));
+            let (dst_x, dst_y) = panel_origin(corner(), (width, height), (w, h));
+            list.CopyTextureRegion(&to, dst_x, dst_y, 0, &from, Some(&part));
         }
         self.cost += began.elapsed();
     }
@@ -1052,6 +1087,15 @@ mod tests {
         (a.0[1], b.0[1]) = (50, 20);
         let c = b.since(a, 10.0);
         assert_eq!((c[0], c[1]), (2.0, 2.0));
+    }
+
+    #[test]
+    fn panel_origin_places_in_requested_corner() {
+        assert_eq!(panel_origin(Corner::TopLeft, (1920, 1080), (540, 354)), (0, 0));
+        assert_eq!(panel_origin(Corner::TopRight, (1920, 1080), (540, 354)), (1380, 0));
+        assert_eq!(panel_origin(Corner::BottomLeft, (1920, 1080), (540, 354)), (0, 726));
+        assert_eq!(panel_origin(Corner::BottomRight, (1920, 1080), (540, 354)), (1380, 726));
+        assert_eq!(panel_origin(Corner::TopRight, (300, 200), (540, 354)), (0, 0));
     }
 }
 

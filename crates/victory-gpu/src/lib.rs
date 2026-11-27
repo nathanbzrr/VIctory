@@ -74,6 +74,8 @@ pub mod pipeline;
 #[cfg(windows)]
 mod picked;
 #[cfg(windows)]
+pub(crate) mod phase2_prof;
+#[cfg(windows)]
 mod pool;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod popwatch;

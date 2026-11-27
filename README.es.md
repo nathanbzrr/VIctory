@@ -20,7 +20,7 @@ Medido en **Ryzen 5 5600 (6C/12T), Radeon RX 9060 XT 16 GB, 16 GB DDR4, Windows 
 | Tráfico copy-back | 27.0 MB / cuadro | **0.5 MB / cuadro** |
 | CPU `preparing` | 45.8 ms | **32.2 – 35.4 ms** |
 | Cuadro real (mín / med) | 68.6 / 73.1 ms | **64.3 / 66.2 – 69.6 ms** |
-| FPS nativos y estabilidad (sin FG, 180 s) | 14.08 FPS (media 71.03 ms, p99 152.1 ms / 1% low 6.6 FPS, máx. 194.2 ms) | **14.23 FPS** (media **70.29 ms**, p50 **69.35 ms**, p99 **97.9 ms** / 1% low **10.2 FPS**, máx. **104.4 ms**) |
+| FPS nativos y estabilidad (sin FG, mundo abierto estable) | 14.08 FPS (media 71.03 ms, p99 152.1 ms / 1% low 6.6 FPS) | **16.6 – 19.5 FPS** (p50 **60.0 ms**, `victory-submit` **34.4 ms** frente a 59.7 ms, `VirtualQuery` **0.00 ms**, `BufferSweep` **0.82 ms**, `0` OOM / `0` emergency reclaim) |
 | Pase `heap buffers` (máx. / picos >50 ms) | 821.1 ms (8 picos >50 ms) | **33.8 ms (0 picos >50 ms; estable 8.6–10.0 ms)** |
 | Esperas `settle` y `take()` (estable sin FG) | 0.2–2.6 ms settle / 0.75–1.07 ms `take()` | **0.0 ms settle / 0.31–0.47 ms `take()`** |
 | FPS mostrados (FSR 3.1.6 FG) | 25–27 FPS (caídas VSync a 15–20) | **29.2 – 31.0 FPS** (sin caídas VSync) |
@@ -34,11 +34,12 @@ Medido en **Ryzen 5 5600 (6C/12T), Radeon RX 9060 XT 16 GB, 16 GB DDR4, Windows 
 - **Envío CPU y copy-back:** escrituras write-combined retenidas en VRAM (`27 -> 0.5 MB/cuadro`); salto rápido AVX2 `vptest` de 128 B y `merge_piece` vectorizado; pool lock-free work-stealing en `land`; shards write-watch alineados a 64 B; escaneo fusionado `ask_once`/`stale_under_flights`; `mirror` lock-free; `OnceLock` en firmas de comando; `Few<Barrier, 16>` en pila; `PLACED_TEXTURES` en 64 shards; `unfold` sin bloqueo y `wake()` lock-free; puesta a cero de `upload::ARENAS` fuera del mutex; prioridad elevada para hilos auxiliares en 6 núcleos; listas preplanificadas; hash antes de detile; reutilización de búferes de subida.
 - **Auto-VRAM dinámico DXGI y reducción de Shared GPU:** escalado automático 8 / 12 / 16 / 24+ GB mediante `DedicatedVideoMemory` y `DXGI_QUERY_VIDEO_MEMORY_INFO` en vivo (`VICTORY_VRAM_MODE=auto|8gb|12gb|16gb|24gb|legacy`, soporte `"auto"` y sobrescrituras manuales, detección UMA y descenso escalonado por Commit). En GPUs de 16 GB adapta el presupuesto según la RAM: `<=20 GB` RAM usa `84%` keep / `90%` room (`12.11 GB` VRAM, `2.18 GB` Shared GPU, sin paginación de working set, `+55%` en 1% low FPS) y `>=32 GB` RAM usa `91%` keep / `95%` room (`~13.2–14.2 GB` VRAM). Ventanas VRAM directas sin staging (`CardCpu::Direct`), copias CPU compactas (`CardCpu::Cpu`), cola `DIRTY_CARDED` O(dirty), expulsión incremental de ventanas con histéresis (máx. 8/s), scratch compartido para depth-stencil (upstream `#2162`), corrección del umbral `host_pressure` en 16 GB RAM (`send_allocs` `117/15s -> 0/15s`), autodetección NVMe (`VICTORY_FILE_PHYSICAL=auto`) y estadísticas de memoria propias del título en `XMemGetWorkingSetStatistics`.
 - **Frame pacing y eliminación de picos (nativo sin FG):** `sweep()` asíncrono incremental (`victory-sweep`, `VICTORY_SWEEP_ASYNC=1`) eliminando el drenaje síncrono `settle(WHY_SYNC)` cada 1.5 s; recolección en segundo plano `bury()` con limitación (`victory-bury`, `VICTORY_BURY_ASYNC=1`); esperas `WHY_FENCE`/`WHY_VALUE` por `Line.seq` sin bloquear `host.submitted`; omisión de `sync_heaps` redundante en `execute_own` (`0.0` rondas sin marca); escaneo de 64 bits `AtomicU64` en `port_descriptors::take()` (`2–3×` más rápido); `frame::wait` de precisión sin `Sleep(0)`; telemetría por cuadro `present pacing` (`avg / p50 / p95 / p99 / 1% low / max / >50 ms / >100 ms`, `VICTORY_FRAME_TIMES_FILE`) y `heap buffers` plano (`VICTORY_TEXTURE_STAGE_MS=4`, `VICTORY_TEXTURE_CATCHUP=0`, `0` picos >50 ms).
-- **Correcciones y controles:** presupuesto de espera compute (`5000 ms`) corrigiendo rostros faltantes; omisión de shader con fallo en RDNA4 (`240cb516c1af0bc3`); filtro de sondas violetas; flips asíncronos seguros; reintento de detile; teclado y ratón PC (`F2`/`~` cámara, `F3` panel FPS).
+- **Fase 2 — optimización de envío CPU y descriptores (`feat/phase2-30fps`):** caché `VirtualQuery` `MappedCache` entre envíos con invalidación por rango en `card_steps` (`12.56 ms / 36 llamadas -> 0.00 ms / 0 llamadas`, `own_cs` `15.1 -> 2.7 ms`); tabla atómica lock-free por ranura `ENTRY_GENS` + caché TLS de 8192 entradas para `descriptor::VIEWS` y `words_for` (`100.0%` de aciertos); `BufferSweep` incremental por copia y omisión de ranuras sin cambios en `heap_buffer_pass` (`HBP_SPANS` `10.94 -> 0.82 ms`); pools ampliados `PRELUDES_MOST` `(256, 64)`, `send::SPARE` `(256/128 MiB)` y `VICTORY_LIST_IDLE_MOST=320` eliminando la recreación por cuadro de listas/búferes D3D12; caché `Batch::last_ahead`; mapa de bits por páginas de 64 KiB `gpu_written_pages` para `PORT_CBV`; HUD en esquina superior derecha (`VICTORY_PANEL_POS=top-right`); perfilador opcional (`VICTORY_PHASE2_PROFILE=1`).
+- **Correcciones y controles:** presupuesto de espera compute (`5000 ms`) corrigiendo rostros faltantes; omisión de shader con fallo en RDNA4 (`240cb516c1af0bc3`); filtro de sondas violetas; flips asíncronos seguros; reintento de detile; teclado y ratón PC (`F2`/`~` cámara, `F3` panel FPS arriba a la derecha).
 
 ## Límites conocidos (en desarrollo en `dev`)
 
-- Los 30 FPS nativos (`<= 33.3 ms`) están limitados por el hilo `victory-submit` (`49–60 ms/cuadro`; GPU al 52–58%).
+- Los 30 FPS nativos (`<= 33.3 ms`) siguen optimizándose en `dev`: `victory-submit` ya bajó a `34.4 ms/cuadro`; el siguiente foco es la grabación paralela (`victory-list-0..3`) y copias CBV.
 - Los picos de Commit en la transición prólogo -> mundo abierto en archivos de paginación muy ajustados se mitigan en `dev` con `emergency_reclaim()` y autodetección NVMe (`VICTORY_FILE_PHYSICAL=auto`).
 
 ## Inicio rápido
@@ -77,7 +78,7 @@ $env:RUSTFLAGS = "-C target-cpu=znver3"
 cargo build --release --locked -p victory
 ```
 
-SHA-256 de `RAZDA4A_XEN.exe`: `e90b23f05f6d3caa488beaf3afc4cd0e94151b75a33606bfd75594a373e4f18b`
+SHA-256 de `RAZDA4A_XEN.exe`: `044366d1ddc3e72c815273f600d1fce5ce6efad3af42ac3a5d0155080964be77`
 
 ## Ramas y licencia
 

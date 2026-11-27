@@ -825,6 +825,7 @@ impl Work for Job {
         }
         // (The mark was this submission's alone.)
         crate::port_journal::set_mark(0);
+        crate::phase2_prof::flush_tls();
         let us = began.elapsed().as_micros() as u64;
         STATS[BUSY].fetch_add(us, Relaxed);
         if is_run {
@@ -1103,6 +1104,8 @@ fn trace_present() {
     }
     static STATE: Mutex<Option<Prev>> = Mutex::new(None);
     let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    static PRESENTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+    let total_presented = PRESENTED_TOTAL.fetch_add(1, Relaxed) + 1;
     let now = Instant::now();
     let cur_prep = || std::array::from_fn(|i| crate::host::PREPARING[i].load(Relaxed));
     let cur_card = || std::array::from_fn(|i| crate::port_cbv::TRACE_CARD_STEPS[i].load(Relaxed));
@@ -1172,6 +1175,7 @@ fn trace_present() {
          card_steps={card_fills:.0}f/{card_copies:.1}c/{card_kb:.0}KB/ref={card_ref:.2} | upq={upq_subs:.1}s/{upq_mb:.1}MB | \
          port_cbv=place:{cbv_place:.0} shadow:{cbv_shadow:.0}({cbv_shadow_kb:.0}KB) copy:{cbv_copy:.0} unalign:{cbv_align:.0}"
     );
+    crate::phase2_prof::emit_breakdown(total_presented);
     *prev = Prev { at: now, frames: 0, busy, runs, joined, drawn, prep, card, upq, cbv, us, heap_us };
 }
 

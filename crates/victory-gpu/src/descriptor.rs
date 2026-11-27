@@ -242,6 +242,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                 let mut r = rounds();
                 let mut asked = r.0 != r.1;
                 while !asked {
+                    let _idle_p2 = crate::phase2_prof::span(crate::phase2_prof::t::HS_IDLE_WAIT);
                     let Some(every) = sync_early().filter(|_| last.elapsed().as_millis() < 500) else {
                         r = SYNC_ROUNDS.1.wait(r).unwrap_or_else(|e| e.into_inner());
                         asked = r.0 != r.1;
@@ -262,7 +263,13 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                 });
                 let _round =
                     crate::timeline::span(if asked { "the heaps' records, for a submission" } else { "the heaps' records, early" });
+                crate::phase2_prof::inc(if asked {
+                    crate::phase2_prof::c::HS_SUB_ROUNDS
+                } else {
+                    crate::phase2_prof::c::HS_EARLY_ROUNDS
+                });
                 let _ = std::panic::catch_unwind(sync_heaps);
+                crate::phase2_prof::flush_tls();
             }
         });
         THREAD.store(made.is_ok(), std::sync::atomic::Ordering::Release);
@@ -383,6 +390,7 @@ pub(crate) fn sync_heaps() {
     if !sync_on() {
         return;
     }
+    let _p2_hs = crate::phase2_prof::span(crate::phase2_prof::t::HS_TOTAL);
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut views, mut bytes) = (0u64, 0u64);
@@ -393,7 +401,7 @@ pub(crate) fn sync_heaps() {
     let mut short = 0u64;
     let mut wait: Vec<u32> = Vec::new();
     let frame = crate::frame::current();
-    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let heaps = crate::phase2_prof::read_rw(crate::phase2_prof::lock::L_HEAPS_R, &SHADER_HEAPS);
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -438,9 +446,13 @@ pub(crate) fn sync_heaps() {
             // calls marked, in place of the changed pages; and a few of the
             // pages the watch says were written, looked at whole.
             let phase = crate::timeline::span("the heaps' records: the marks taken (renderer port 2)");
-            let runs = crate::port_descriptors::take(start).unwrap_or_default();
+            let runs = {
+                let _p2_dt = crate::phase2_prof::span(crate::phase2_prof::t::HS_DESC_TAKE);
+                crate::port_descriptors::take(start).unwrap_or_default()
+            };
             phase.end();
             if crate::port_descriptors::ask_due(frame) {
+                let _p2_fa = crate::phase2_prof::span(crate::phase2_prof::t::HS_FALLBACK_ASK);
                 let began = std::time::Instant::now();
                 let phase = crate::timeline::span("the heaps' records: asking (renderer port 2's fallback)");
                 let taken = written.take(start as usize, end as usize);
@@ -451,6 +463,7 @@ pub(crate) fn sync_heaps() {
             let pages = crate::port_descriptors::to_check(frame);
             (parts, taken_in_check) = crate::port_descriptors::plan_parts(start, end, step, mirrored_count, &runs, &pages, crate::watch::PAGE);
         } else {
+            let _p2_fa = crate::phase2_prof::span(crate::phase2_prof::t::HS_FALLBACK_ASK);
             let began = std::time::Instant::now();
             let phase = crate::timeline::span("the heaps' records: asking");
             let taken = written.take(start as usize, end as usize);
@@ -615,13 +628,17 @@ pub(crate) fn sync_heaps() {
             }
         }
         spent[1] += since(began);
+        crate::phase2_prof::record_time(crate::phase2_prof::t::HS_SCAN, began.elapsed().as_micros() as u64);
         let began = std::time::Instant::now();
         let phase = crate::timeline::span("the heaps' records: made");
-        crate::land::each_view(true, make.len().div_ceil(records_a_job), &|n| {
-            for &index in make.chunks(records_a_job).nth(n).unwrap_or_default() {
-                host.mirror(index, start + u64::from(index) * step, false);
-            }
-        });
+        {
+            let _p2_mir = crate::phase2_prof::span(crate::phase2_prof::t::HS_MIRROR);
+            crate::land::each_view(true, make.len().div_ceil(records_a_job), &|n| {
+                for &index in make.chunks(records_a_job).nth(n).unwrap_or_default() {
+                    host.mirror(index, start + u64::from(index) * step, false);
+                }
+            });
+        }
         phase.end();
         spent[2] += since(began);
         if !wait.is_empty() {
@@ -629,6 +646,8 @@ pub(crate) fn sync_heaps() {
         }
     }
     drop(heaps);
+    crate::phase2_prof::inc_by(crate::phase2_prof::c::HS_PAGES_SCANNED, pages);
+    crate::phase2_prof::inc_by(crate::phase2_prof::c::HS_SLOTS_MIRRORED, mirrored);
     let micros = started.elapsed().as_micros() as u64;
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, micros, tabled, later]) {
         count.fetch_add(n, Relaxed);
@@ -918,7 +937,7 @@ pub(crate) fn constant_slots_batch(
     base_gpu: u64,
     mut visit: impl FnMut(&mut dyn FnMut(usize, u32, u64, u32)),
 ) {
-    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let heaps = crate::phase2_prof::read_rw(crate::phase2_prof::lock::L_HEAPS_R, &SHADER_HEAPS);
     let mut last_heap: (usize, Option<&host::HostHeap>) = (0, None);
     let mut set_slot = |heap: usize, index: u32, offset: u64, size: u32| {
         let host = if heap == last_heap.0 {
@@ -1266,6 +1285,7 @@ impl Views {
     }
 
     /// The view of placed memory [`placed_words`] named.
+    #[allow(dead_code)]
     fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
         let payload = payload(i, generation);
         let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
@@ -1306,8 +1326,187 @@ impl Views {
                 i
             }
         };
-        [i, self.list[i as usize].1]
+        let gen_val = self.list[i as usize].1;
+        entry_gen_store(i, gen_val);
+        [i, gen_val]
     }
+}
+
+/// Lock-free segmented per-slot generation table for [`Views::list`].
+/// `forget()` updates ONLY the freed slot's atomic generation so unrelated
+/// entries in every thread's TLS cache remain valid indefinitely.
+const GEN_CHUNK_SHIFT: usize = 12;
+const GEN_CHUNK_SIZE: usize = 1 << GEN_CHUNK_SHIFT;
+const GEN_CHUNKS: usize = 128; // up to 524,288 table slots
+
+static ENTRY_GENS: [std::sync::OnceLock<Box<[std::sync::atomic::AtomicU32; GEN_CHUNK_SIZE]>>; GEN_CHUNKS] =
+    [const { std::sync::OnceLock::new() }; GEN_CHUNKS];
+
+#[inline]
+fn entry_gen_store(i: u32, gen_val: u32) {
+    let chunk = (i as usize) >> GEN_CHUNK_SHIFT;
+    if let Some(slot) = ENTRY_GENS.get(chunk) {
+        let table = slot.get_or_init(|| {
+            (0..GEN_CHUNK_SIZE)
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+                .try_into()
+                .ok()
+                .unwrap()
+        });
+        table[(i as usize) & (GEN_CHUNK_SIZE - 1)].store(gen_val, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[inline]
+fn entry_gen_load(i: u32) -> u32 {
+    let chunk = (i as usize) >> GEN_CHUNK_SHIFT;
+    let Some(slot) = ENTRY_GENS.get(chunk) else { return 0 };
+    let Some(table) = slot.get() else { return 0 };
+    table[(i as usize) & (GEN_CHUNK_SIZE - 1)].load(std::sync::atomic::Ordering::Acquire)
+}
+
+const TLS_SHAPE_SLOTS: usize = 1024;
+const TLS_SHAPE_ID_SLOTS: usize = 512;
+const TLS_ENTRY_SLOTS: usize = 8192;
+const TLS_VIEW_WORDS_SLOTS: usize = 2048;
+
+#[derive(Clone, Default)]
+struct TlsViewEntry {
+    i: u32,
+    generation: u32,
+    view: Option<View>,
+}
+
+struct TlsViewsCache {
+    /// Append-only `Views::shapes` cache (`shape_id -> Shape`). Never invalidated.
+    shapes: Box<[Option<(u32, Shape)>; TLS_SHAPE_SLOTS]>,
+    /// Reverse `Shape -> shape_id` cache for `words_for(View::Placed(..))`. Never invalidated.
+    shape_ids: Box<[Option<(Shape, u32)>; TLS_SHAPE_ID_SLOTS]>,
+    /// Per-slot generation-validated table entry cache (`(i, generation) -> View`).
+    entries: Box<[TlsViewEntry; TLS_ENTRY_SLOTS]>,
+    /// Reverse `View -> (i, generation)` cache for `words_for()` on table entries,
+    /// validated lock-free via `entry_gen_load(i) == generation`.
+    view_words: Box<[Option<(View, u32, u32)>; TLS_VIEW_WORDS_SLOTS]>,
+}
+
+impl TlsViewsCache {
+    fn new() -> Self {
+        Self {
+            shapes: vec![None; TLS_SHAPE_SLOTS].into_boxed_slice().try_into().ok().unwrap(),
+            shape_ids: vec![None; TLS_SHAPE_ID_SLOTS].into_boxed_slice().try_into().ok().unwrap(),
+            entries: vec![TlsViewEntry::default(); TLS_ENTRY_SLOTS].into_boxed_slice().try_into().ok().unwrap(),
+            view_words: vec![None; TLS_VIEW_WORDS_SLOTS].into_boxed_slice().try_into().ok().unwrap(),
+        }
+    }
+}
+
+/// Lock-free check whether record words `(i, generation)` still name a live view.
+#[inline]
+pub(crate) fn is_record_live(i: u32, generation: u32) -> bool {
+    match generation >> KIND_SHIFT {
+        0 => entry_gen_load(i) == generation,
+        CONSTANT | PLACED => true,
+        _ => false,
+    }
+}
+
+/// Reads the packed `(generation << 32 | i)` record key at `handle`, or `0` if not a view record.
+#[inline]
+pub(crate) fn record_key(handle: u64) -> u64 {
+    if handle == 0 {
+        return 0;
+    }
+    // SAFETY: `handle` is a descriptor slot in title memory.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag == VIEW_TAG {
+        u64::from(generation) << 32 | u64::from(i)
+    } else {
+        0
+    }
+}
+
+#[inline]
+fn hash_view(view: &View) -> usize {
+    let mut h = 0x9E37_79B9_7F4A_7C15u64;
+    let mix = |h: &mut u64, v: u64| {
+        *h = (h.rotate_left(5) ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    };
+    match view {
+        View::Constant(a, s) => {
+            mix(&mut h, 1);
+            mix(&mut h, *a);
+            mix(&mut h, u64::from(*s));
+        }
+        View::Shader(r, d) => {
+            mix(&mut h, 2);
+            mix(&mut h, *r as u64);
+            if let Some(w) = d {
+                for &x in w {
+                    mix(&mut h, u64::from(x));
+                }
+            }
+        }
+        View::Unordered(r, c, d) => {
+            mix(&mut h, 3);
+            mix(&mut h, *r as u64);
+            mix(&mut h, *c as u64);
+            if let Some(w) = d {
+                for &x in w {
+                    mix(&mut h, u64::from(x));
+                }
+            }
+        }
+        View::Sampler(w) => {
+            mix(&mut h, 4);
+            for &x in w {
+                mix(&mut h, u64::from(x));
+            }
+        }
+        View::ConsoleSampler(w) => {
+            mix(&mut h, 5);
+            for &x in w {
+                mix(&mut h, u64::from(x));
+            }
+        }
+        View::Placed(u, r, d) => {
+            mix(&mut h, 6 + u64::from(*u));
+            for &x in r {
+                mix(&mut h, u64::from(x));
+            }
+            for &x in d {
+                mix(&mut h, u64::from(x));
+            }
+        }
+    }
+    (h ^ (h >> 32)) as usize
+}
+
+thread_local! {
+    static TLS_VIEWS: std::cell::RefCell<TlsViewsCache> = std::cell::RefCell::new(TlsViewsCache::new());
+}
+
+#[inline]
+fn hash_shape(shape: &Shape) -> usize {
+    let mut h = u64::from(shape.0) ^ 0x9E37_79B9_7F4A_7C15;
+    for &w in &shape.1 {
+        h = (h.rotate_left(5) ^ u64::from(w)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    for &w in &shape.2 {
+        h = (h.rotate_left(5) ^ u64::from(w)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    (h ^ (h >> 32)) as usize
+}
+
+#[inline]
+fn build_placed_view(shape: &Shape, address: u64) -> View {
+    let (unordered, resource, rest) = *shape;
+    let mut desc = [0u32; 16];
+    desc[..10].copy_from_slice(&rest[..10]);
+    (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+    desc[12..].copy_from_slice(&rest[10..]);
+    View::Placed(unordered, resource, desc)
 }
 
 /// The two words that name `view` in a record: the view itself where its
@@ -1325,10 +1524,27 @@ fn words_for(view: View) -> [u32; 2] {
             View::Placed(unordered, resource, desc) => {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
-                    // Nearly every placed view has a shape seen before.
-                    let known = views_read().shape_index.get(&shape).copied();
-                    let shape = known.or_else(|| views_write().shape(shape));
-                    if let Some(shape) = shape {
+                    let h = hash_shape(&shape) & (TLS_SHAPE_ID_SLOTS - 1);
+                    let cached = TLS_VIEWS.with(|c| {
+                        let c = c.borrow();
+                        c.shape_ids[h].as_ref().and_then(|(s, id)| (*s == shape).then_some(*id))
+                    });
+                    let shape_id = match cached {
+                        Some(id) => Some(id),
+                        None => {
+                            let known = views_read().shape_index.get(&shape).copied();
+                            let resolved = known.or_else(|| views_write().shape(shape));
+                            if let Some(id) = resolved {
+                                TLS_VIEWS.with(|c| {
+                                    let mut c = c.borrow_mut();
+                                    c.shape_ids[h] = Some((shape, id));
+                                    c.shapes[(id as usize) & (TLS_SHAPE_SLOTS - 1)] = Some((id, shape));
+                                });
+                            }
+                            resolved
+                        }
+                    };
+                    if let Some(shape) = shape_id {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
                         return placed_words(shape, address);
                     }
@@ -1337,19 +1553,40 @@ fn words_for(view: View) -> [u32; 2] {
             _ => {}
         }
     }
-    // A view written before keeps its entry and generation.
-    if let Some(words) = views_read().entry_of(&view) {
+    // A view written before keeps its entry and generation: check lock-free TLS first.
+    let vh = hash_view(&view) & (TLS_VIEW_WORDS_SLOTS - 1);
+    let cached_words = TLS_VIEWS.with(|c| {
+        let c = c.borrow();
+        c.view_words[vh].as_ref().and_then(|(v, i, g)| {
+            (*v == view && entry_gen_load(*i) == *g).then_some([*i, *g])
+        })
+    });
+    if let Some(words) = cached_words {
         return words;
     }
-    views_write().entry(view)
+    let words = if let Some(words) = views_read().entry_of(&view) {
+        words
+    } else {
+        views_write().entry(view.clone())
+    };
+    let [i, g] = words;
+    if entry_gen_load(i) == g {
+        TLS_VIEWS.with(|c| {
+            let mut c = c.borrow_mut();
+            c.view_words[vh] = Some((view.clone(), i, g));
+            let slot_idx = (i as usize ^ (g as usize).wrapping_mul(0x9E37_79B9)) & (TLS_ENTRY_SLOTS - 1);
+            c.entries[slot_idx] = TlsViewEntry { i, generation: g, view: Some(view) };
+        });
+    }
+    words
 }
 
 fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
-    VIEWS.read().unwrap_or_else(|e| e.into_inner())
+    crate::phase2_prof::read_rw(crate::phase2_prof::lock::L_VIEWS_R, &VIEWS)
 }
 
 fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
-    VIEWS.write().unwrap_or_else(|e| e.into_inner())
+    crate::phase2_prof::write_rw(crate::phase2_prof::lock::L_VIEWS_W, &VIEWS)
 }
 
 /// For the memory line: the distinct views kept ([`Views`]), those of them
@@ -1540,7 +1777,9 @@ pub(crate) fn forget(resource: usize) {
         }
         views.index.remove(&view);
         // (Below the bits that say a record is no table entry.)
-        views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+        let next_gen = ((generation + 1) & GENERATIONS).max(1);
+        views.list[i as usize].1 = next_gen;
+        entry_gen_store(i, next_gen);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
@@ -1552,12 +1791,70 @@ pub(crate) fn forget(resource: usize) {
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
         0 => {
-            let views = views_read();
-            let (view, current) = views.list.get(i as usize)?;
-            (*current == generation).then(|| view.clone())
+            let live_gen = entry_gen_load(i);
+            if live_gen != 0 && live_gen != generation {
+                // Slot was forgotten or reused under a newer generation: stale, zero locks!
+                crate::phase2_prof::inc(crate::phase2_prof::c::VIEWS_STALE_FAST);
+                return None;
+            }
+            let slot_idx = (i as usize ^ (generation as usize).wrapping_mul(0x9E37_79B9)) & (TLS_ENTRY_SLOTS - 1);
+            if live_gen == generation {
+                let hit = TLS_VIEWS.with(|c| {
+                    let c = c.borrow();
+                    let entry = &c.entries[slot_idx];
+                    if entry.i == i && entry.generation == generation {
+                        entry.view.clone()
+                    } else {
+                        None
+                    }
+                });
+                if hit.is_some() {
+                    crate::phase2_prof::inc(crate::phase2_prof::c::VIEWS_TLS_HIT);
+                    return hit;
+                }
+            }
+            crate::phase2_prof::inc(crate::phase2_prof::c::VIEWS_TLS_MISS);
+            let found = {
+                let views = views_read();
+                let (view, current) = views.list.get(i as usize)?;
+                (*current == generation).then(|| view.clone())
+            };
+            if let Some(ref view) = found
+                && live_gen == generation
+            {
+                TLS_VIEWS.with(|c| {
+                    let mut c = c.borrow_mut();
+                    c.entries[slot_idx] = TlsViewEntry {
+                        i,
+                        generation,
+                        view: Some(view.clone()),
+                    };
+                });
+            }
+            found
         }
         CONSTANT => Some(constant_of(i, generation)),
-        PLACED => views_read().placed_of(i, generation),
+        PLACED => {
+            let p = payload(i, generation);
+            let address = p & ((1 << PLACED_ADDRESS_BITS) - 1);
+            let shape_id = (p >> PLACED_ADDRESS_BITS) as u32;
+            let slot_idx = (shape_id as usize) & (TLS_SHAPE_SLOTS - 1);
+            let cached = TLS_VIEWS.with(|c| {
+                let c = c.borrow();
+                c.shapes[slot_idx].as_ref().and_then(|(id, s)| (*id == shape_id).then(|| build_placed_view(s, address)))
+            });
+            if cached.is_some() {
+                return cached;
+            }
+            let shape = {
+                let views = views_read();
+                *views.shapes.get(shape_id as usize)?
+            };
+            TLS_VIEWS.with(|c| {
+                c.borrow_mut().shapes[slot_idx] = Some((shape_id, shape));
+            });
+            Some(build_placed_view(&shape, address))
+        }
         _ => None,
     }
 }
@@ -2170,5 +2467,36 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[test]
+    fn tls_view_cache_invalidates_on_forget() {
+        let res_a = 0xDEAD_BEEF_1000usize;
+        let res_b = 0xDEAD_BEEF_2000usize;
+        let res_c = 0xDEAD_BEEF_3000usize;
+        let va = View::Shader(res_a, Some([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]));
+        let vc = View::Shader(res_c, Some([3, 3, 3, 3, 3, 3, 3, 3, 3, 3]));
+        let [ia, ga] = words_for(va.clone());
+        let [ic, gc] = words_for(vc.clone());
+        // First lookup populates TLS cache; second hits TLS cache.
+        assert_eq!(view_at(ia, ga), Some(va.clone()));
+        assert_eq!(view_at(ia, ga), Some(va.clone()));
+        assert_eq!(view_at(ic, gc), Some(vc.clone()));
+
+        // Forgetting res_a invalidates ONLY slot ia (via ENTRY_GENS[ia]), leaving ic valid.
+        forget(res_a);
+        assert_eq!(view_at(ia, ga), None);
+        assert_eq!(view_at(ic, gc), Some(vc.clone()));
+
+        // Reusing freed slot with new generation returns the new view.
+        let vb = View::Shader(res_b, Some([10, 9, 8, 7, 6, 5, 4, 3, 2, 1]));
+        let [ib, gb] = words_for(vb.clone());
+        assert_eq!(view_at(ib, gb), Some(vb.clone()));
+        assert_eq!(view_at(ib, gb), Some(vb));
+        assert_eq!(view_at(ia, ga), None);
+        forget(res_b);
+        forget(res_c);
+        assert_eq!(view_at(ib, gb), None);
+        assert_eq!(view_at(ic, gc), None);
     }
 }
