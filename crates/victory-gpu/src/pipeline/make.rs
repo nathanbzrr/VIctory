@@ -511,11 +511,18 @@ fn shared_budget() -> bool {
 fn wait(p: &Pending, frame: u64) {
     let compute = p.compute && !compute_budget().is_zero();
     let screen = !compute && p.screen && !screen_budget().is_zero();
+    // Critical once-only compute passes (such as the character head blend-shape
+    // map `61e54e90adccaf6a`) always keep an exclusive compute wait budget so
+    // they can never be starved by concurrent recording threads. Regular
+    // gameplay compute pipelines share the per-frame compute budget so a burst
+    // of new effect shaders never stacks 2x-4x (10+ second) freezes in one frame.
+    let critical_compute = compute
+        && (frame < 120
+            || p.shaders
+                .iter()
+                .any(|s| s.hash == "61e54e90adccaf6a"));
     let (bucket, budget, shared) = if compute {
-        // Compute threads must not reserve the entire 10 s budget exclusively:
-        // two recording threads hitting different once-only compute pipelines
-        // on the first world frame both need to wait for their own pipeline.
-        (2usize, compute_budget(), false)
+        (2usize, compute_budget(), !critical_compute && shared_budget())
     } else if screen {
         (1usize, screen_budget(), shared_budget())
     } else {
@@ -616,8 +623,11 @@ fn slow_limit() -> usize {
 }
 
 struct Queue {
-    /// Requested passes over the screen: before all others, and the only ones
-    /// [`SCREEN_WORKERS`] take.
+    /// Requested compute pipelines: highest priority so compute dispatches
+    /// never stall behind graphics screen passes or early prewarm work.
+    compute: VecDeque<Arc<Pending>>,
+    /// Requested passes over the screen: before regular graphics, and taken by
+    /// [`SCREEN_WORKERS`] alongside [`Queue::compute`].
     screen: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
     /// Those of the early ones known to take long, and how many of them are
@@ -630,6 +640,7 @@ struct Queue {
 impl Queue {
     const fn new() -> Self {
         Self {
+            compute: VecDeque::new(),
             screen: VecDeque::new(),
             early: VecDeque::new(),
             slow: VecDeque::new(),
@@ -650,7 +661,9 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED && ((p.screen && !screen_budget().is_zero()) || (p.compute && !compute_budget().is_zero())) {
+        if priority == REQUESTED && p.compute && !compute_budget().is_zero() {
+            self.compute.push_back(p.clone());
+        } else if priority == REQUESTED && p.screen && !screen_budget().is_zero() {
             self.screen.push_back(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
@@ -667,7 +680,7 @@ impl Queue {
         let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
             std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         };
-        let mut p = self.screen.pop_front();
+        let mut p = self.compute.pop_front().or_else(|| self.screen.pop_front());
         if p.is_none() && !screens_only {
             p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
             if p.is_none() && self.slow_now < slow_limit {
@@ -719,8 +732,10 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
 }
 
-/// Workers that make passes over the screen alone, besides the others.
-const SCREEN_WORKERS: usize = 2;
+/// Workers that make requested compute and screen passes alone, besides the
+/// general workers (idle at 0% CPU when the compute/screen queues are empty,
+/// and parallelize bursts of new compute shaders immediately on arrival).
+const SCREEN_WORKERS: usize = 4;
 
 fn next(screens_only: bool) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());

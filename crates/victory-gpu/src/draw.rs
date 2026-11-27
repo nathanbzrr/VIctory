@@ -3365,6 +3365,7 @@ impl State {
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+            crate::phase2_prof::inc(crate::phase2_prof::c::HT_UPLOADED);
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => schedule_recheck(at, len),
@@ -4080,10 +4081,13 @@ impl State {
                 fresh[usize::from(slot / 64)] |= 1u64 << (slot % 64);
             }
         }
-        for &(g, e) in &plan.direct {
-            let group = &plan.groups[g];
-            if !selected_slot(&fresh, group.slot) {
-                self.table_entry(list, &group.entries[e], compute);
+        if !plan.direct.is_empty() {
+            let _p2_tdir = crate::phase2_prof::span(crate::phase2_prof::t::TBL_DIRECT);
+            for &(g, e) in &plan.direct {
+                let group = &plan.groups[g];
+                if !selected_slot(&fresh, group.slot) {
+                    self.table_entry(list, &group.entries[e], compute);
+                }
             }
         }
         let mut made = Few::default();
@@ -4135,6 +4139,7 @@ impl State {
             // title memory on a `fresh_tables` miss.
             let mut cached_words = [[0u32; 3]; 64];
             let key = {
+                let _p2_thash = crate::phase2_prof::span(crate::phase2_prof::t::TBL_HASH);
                 let mut h = RecordHash::default();
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
@@ -4201,6 +4206,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
+            crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FRESH_MISS);
             let Some(first) = host.dynamic(n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
@@ -4233,6 +4239,7 @@ impl State {
             }
             let recording = self.recording;
             let mut copy_batch = crate::descriptor::host::CopyBatch::new();
+            let port_cbv_on = crate::port_cbv::on();
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -4243,6 +4250,34 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned() }
                 };
+                // Fast path when `PORT_CBV=0`: inline constant views never live
+                // in `ListViews`, so skip the TLS HashMap miss + double `view_at`.
+                if !port_cbv_on
+                    && let Some((address, size)) = crate::descriptor::inline_constant(words)
+                {
+                    let _p2_cbv = crate::phase2_prof::span(crate::phase2_prof::t::DRAW_CBV_DEFER);
+                    crate::phase2_prof::inc(crate::phase2_prof::c::CBV_SEEN_FALLBACK);
+                    crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_PORT_OFF);
+                    crate::phase2_prof::inc(crate::phase2_prof::c::CBV_OK_COPY);
+                    crate::phase2_prof::inc_by(crate::phase2_prof::c::CBV_OK_COPY_BYTES, u64::from(size));
+                    let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
+                        host.make_null(index);
+                        continue;
+                    };
+                    let slot = (std::ptr::from_ref(heap) as usize, index);
+                    list.defer_constants(to, address as *const u8, size as usize, slot);
+                    let raw_ptr = buffer.as_raw() as usize;
+                    let base = if self.scratch_base.0 == raw_ptr {
+                        self.scratch_base.1
+                    } else {
+                        // SAFETY: live scratch upload buffer.
+                        let b = unsafe { buffer.GetGPUVirtualAddress() };
+                        self.scratch_base = (raw_ptr, b);
+                        b
+                    };
+                    host.constant_at_known(index, &buffer, gpu, gpu.saturating_sub(base), size);
+                    continue;
+                }
                 // A view this list has made before: its descriptor copied in a
                 // coalesced batch, and nothing more if nothing changed since.
                 if list_views
@@ -4398,7 +4433,10 @@ impl State {
                         host.constant_at_known(index, &buffer, gpu, gpu.saturating_sub(base), size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        {
+                            let _p2_mk = crate::phase2_prof::span(crate::phase2_prof::t::TBL_MAKE_AT);
+                            host.make_at(index, &view);
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
@@ -4420,16 +4458,23 @@ impl State {
                         }
                     }
                     None => {
-                        host.make_null(index);
+                        {
+                            let _p2_mk = crate::phase2_prof::span(crate::phase2_prof::t::TBL_MAKE_AT);
+                            host.make_null(index);
+                        }
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }
                     }
                 }
             }
-            host.flush_copy_batch(&mut copy_batch);
+            {
+                let _p2_fl = crate::phase2_prof::span(crate::phase2_prof::t::TBL_FLUSH);
+                host.flush_copy_batch(&mut copy_batch);
+            }
             made.push((slot, first * 32));
         }
+        crate::host::flush_retired_tls();
         made
     }
 

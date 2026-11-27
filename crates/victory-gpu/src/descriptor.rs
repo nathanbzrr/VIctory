@@ -1367,10 +1367,10 @@ fn entry_gen_load(i: u32) -> u32 {
     table[(i as usize) & (GEN_CHUNK_SIZE - 1)].load(std::sync::atomic::Ordering::Acquire)
 }
 
-const TLS_SHAPE_SLOTS: usize = 1024;
-const TLS_SHAPE_ID_SLOTS: usize = 512;
+const TLS_SHAPE_SLOTS: usize = 4096;
+const TLS_SHAPE_ID_SLOTS: usize = 2048;
 const TLS_ENTRY_SLOTS: usize = 8192;
-const TLS_VIEW_WORDS_SLOTS: usize = 2048;
+const TLS_VIEW_WORDS_SLOTS: usize = 8192;
 
 #[derive(Clone, Default)]
 struct TlsViewEntry {
@@ -1400,6 +1400,18 @@ impl TlsViewsCache {
             view_words: vec![None; TLS_VIEW_WORDS_SLOTS].into_boxed_slice().try_into().ok().unwrap(),
         }
     }
+}
+
+/// Fast lock-free decode for inline constant buffer view records, avoiding
+/// `LIST_VIEWS` HashMap probes and `view_at()` dispatch when `PORT_CBV=0`.
+#[inline]
+pub(crate) fn inline_constant(words: [u32; 3]) -> Option<(u64, u32)> {
+    if words[0] == VIEW_TAG && (words[2] >> KIND_SHIFT) == CONSTANT {
+        if let View::Constant(address, size) = constant_of(words[1], words[2]) {
+            return Some((address, size));
+        }
+    }
+    None
 }
 
 /// Lock-free check whether record words `(i, generation)` still name a live view.

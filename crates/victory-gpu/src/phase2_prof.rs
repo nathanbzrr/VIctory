@@ -144,8 +144,12 @@ pub(crate) mod t {
     pub(crate) const DRAW_LISTED: usize = 102;
     pub(crate) const PREL_MAKE: usize = 103;
     pub(crate) const D3D_ALLOC_LIST: usize = 104;
+    pub(crate) const TBL_DIRECT: usize = 105;
+    pub(crate) const TBL_HASH: usize = 106;
+    pub(crate) const TBL_MAKE_AT: usize = 107;
+    pub(crate) const TBL_FLUSH: usize = 108;
 
-    pub(crate) const COUNT: usize = 105;
+    pub(crate) const COUNT: usize = 109;
 }
 
 pub(crate) mod c {
@@ -784,7 +788,7 @@ pub(crate) fn emit_breakdown(presented_total: u64) {
 
     tracing::info!(
         target: "phase2_prof",
-        "PHASE2_DEEP: send[mem={:.2} pairs={:.2} dir={:.2} cpy={:.2}] rf[plan={:.2} ask={:.2} tex={:.2} buf={:.2}] prel[mk={:.2} rst={:.2} up={:.2} pref={:.2} cls={:.2}] def[cpy={:.2} fill={:.2} gwr={:.2} tex={:.2}] | bind[tot={:.2} early_t={:.2} tbl={:.2} listed={:.2} cbv={:.2} read={:.2}] | d3d[alloc={:.2}ms({:.1}c,{:.1}MB) list_al={:.2}ms({:.1}c) res={:.2}ms({:.1}c) pso_gfx={:.2}ms({:.1}c) pso_cs={:.2}ms({:.1}c) pso_hit={:.1}({:.2}ms)]",
+        "PHASE2_DEEP: send[mem={:.2} pairs={:.2} dir={:.2} cpy={:.2}] rf[plan={:.2} ask={:.2} tex={:.2} buf={:.2}] prel[mk={:.2} rst={:.2} up={:.2} pref={:.2} cls={:.2}] def[cpy={:.2} fill={:.2} gwr={:.2} tex={:.2}] | bind[tot={:.2} early_t={:.2} tbl={:.2} listed={:.2} cbv={:.2} read={:.2}] tblx[dir={:.2} hash={:.2} mk={:.2} fl={:.2}] | d3d[alloc={:.2}ms({:.1}c,{:.1}MB) list_al={:.2}ms({:.1}c) res={:.2}ms({:.1}c) pso_gfx={:.2}ms({:.1}c) pso_cs={:.2}ms({:.1}c) pso_hit={:.1}({:.2}ms)]",
         ms(t::SEND_MEM),
         ms(t::SEND_PAIRS),
         ms(t::SEND_DIRECT),
@@ -808,6 +812,10 @@ pub(crate) fn emit_breakdown(presented_total: u64) {
         ms(t::DRAW_LISTED),
         ms(t::DRAW_CBV_DEFER),
         ms(t::DRAW_READABLE),
+        ms(t::TBL_DIRECT),
+        ms(t::TBL_HASH),
+        ms(t::TBL_MAKE_AT),
+        ms(t::TBL_FLUSH),
         ms(t::D3D_ALLOC_COMMIT),
         calls(t::D3D_ALLOC_COMMIT),
         cntf(c::D3D_ALLOC_BYTES) / (1024.0 * 1024.0),

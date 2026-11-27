@@ -841,7 +841,7 @@ fn sweep() {
         send::trim();
         card_steps::trim();
         crate::shadow::trim_snapshots();
-        crate::list::trim_idle(32);
+        crate::list::trim_idle(128);
         crate::list::thin::trim_backs(16);
     } else {
         trim_upload_pool(upload_pool_budget());
@@ -921,17 +921,48 @@ pub(crate) fn retire<T: 'static>(object: T) {
     retired().push_back((started, Retired::Any(Box::new(object))));
 }
 
-/// [`retire`] for a resource.
+thread_local! {
+    static RETIRE_TLS: std::cell::RefCell<Vec<ID3D12Resource>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+const RETIRE_TLS_BATCH: usize = 64;
+
+/// Flushes any per-thread batched retired resources into the shared `RETIRED`
+/// shard in a single lock acquisition.
+pub(crate) fn flush_retired_tls() {
+    RETIRE_TLS.with(|tls| {
+        let mut buf = tls.borrow_mut();
+        if buf.is_empty() {
+            return;
+        }
+        let queued = crate::queue::queued();
+        let started = STARTED.load(Ordering::Acquire) + queued;
+        let n = buf.len() as u64;
+        if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
+            RETIREMENTS[0].fetch_add(n, Ordering::Relaxed);
+            buf.clear();
+            return;
+        }
+        RETIREMENTS[1].fetch_add(n, Ordering::Relaxed);
+        let mut r = retired();
+        r.reserve(buf.len());
+        for obj in buf.drain(..) {
+            r.push_back((started, Retired::Resource(obj)));
+        }
+    });
+}
+
+/// [`retire`] for a resource, batched per thread to avoid taking the `RETIRED`
+/// shard lock and querying submission state on every dynamic descriptor slot.
 pub(crate) fn retire_resource(object: ID3D12Resource) {
-    let queued = crate::queue::queued();
-    let started = STARTED.load(Ordering::Acquire) + queued;
-    if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
-        RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        drop(object);
-        return;
+    let flush = RETIRE_TLS.with(|tls| {
+        let mut buf = tls.borrow_mut();
+        buf.push(object);
+        buf.len() >= RETIRE_TLS_BATCH
+    });
+    if flush || emergency_pressure() {
+        flush_retired_tls();
     }
-    RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    retired().push_back((started, Retired::Resource(object)));
 }
 
 /// How many submissions later than it could (the last one that may use it
@@ -1708,7 +1739,7 @@ struct BatchBuf(ID3D12Resource);
 unsafe impl Send for BatchBuf {}
 
 static SPARE_BATCH: Mutex<Vec<BatchBuf>> = Mutex::new(Vec::new());
-const SPARE_BATCH_MAX: usize = 64;
+const SPARE_BATCH_MAX: usize = 256;
 
 fn take_batch_buffer(size: u64) -> Option<ID3D12Resource> {
     if let Some(BatchBuf(buf)) = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner()).pop() {
@@ -1723,7 +1754,7 @@ fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
     if buffers.is_empty() {
         return;
     }
-    let limit = if keep_freed() { SPARE_BATCH_MAX } else { 16 };
+    let limit = if keep_freed() { SPARE_BATCH_MAX } else { 128 };
     let mut overflow = Vec::new();
     {
         let mut spare = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner());
@@ -1824,7 +1855,7 @@ static PRELUDES: Mutex<Vec<IdlePrelude>> = Mutex::new(Vec::new());
 /// `(max_idle, max_under_pressure)` preludes kept pooled.
 /// Open World submits ~225 lists/frame across 2–3 in-flight frames; keeping 256
 /// idle avoids per-frame `CreateCommandAllocator`/`CreateCommandList` thrashing.
-const PRELUDES_MOST: (usize, usize) = (256, 64);
+const PRELUDES_MOST: (usize, usize) = (512, 128);
 
 fn take_prelude() -> Option<Prelude> {
     let idle = PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).pop();
@@ -6378,7 +6409,7 @@ impl Host {
         RELAY_MOVED.notify_one();
         let tight = self.shared_tight();
         if tight {
-            crate::list::trim_idle(32);
+            crate::list::trim_idle(128);
             trim_preludes();
         }
         if told && !late_writes() {
@@ -7715,7 +7746,7 @@ impl HostList {
         if self.oom_retired.load(Ordering::Relaxed) {
             return true;
         }
-        let max_resets = if emergency_pressure() { 8 } else { 256 };
+        let max_resets = if emergency_pressure() { 8 } else { 1024 };
         self.resets.load(Ordering::Relaxed) >= max_resets
     }
 

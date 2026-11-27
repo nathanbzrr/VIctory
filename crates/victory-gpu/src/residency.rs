@@ -142,18 +142,20 @@ fn next_pressure_for_host(was: bool, physical: u64, commit: u64, total_phys: u64
         return next_pressure_physical(was, physical);
     }
     // On <= 20 GiB RAM hosts (e.g. 16 GB DDR4), Windows normally keeps
-    // `ullAvailPhys` around 1.4-3.0 GiB during gameplay because of standby
-    // file cache and WDDM/file-backed working set. Using 32/64 GB thresholds
-    // (3->5 GiB phys / 4->6 GiB commit) latched `PRESSURED=true` permanently
-    // and triggered a 1 Hz wipe of every upload/send/prelude/scratch/snapshot
-    // pool (`send_allocs = 117 / 15s`, +10 ms/frame). Enter pressure at
-    // <= 768 MiB phys or <= 2 GiB commit, and clear at >= 1.25 GiB phys and
-    // >= 3 GiB commit.
+    // `ullAvailPhys` around 650-1100 MiB during Open World gameplay due to
+    // standby file cache even when 4.5-6.0 GiB of commit headroom is free.
+    // Entering pressure at <= 768 MiB and clearing only at >= 1280 MiB latched
+    // `PRESSURED=true` throughout cutscenes and gameplay, throttling texture
+    // streaming to 64 MiB/f (`tex_wait` -> 24,000, missing cutscene textures)
+    // and wiping idle command-list/buffer pools every second.
+    // Enter pressure at <= 384 MiB phys or <= 1792 MiB commit, and clear at
+    // >= 640 MiB phys and >= 2560 MiB commit (all commit safety guards in
+    // `admit_texture_pass`, `critical_commit`, and `emergency_pressure` remain).
     if total_phys > 0 && total_phys <= 20 * GIB {
         if was {
-            physical < 1280 * MIB || commit < 3072 * MIB
+            physical < 640 * MIB || commit < 2560 * MIB
         } else {
-            physical <= 768 * MIB || commit <= 2048 * MIB
+            physical <= 384 * MIB || commit <= 1792 * MIB
         }
     } else if was {
         physical < 5 * GIB || commit < 6 * GIB
@@ -688,11 +690,11 @@ mod tests {
         assert_eq!(vram_keep_for(budget, 12_000 * MIB, 83, Some(2 * GIB)).0, 5_000);
         // Critical commit (<1.5 GiB) steps watermark down to 63% (~9.7 GB)
         assert_eq!(vram_keep_for(budget, 12_000 * MIB, 83, Some(1 * GIB)).0, 3_000);
-        // 16 GB RAM hosts do not latch permanent pressure at 1.4-2.2 GiB free RAM + 5-6 GiB commit
-        assert!(!next_pressure_for_host(false, 1280 * MIB, 6 * GIB, 16 * GIB));
-        assert!(next_pressure_for_host(false, 768 * MIB, 6 * GIB, 16 * GIB));
-        assert!(next_pressure_for_host(false, 2500 * MIB, 2048 * MIB, 16 * GIB));
-        assert!(next_pressure_for_host(true, 1024 * MIB, 4 * GIB, 16 * GIB));
-        assert!(!next_pressure_for_host(true, 1280 * MIB, 3072 * MIB, 16 * GIB));
+        // 16 GB RAM hosts do not latch permanent pressure at 700-1100 MiB free RAM + 4.5-6 GiB commit
+        assert!(!next_pressure_for_host(false, 768 * MIB, 6 * GIB, 16 * GIB));
+        assert!(next_pressure_for_host(false, 384 * MIB, 6 * GIB, 16 * GIB));
+        assert!(next_pressure_for_host(false, 2500 * MIB, 1792 * MIB, 16 * GIB));
+        assert!(next_pressure_for_host(true, 512 * MIB, 4 * GIB, 16 * GIB));
+        assert!(!next_pressure_for_host(true, 640 * MIB, 2560 * MIB, 16 * GIB));
     }
 }
