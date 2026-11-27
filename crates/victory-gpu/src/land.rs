@@ -230,6 +230,10 @@ impl Pool {
     }
 
     fn new(name: &'static str, threads: usize) -> &'static Pool {
+        Pool::with_priority(name, threads, true)
+    }
+
+    fn with_priority(name: &'static str, threads: usize, raised: bool) -> &'static Pool {
         let pool: &'static Pool = Box::leak(Box::new(Pool {
             state: Mutex::new(State { work: None, count: 0, generation: 0, running: 0, panicked: false }),
             more: Condvar::new(),
@@ -247,15 +251,17 @@ impl Pool {
                 } else {
                     crate::cores::keep_many_on_fast_cores(name);
                 }
-                pool.help()
+                pool.help(raised)
             });
         }
         pool
     }
 
-    fn help(&self) {
-        // (The thread that calls `each` waits for this one's share.)
-        let mut priority = crate::cores::Priority::new();
+    fn help(&self, raised: bool) {
+        // Only pools that the submit/relay critical path waits for run at
+        // elevated priority; background list-descriptor workers stay at normal
+        // priority so they never preempt `victory-submit` on 6-core CPUs.
+        let mut priority = raised.then(crate::cores::Priority::new);
         let mut last_gen = 0u64;
         let mut state = self.state();
         loop {
@@ -272,7 +278,9 @@ impl Pool {
             last_gen = epoch;
             drop(state);
 
-            priority.keep();
+            if let Some(p) = &mut priority {
+                p.keep();
+            }
             let mut panicked = false;
             loop {
                 if self.stop.load(Ordering::Relaxed) {
@@ -363,27 +371,36 @@ pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
 }
 
 /// [`Pool::each`] on threads kept for the title's bytes under flights' writes
-/// (`VICTORY_UNDER_THREADS`, 6 with this one).
+/// (`VICTORY_UNDER_THREADS`, scales with CPU cores: 4 on 6C/12T up to 6 on
+/// 18+ threads, preventing elevated-priority oversubscription of `victory-submit`).
 pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6usize);
-        Pool::new("victory-under", threads.clamp(1, 16))
+        let default = std::thread::available_parallelism().map_or(4, |n| (n.get() / 3).clamp(2, 6));
+        let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
+        Pool::with_priority("victory-under", threads.clamp(1, 16), true)
     })
     .each(count, f);
 }
 
 /// Calls `f` with every number below `count`, on this thread and on threads
-/// kept for making descriptors (`VICTORY_VIEW_THREADS`, 4 with this one, 6 for records; 1:
-/// on this one alone). Those for `records`, the heaps' records copied as
-/// bytes, are others than those for the views picked by index: submissions
-/// wait for the first, lists for the second, and each kept the other waiting.
+/// kept for making descriptors (`VICTORY_VIEW_THREADS`, scales with CPU cores:
+/// 4 for records / 3 for views on 6C/12T; 1: on this one alone). Those for
+/// `records`, the heaps' records copied as bytes, are others than those for
+/// the views picked by index: submissions wait for the first (elevated
+/// priority), lists for the second (normal priority so they do not preempt
+/// `victory-submit`).
 pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOLS: [OnceLock<&'static Pool>; 2] = [const { OnceLock::new() }; 2];
     POOLS[usize::from(records)]
         .get_or_init(|| {
-            let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(if records { 6usize } else { 4 });
-            Pool::new(if records { "victory-records" } else { "victory-views" }, threads.clamp(1, 16))
+            let default = if records {
+                std::thread::available_parallelism().map_or(4, |n| (n.get() / 3).clamp(2, 6))
+            } else {
+                std::thread::available_parallelism().map_or(3, |n| (n.get() / 4).clamp(2, 3))
+            };
+            let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
+            Pool::with_priority(if records { "victory-records" } else { "victory-views" }, threads.clamp(1, 16), records)
         })
         .each(count, f);
 }
@@ -401,16 +418,15 @@ pub(crate) fn ordered(pieces: &[Piece]) -> Vec<(usize, usize, usize)> {
     let mut order: Vec<usize> = (0..pieces.len()).collect();
     order.sort_by_key(|&i| pieces[i].1 / BLOCK);
     let mut out: Vec<(usize, usize, usize)> = Vec::with_capacity(order.len());
-    for group in order.chunk_by(|&a, &b| pieces[a].1 / BLOCK == pieces[b].1 / BLOCK) {
+    for group in order.chunk_by_mut(|&a, &b| pieces[a].1 / BLOCK == pieces[b].1 / BLOCK) {
         let alone = group.len() > 1 && group.iter().all(|&i| pieces[i].0 == pieces[group[0]].0);
         if !alone {
             out.extend(group.iter().map(|&i| (i, pieces[i].1, pieces[i].2)));
             continue;
         }
-        let mut sorted = group.to_vec();
-        sorted.sort_by_key(|&i| pieces[i].1);
+        group.sort_unstable_by_key(|&i| pieces[i].1);
         let begun = out.len();
-        for i in sorted {
+        for &i in group.iter() {
             let (_, at, len) = pieces[i];
             match out[begun..].last_mut() {
                 Some(last) if at <= last.1 + last.2 => {
@@ -509,7 +525,9 @@ fn anytime() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_ANYTIME").is_none_or(|v| v != "0"))
 }
 
-/// What a job wrote beside the guards, to be noted ([`Notes::flush`]).
+/// What a job wrote beside the guards, to be noted ([`Notes::flush`]),
+/// together with per-job batched piece statistics so landing threads do not
+/// contend on global atomic counters once per piece.
 #[derive(Default)]
 pub(crate) struct Notes {
     /// Pages of 4 KiB, by number.
@@ -519,10 +537,66 @@ pub(crate) struct Notes {
     /// Per piece put beside the guards, all of it: its 64 KiB block and the
     /// copy it was landed through (which the job holds until the flush).
     landed: Vec<(usize, *const crate::shadow::Shadow)>,
+    pieces: u64,
+    beside: u64,
+    direct: u64,
+    new_pieces: u64,
+    stat_pages: u64,
+    new_pages: u64,
+    new_blocks: u64,
+    dwords: u64,
+    missing: u64,
+    put_pieces: u64,
+    put_bytes: u64,
 }
 
 // SAFETY: the pointers are used by the job that has the notes, in `flush`.
 unsafe impl Send for Notes {}
+
+impl Notes {
+    fn flush_stats(&mut self) {
+        if self.pieces == 0 {
+            return;
+        }
+        count(stat::PIECES, std::mem::take(&mut self.pieces));
+        if self.beside != 0 {
+            count(stat::BESIDE, std::mem::take(&mut self.beside));
+        }
+        if self.direct != 0 {
+            count(stat::DIRECT, std::mem::take(&mut self.direct));
+        }
+        if self.new_pieces != 0 {
+            count(stat::NEW_PIECES, std::mem::take(&mut self.new_pieces));
+        }
+        if self.stat_pages != 0 {
+            count(stat::PAGES, std::mem::take(&mut self.stat_pages));
+        }
+        if self.new_pages != 0 {
+            count(stat::NEW_PAGES, std::mem::take(&mut self.new_pages));
+        }
+        if self.new_blocks != 0 {
+            count(stat::NEW_BLOCKS, std::mem::take(&mut self.new_blocks));
+        }
+        if self.dwords != 0 {
+            count(stat::DWORDS, std::mem::take(&mut self.dwords));
+        }
+        if self.missing != 0 {
+            count(stat::MISSING, std::mem::take(&mut self.missing));
+        }
+        if self.put_pieces != 0 {
+            crate::shadow::PUT[0].fetch_add(std::mem::take(&mut self.put_pieces), Ordering::Relaxed);
+        }
+        if self.put_bytes != 0 {
+            crate::shadow::PUT[2].fetch_add(std::mem::take(&mut self.put_bytes), Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for Notes {
+    fn drop(&mut self) {
+        self.flush_stats();
+    }
+}
 
 /// Whether a copy a landing went through is noted as up to date with it
 /// (`VICTORY_LAND_TAKEN=0`: it is not, and the next refresh copies the 64
@@ -552,6 +626,7 @@ static TAKEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 impl Notes {
     /// At the end of a job: what it wrote beside the guards is noted.
     pub(crate) fn flush(&mut self) {
+        self.flush_stats();
         if self.pages.is_empty() {
             return;
         }
@@ -623,8 +698,12 @@ unsafe fn piece_at(
     // ([`anytime`]), or the title's own address.
     let reading = beside.then(crate::watch::title_memory_reading_now).flatten();
     let beside = if reading.is_some() || beside && anytime() { crate::inplace::beside(title, end) } else { None };
-    count(stat::PIECES, 1);
-    count(if beside.is_some() { stat::BESIDE } else { stat::DIRECT }, 1);
+    notes.pieces += 1;
+    if beside.is_some() {
+        notes.beside += 1;
+    } else {
+        notes.direct += 1;
+    }
     // The pages that differ, before any is written: none, and the guard
     // stays; else it is opened once for the piece.
     let mut differing = [true; BLOCK / PAGE + 1];
@@ -639,7 +718,7 @@ unsafe fn piece_at(
             }
         });
         let Some(first) = differing.iter().position(|&d| d) else {
-            for_pages(title, parts, |_, _| count(stat::PAGES, 1));
+            for_pages(title, parts, |_, _| notes.stat_pages += 1);
             return 0;
         };
         let last = differing.iter().rposition(|&d| d).unwrap_or(first);
@@ -649,7 +728,7 @@ unsafe fn piece_at(
         spent(stat::NOTES, opening);
     }
     let into = beside.unwrap_or(title);
-    let since = crate::watch::changes();
+    let since = if beside.is_none() { crate::watch::changes() } else { 0 };
     let (mut pages, mut new_pages, mut blocks, mut dwords, mut missing) = (0, 0u64, 0, 0, 0);
     let mut span: Option<(usize, usize)> = None;
     for_pages(title, parts, |from, n| {
@@ -702,14 +781,14 @@ unsafe fn piece_at(
         let through = if missing == 0 { copy } else { std::ptr::null() };
         notes.landed.push((title / BLOCK, through));
     }
-    count(stat::NEW_PIECES, u64::from(new_pages > 0));
-    count(stat::PAGES, pages);
-    count(stat::NEW_PAGES, new_pages);
-    count(stat::NEW_BLOCKS, blocks);
-    count(stat::DWORDS, dwords);
-    count(stat::MISSING, missing);
-    crate::shadow::PUT[0].fetch_add(u64::from(dwords > 0), Ordering::Relaxed);
-    crate::shadow::PUT[2].fetch_add(dwords * 4, Ordering::Relaxed);
+    notes.new_pieces += u64::from(new_pages > 0);
+    notes.stat_pages += pages;
+    notes.new_pages += new_pages;
+    notes.new_blocks += blocks;
+    notes.dwords += dwords;
+    notes.missing += missing;
+    notes.put_pieces += u64::from(dwords > 0);
+    notes.put_bytes += dwords * 4;
     dwords * 4
 }
 

@@ -129,6 +129,31 @@ fn opposite(p: u8) -> u8 {
     }
 }
 
+/// The comparison with its operands swapped (`cmp(p, a, b) == cmp(swapped(p), b, a)`),
+/// exact for all float (0-15, including NaN/±0) and integer (32-41) predicates.
+fn swapped(p: u8) -> u8 {
+    match p {
+        0..=15 => (p & !6) | ((p & 2) << 1) | ((p & 4) >> 1),
+        pred::EQ => pred::EQ,
+        pred::NE => pred::NE,
+        pred::IUGT => pred::IULT,
+        pred::IULT => pred::IUGT,
+        pred::IUGE => pred::IULE,
+        pred::IULE => pred::IUGE,
+        pred::SGT => pred::SLT,
+        pred::SLT => pred::SGT,
+        pred::SGE => pred::SLE,
+        pred::SLE => pred::SGE,
+        other => other,
+    }
+}
+
+/// Canonical operand order for a comparison key (`a <= b`), so `x == y` /
+/// `y == x` and `x < y` / `y > x` share facts and CSE entries.
+fn canonical_cmp(p: u8, a: V, b: V) -> (u8, V, V) {
+    if b < a { (swapped(p), b, a) } else { (p, a, b) }
+}
+
 /// What holds in the block being walked: values that are a known bit there,
 /// and comparisons (by their operands) with a known outcome.
 #[derive(Default)]
@@ -382,12 +407,16 @@ impl Module {
                 };
                 self.learn(x, holds != (k != 0), facts, learned, depth - 1);
             }
-            // The opposite comparison of the same operands.
+            // The comparison itself and its opposite, in canonical operand order.
             Op::Cmp(p, a, b) => {
-                let key = (opposite(p), a, b);
-                if let std::collections::hash_map::Entry::Vacant(e) = facts.compares.entry(key) {
-                    e.insert(!holds);
-                    learned.compares.push(key);
+                for (key, val) in [
+                    (canonical_cmp(p, a, b), holds),
+                    (canonical_cmp(opposite(p), a, b), !holds),
+                ] {
+                    if let std::collections::hash_map::Entry::Vacant(e) = facts.compares.entry(key) {
+                        e.insert(val);
+                        learned.compares.push(key);
+                    }
                 }
             }
             _ => {}
@@ -493,10 +522,51 @@ impl Module {
         self.int_const(ty, signed(bits, x & mask(bits)))
     }
 
+    /// Negates an `i1` value `b` in-place at instruction `i`: if `b` is a
+    /// comparison, flips its predicate (no extra `xor`); otherwise writes
+    /// `xor(b, true)`.
+    fn negate_bool_in_place(&mut self, i: u32, b: V, changed: &mut bool) {
+        if let V::Inst(ci) = b
+            && let Op::Cmp(p, u, v) = self.insts[ci as usize].op
+        {
+            self.insts[i as usize].op = Op::Cmp(opposite(p), u, v);
+            *changed = true;
+            return;
+        }
+        let one = self.bool(true);
+        self.insts[i as usize].op = Op::Bin(Bin::Xor, b, one);
+        *changed = true;
+    }
+
+    /// Reinterprets a value `v` to type `ty` without emitting new instructions
+    /// if `v` is already `Bitcast(orig)` of type `ty` or a 32-bit constant.
+    fn unwrap_bitcast(&mut self, v: V, ty: Ty) -> Option<V> {
+        match v {
+            V::Inst(j) => match self.insts[j as usize].op {
+                Op::Cast(Cast::Bitcast, orig) if self.type_of(orig) == ty => Some(orig),
+                _ => None,
+            },
+            V::Const(c) => {
+                let from = self.consts[c as usize].0;
+                let to_float = matches!(self.types[ty.0 as usize], TypeDef::Float);
+                match self.consts[c as usize].1 {
+                    Const::Int(bits) if to_float && self.int_bits(from) == Some(32) => {
+                        Some(self.f32(bits as u32))
+                    }
+                    Const::Float(bits) if self.int_bits(ty) == Some(32) => {
+                        Some(self.int_const(ty, i64::from(bits as i32)))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// The value instruction `i` is known to have without it, if any: a
     /// constant or an earlier value. May instead give `i` simpler operands
     /// (`changed` says so).
-    fn simplify(&mut self, i: u32, changed: &mut bool) -> Option<V> {
+    fn simplify(&mut self, i: u32, uses: &[u32], changed: &mut bool) -> Option<V> {
         let ty = self.insts[i as usize].ty;
         match self.insts[i as usize].op {
             Op::Bin(op, a, b) => {
@@ -525,24 +595,184 @@ impl Module {
                     };
                     return Some(self.k(ty, bits, r));
                 }
+                if a == b {
+                    match op {
+                        Bin::And | Bin::Or => return Some(a),
+                        Bin::Sub | Bin::Xor => return Some(self.k(ty, bits, 0)),
+                        _ => {}
+                    }
+                }
                 match (op, ka, kb) {
                     (
                         Bin::Add | Bin::Sub | Bin::Or | Bin::Xor | Bin::Shl | Bin::LShr | Bin::AShr,
                         _,
                         Some(0),
-                    ) => Some(a),
-                    (Bin::Add | Bin::Or | Bin::Xor, Some(0), _) => Some(b),
-                    (Bin::Mul | Bin::UDiv, _, Some(1)) => Some(a),
-                    (Bin::Mul, Some(1), _) => Some(b),
-                    (Bin::Mul | Bin::And, _, Some(0)) => Some(b),
-                    (Bin::Mul | Bin::And, Some(0), _) => Some(a),
-                    (Bin::And, _, Some(m)) if m == all => Some(a),
-                    (Bin::And, Some(m), _) if m == all => Some(b),
-                    (Bin::Or, _, Some(m)) if m == all => Some(b),
-                    (Bin::Or, Some(m), _) if m == all => Some(a),
-                    (Bin::And | Bin::Or, _, _) if a == b => Some(a),
-                    _ => None,
+                    ) => return Some(a),
+                    (Bin::Add | Bin::Or | Bin::Xor, Some(0), _) => return Some(b),
+                    (Bin::Mul | Bin::UDiv, _, Some(1)) => return Some(a),
+                    (Bin::Mul, Some(1), _) => return Some(b),
+                    (Bin::Mul | Bin::And, _, Some(0)) => return Some(b),
+                    (Bin::Mul | Bin::And, Some(0), _) => return Some(a),
+                    (Bin::And, _, Some(m)) if m == all => return Some(a),
+                    (Bin::And, Some(m), _) if m == all => return Some(b),
+                    (Bin::Or, _, Some(m)) if m == all => return Some(b),
+                    (Bin::Or, Some(m), _) if m == all => return Some(a),
+                    _ => {}
                 }
+                // Absorption: `x & (x | y) == x`, `x | (x & y) == x`.
+                if matches!(op, Bin::And | Bin::Or) {
+                    let dual = if op == Bin::And { Bin::Or } else { Bin::And };
+                    for (x, other) in [(a, b), (b, a)] {
+                        if let V::Inst(j) = other
+                            && let Op::Bin(op2, u, v) = self.insts[j as usize].op
+                            && op2 == dual
+                            && (u == x || v == x)
+                        {
+                            return Some(x);
+                        }
+                    }
+                }
+                // `xor(cmp(p, u, v), true)` -> `cmp(opposite(p), u, v)` on `i1`.
+                if op == Bin::Xor && bits == 1 {
+                    let inner = match (ka, kb) {
+                        (None, Some(1)) => Some(a),
+                        (Some(1), None) => Some(b),
+                        _ => None,
+                    };
+                    if let Some(V::Inst(ci)) = inner
+                        && let Op::Cmp(p, u, v) = self.insts[ci as usize].op
+                    {
+                        self.insts[i as usize].op = Op::Cmp(opposite(p), u, v);
+                        *changed = true;
+                        return None;
+                    }
+                }
+                // `and(zext(x: iN), mask)` where `mask` retains all low N bits -> `zext(x)`,
+                // and `and(select(c, 1, 0), 1)` -> `select(c, 1, 0)`.
+                if op == Bin::And {
+                    let pair = match (ka, kb) {
+                        (None, Some(m)) => Some((a, m)),
+                        (Some(m), None) => Some((b, m)),
+                        _ => None,
+                    };
+                    if let Some((V::Inst(j), m)) = pair {
+                        match self.insts[j as usize].op {
+                            Op::Cast(Cast::ZExt, x) => {
+                                if let Some(from_bits) = self.int_bits(self.type_of(x)) {
+                                    let low = mask(from_bits);
+                                    if m & low == low {
+                                        return Some(V::Inst(j));
+                                    }
+                                }
+                            }
+                            Op::Select(_, t, f) => {
+                                if let (Some((_, kt)), Some((_, kf))) = (self.int_k(t), self.int_k(f))
+                                    && (kt & m) == kt
+                                    && (kf & m) == kf
+                                {
+                                    return Some(V::Inst(j));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // Associative constant folding for chains of Add/Sub/And/Or/Xor/Shifts
+                // (e.g. `(y + c1) + c2 -> y + (c1 + c2)`, `(y ^ c1) ^ c2 -> y ^ (c1 ^ c2)`).
+                let rhs = match (op, ka, kb) {
+                    (Bin::Add | Bin::And | Bin::Or | Bin::Xor, None, Some(c2)) => Some((a, c2)),
+                    (Bin::Add | Bin::And | Bin::Or | Bin::Xor, Some(c2), None) => Some((b, c2)),
+                    (Bin::Sub | Bin::Shl | Bin::LShr | Bin::AShr, None, Some(c2)) => Some((a, c2)),
+                    _ => None,
+                };
+                if let Some((V::Inst(j), c2)) = rhs
+                    && let Op::Bin(op1, x, y) = self.insts[j as usize].op
+                {
+                    let inner_const = |m: &Module, op1: Bin, x: V, y: V| -> Option<(V, u64)> {
+                        match (op1, m.int_k(x).map(|k| k.1), m.int_k(y).map(|k| k.1)) {
+                            (Bin::Add | Bin::And | Bin::Or | Bin::Xor, None, Some(c1)) => Some((x, c1)),
+                            (Bin::Add | Bin::And | Bin::Or | Bin::Xor, Some(c1), None) => Some((y, c1)),
+                            (Bin::Sub | Bin::Shl | Bin::LShr | Bin::AShr, None, Some(c1)) => Some((x, c1)),
+                            _ => None,
+                        }
+                    };
+                    if let Some((base, c1)) = inner_const(self, op1, x, y) {
+                        match (op1, op) {
+                            (Bin::Add, Bin::Add) | (Bin::Sub, Bin::Sub) => {
+                                let c = c1.wrapping_add(c2) & all;
+                                if c == 0 {
+                                    return Some(base);
+                                }
+                                let k = self.k(ty, bits, c);
+                                self.insts[i as usize].op = Op::Bin(op, base, k);
+                                *changed = true;
+                                return None;
+                            }
+                            (Bin::Add, Bin::Sub) => {
+                                let c = c1.wrapping_sub(c2) & all;
+                                if c == 0 {
+                                    return Some(base);
+                                }
+                                let k = self.k(ty, bits, c);
+                                self.insts[i as usize].op = Op::Bin(Bin::Add, base, k);
+                                *changed = true;
+                                return None;
+                            }
+                            (Bin::Sub, Bin::Add) => {
+                                let c = c2.wrapping_sub(c1) & all;
+                                if c == 0 {
+                                    return Some(base);
+                                }
+                                let k = self.k(ty, bits, c);
+                                self.insts[i as usize].op = Op::Bin(Bin::Add, base, k);
+                                *changed = true;
+                                return None;
+                            }
+                            (Bin::And, Bin::And) => {
+                                let c = c1 & c2;
+                                if c == 0 {
+                                    return Some(self.k(ty, bits, 0));
+                                }
+                                let k = self.k(ty, bits, c);
+                                self.insts[i as usize].op = Op::Bin(Bin::And, base, k);
+                                *changed = true;
+                                return None;
+                            }
+                            (Bin::Or, Bin::Or) => {
+                                let c = (c1 | c2) & all;
+                                if c == all {
+                                    return Some(self.k(ty, bits, all));
+                                }
+                                let k = self.k(ty, bits, c);
+                                self.insts[i as usize].op = Op::Bin(Bin::Or, base, k);
+                                *changed = true;
+                                return None;
+                            }
+                            (Bin::Xor, Bin::Xor) => {
+                                let c = (c1 ^ c2) & all;
+                                if c == 0 {
+                                    return Some(base);
+                                }
+                                let k = self.k(ty, bits, c);
+                                self.insts[i as usize].op = Op::Bin(Bin::Xor, base, k);
+                                *changed = true;
+                                return None;
+                            }
+                            (Bin::Shl, Bin::Shl) | (Bin::LShr, Bin::LShr) | (Bin::AShr, Bin::AShr) => {
+                                if let Some(sum) = c1.checked_add(c2)
+                                    && sum < u64::from(bits)
+                                {
+                                    let k = self.k(ty, bits, sum);
+                                    self.insts[i as usize].op = Op::Bin(op, base, k);
+                                    *changed = true;
+                                    return None;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                None
             }
             Op::Cmp(p, a, b) if p <= pred::TRUE => {
                 // Two float constants compare one way (`v_mul_legacy` asks
@@ -566,11 +796,11 @@ impl Module {
                 };
                 Some(self.bool(holds))
             }
-            Op::Cmp(p, a, b) => {
+            Op::Cmp(mut p, mut a, mut b) => {
                 if !(pred::EQ..=pred::SLE).contains(&p) {
                     return None;
                 }
-                let holds = |x: u64, y: u64, bits: u32| {
+                let holds = |p: u8, x: u64, y: u64, bits: u32| {
                     let (sx, sy) = (signed(bits, x), signed(bits, y));
                     match p {
                         pred::EQ => x == y,
@@ -586,29 +816,90 @@ impl Module {
                     }
                 };
                 if let (Some((bits, x)), Some((_, y))) = (self.int_k(a), self.int_k(b)) {
-                    return Some(self.bool(holds(x, y, bits)));
+                    return Some(self.bool(holds(p, x, y, bits)));
                 }
                 if a == b {
-                    return Some(self.bool(holds(0, 0, 32)));
+                    return Some(self.bool(holds(p, 0, 0, 32)));
                 }
-                // A bit widened and tested again is the bit.
-                if p == pred::NE
-                    && self.int_k(b).is_some_and(|k| k.1 == 0)
+                // Canonicalize constant to the RHS so patterns match once.
+                if self.int_k(a).is_some() && self.int_k(b).is_none() {
+                    p = swapped(p);
+                    std::mem::swap(&mut a, &mut b);
+                    self.insts[i as usize].op = Op::Cmp(p, a, b);
+                    *changed = true;
+                }
+                if let Some((bits, k)) = self.int_k(b)
                     && let V::Inst(z) = a
-                    && let Op::Cast(Cast::ZExt, x) = self.insts[z as usize].op
-                    && self.type_of(x) == ty
                 {
-                    return Some(x);
+                    match self.insts[z as usize].op {
+                        // A boolean widened (zext/sext) and tested against a constant.
+                        Op::Cast(Cast::ZExt, x) if self.type_of(x) == ty => {
+                            let (ht, hf) = (holds(p, 1, k, bits), holds(p, 0, k, bits));
+                            return match (ht, hf) {
+                                (true, true) => Some(self.bool(true)),
+                                (false, false) => Some(self.bool(false)),
+                                (true, false) => Some(x),
+                                (false, true) => {
+                                    self.negate_bool_in_place(i, x, changed);
+                                    None
+                                }
+                            };
+                        }
+                        Op::Cast(Cast::SExt, x) if self.type_of(x) == ty => {
+                            let all = mask(bits);
+                            let (ht, hf) = (holds(p, all, k, bits), holds(p, 0, k, bits));
+                            return match (ht, hf) {
+                                (true, true) => Some(self.bool(true)),
+                                (false, false) => Some(self.bool(false)),
+                                (true, false) => Some(x),
+                                (false, true) => {
+                                    self.negate_bool_in_place(i, x, changed);
+                                    None
+                                }
+                            };
+                        }
+                        // `cmp(p, select(c, kt, kf), k)` collapses directly to `true`/`false`/`c`/`!c`.
+                        Op::Select(c, t, f) => {
+                            if let (Some((_, kt)), Some((_, kf))) = (self.int_k(t), self.int_k(f)) {
+                                let (ht, hf) = (holds(p, kt, k, bits), holds(p, kf, k, bits));
+                                return match (ht, hf) {
+                                    (true, true) => Some(self.bool(true)),
+                                    (false, false) => Some(self.bool(false)),
+                                    (true, false) => Some(c),
+                                    (false, true) => {
+                                        self.negate_bool_in_place(i, c, changed);
+                                        None
+                                    }
+                                };
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 None
             }
-            Op::Select(c, mut t, mut f) => {
-                if let Some((_, c)) = self.int_k(c) {
-                    return Some(if c != 0 { t } else { f });
+            Op::Select(mut c, mut t, mut f) => {
+                if let Some((_, cv)) = self.int_k(c) {
+                    return Some(if cv != 0 { t } else { f });
+                }
+                let mut inner = false;
+                // `select(!cond, t, f)` -> `select(cond, f, t)`.
+                if let V::Inst(ci) = c
+                    && let Op::Bin(Bin::Xor, u, v) = self.insts[ci as usize].op
+                {
+                    let flipped = match (self.int_k(u), self.int_k(v)) {
+                        (None, Some((1, 1))) => Some(u),
+                        (Some((1, 1)), None) => Some(v),
+                        _ => None,
+                    };
+                    if let Some(cond) = flipped {
+                        c = cond;
+                        std::mem::swap(&mut t, &mut f);
+                        inner = true;
+                    }
                 }
                 // Under the same condition an inner select is one of its
                 // operands (two guarded writes of one register in a row).
-                let mut inner = false;
                 while let V::Inst(x) = t
                     && let Op::Select(c2, t2, _) = self.insts[x as usize].op
                     && c2 == c
@@ -624,11 +915,37 @@ impl Module {
                 if t == f {
                     return Some(t);
                 }
-                if self.int_bits(ty) == Some(1)
-                    && self.int_k(t).is_some_and(|k| k.1 == 1)
-                    && self.int_k(f).is_some_and(|k| k.1 == 0)
-                {
-                    return Some(c);
+                if self.int_bits(ty) == Some(1) {
+                    let kt = self.int_k(t).map(|k| k.1);
+                    let kf = self.int_k(f).map(|k| k.1);
+                    match (kt, kf) {
+                        (Some(1), Some(0)) => return Some(c),
+                        (Some(0), Some(1)) => {
+                            self.negate_bool_in_place(i, c, changed);
+                            return None;
+                        }
+                        (Some(1), _) => {
+                            self.insts[i as usize].op = Op::Bin(Bin::Or, c, f);
+                            *changed = true;
+                            return None;
+                        }
+                        (_, Some(0)) => {
+                            self.insts[i as usize].op = Op::Bin(Bin::And, c, t);
+                            *changed = true;
+                            return None;
+                        }
+                        _ => {}
+                    }
+                    if t == c {
+                        self.insts[i as usize].op = Op::Bin(Bin::Or, c, f);
+                        *changed = true;
+                        return None;
+                    }
+                    if f == c {
+                        self.insts[i as usize].op = Op::Bin(Bin::And, c, t);
+                        *changed = true;
+                        return None;
+                    }
                 }
                 if inner {
                     self.insts[i as usize].op = Op::Select(c, t, f);
@@ -655,6 +972,18 @@ impl Module {
                             && self.type_of(z) == ty
                         {
                             return Some(z);
+                        }
+                        // Push bitcast through a single-use `select(c, bitcast(a), bitcast(b))`
+                        // -> `select(c, a, b)`, eliminating up to 3 redundant bitcasts on
+                        // guarded VGPR float writes.
+                        if let V::Inst(s) = x
+                            && uses.get(s as usize).copied().unwrap_or(2) == 1
+                            && let Op::Select(c, t, f) = self.insts[s as usize].op
+                            && let (Some(ut), Some(uf)) = (self.unwrap_bitcast(t, ty), self.unwrap_bitcast(f, ty))
+                        {
+                            self.insts[i as usize].op = Op::Select(c, ut, uf);
+                            *changed = true;
+                            return None;
                         }
                         let V::Const(c) = x else { return None };
                         let to_float = matches!(self.types[ty.0 as usize], TypeDef::Float);
@@ -740,7 +1069,10 @@ impl Module {
                 Key::Bin(*op as u8, a, b)
             }
             Op::Cast(op, v) => Key::Cast(*op as u8, inst.ty, *v),
-            Op::Cmp(p, a, b) => Key::Cmp(*p, *a, *b),
+            Op::Cmp(p, a, b) => {
+                let (p, a, b) = canonical_cmp(*p, *a, *b);
+                Key::Cmp(p, a, b)
+            }
             Op::Select(c, t, f) => Key::Select(*c, *t, *f),
             Op::Extract(a, n) => Key::Extract(*a, *n),
             // A size query stays where the lowering put it: AMD's D3D12
@@ -749,7 +1081,19 @@ impl Module {
             // serves the uses of another below it (29 of the title's
             // `CS_RaytracingResolve` programs; RDNA2 makes them either way).
             Op::Call(f, _) if self.funcs[*f as usize].name == "dx.op.getDimensions" => return None,
-            Op::Call(f, args) => Key::Call(*f, args.clone()),
+            Op::Call(f, args) => {
+                let mut key_args = args.clone();
+                if self.funcs[*f as usize].name == "dx.op.binary.i32"
+                    && key_args.len() == 3
+                    && self
+                        .int_k(key_args[0])
+                        .is_some_and(|(_, code)| matches!(code, 37..=40))
+                    && key_args[2] < key_args[1]
+                {
+                    key_args.swap(1, 2);
+                }
+                Key::Call(*f, key_args)
+            }
             Op::Gep(ty, p, idx) => Key::Gep(*ty, *p, idx.clone()),
             Op::Load(p) => Key::Load(*p),
             _ => return None,
@@ -764,6 +1108,20 @@ impl Module {
         }
         let effects = self.effects();
         let tree = self.dominator_tree();
+        let mut uses = vec![0u32; self.insts.len()];
+        for &b in &tree.order {
+            let blk = &self.blocks[b];
+            for &i in blk.phis.iter().chain(&blk.body) {
+                for_each_operand(&self.insts[i as usize].op, |v| {
+                    if let V::Inst(u) = v {
+                        uses[u as usize] = uses[u as usize].saturating_add(1);
+                    }
+                });
+            }
+            if let Some(Term::CondBr(V::Inst(u), ..)) = blk.term {
+                uses[u as usize] = uses[u as usize].saturating_add(1);
+            }
+        }
         let mut repl: Vec<Option<V>> = vec![None; self.insts.len()];
         let mut changed = false;
         // Joins of one value: until none is left (one gone can leave
@@ -887,14 +1245,14 @@ impl Module {
                     bit
                 });
                 if let Op::Cmp(p, x, y) = self.insts[i as usize].op
-                    && let Some(&holds) = facts.compares.get(&(p, x, y))
+                    && let Some(&holds) = facts.compares.get(&canonical_cmp(p, x, y))
                 {
                     repl[i as usize] = Some(if holds { yes } else { no });
                     changed = true;
                     continue;
                 }
                 if passes & FOLD != 0
-                    && let Some(v) = self.simplify(i, &mut changed)
+                    && let Some(v) = self.simplify(i, &uses, &mut changed)
                 {
                     repl[i as usize] = Some(v);
                     changed = true;
@@ -2253,5 +2611,56 @@ mod tests {
         }
         // The programs are of the wasteful kind: the passes find work.
         assert!(removed > 4000, "{removed} instructions removed");
+    }
+
+    #[test]
+    fn algebraic_cmp_select_and_bitcast_identities_fold() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let (i32t, f32t) = (m.int(32), m.float());
+        let (zero, one, four, eight) = (m.i32(0), m.i32(1), m.i32(4), m.i32(8));
+        let x = m.call(b, reads, vec![one, one]);
+        let y = m.call(b, reads, vec![four, four]);
+        // (x + 4) + 8 -> x + 12, then - 12 -> x.
+        let a = m.bin(b, Bin::Add, x, four);
+        let a = m.bin(b, Bin::Add, a, eight);
+        let k12 = m.i32(12);
+        let a = m.bin(b, Bin::Sub, a, k12);
+        // x - x == 0, x ^ x == 0.
+        let z1 = m.bin(b, Bin::Sub, x, x);
+        let z2 = m.bin(b, Bin::Xor, y, y);
+        // Absorption: x & (x | y) == x.
+        let xy = m.bin(b, Bin::Or, x, y);
+        let abs = m.bin(b, Bin::And, x, xy);
+        // select(c, 1, 0) != 0 -> c, and negated select flips branches.
+        let c = m.cmp(b, pred::IULT, x, y);
+        let flag = m.select(b, c, one, zero);
+        let test = m.cmp(b, pred::NE, flag, zero);
+        let yes = m.bool(true);
+        let not_test = m.bin(b, Bin::Xor, test, yes);
+        // Bitcast(Select(!c, bitcast(fx), bitcast(fy))) -> Select(c, fy, fx).
+        let fx = m.cast(b, Cast::Bitcast, x, f32t);
+        let fy = m.cast(b, Cast::Bitcast, y, f32t);
+        let bx = m.cast(b, Cast::Bitcast, fx, i32t);
+        let by = m.cast(b, Cast::Bitcast, fy, i32t);
+        let sel = m.select(b, not_test, bx, by);
+        let out_f = m.cast(b, Cast::Bitcast, sel, f32t);
+        let out_i = m.cast(b, Cast::Bitcast, out_f, i32t);
+        m.call(b, writes, vec![a, abs]);
+        m.call(b, writes, vec![z1, z2]);
+        m.call(b, writes, vec![out_i, x]);
+        m.terminate(b, Term::Ret);
+        m.optimise(ALL);
+        let st = stores(&m, b);
+        assert_eq!(st[0], [x, x]);
+        assert_eq!(st[1], [zero, zero]);
+        // Only the two reads, one compare, one select, and three stores remain.
+        assert_eq!(body(&m, b), 7);
+        m.write();
     }
 }

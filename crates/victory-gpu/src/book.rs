@@ -389,6 +389,9 @@ pub(crate) fn note(raw: usize, what: impl FnOnce() -> String) {
 
 /// A name for something made before.
 pub(crate) fn named(object: &ID3D12Object, what: impl FnOnce() -> String) {
+    if !on() {
+        return;
+    }
     let raw = object.as_raw() as usize;
     if with(|b| b.by_object.contains_key(&raw)) {
         let what = what();

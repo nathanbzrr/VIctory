@@ -40,6 +40,8 @@ pub(crate) struct Pending {
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
+    /// First 16 bytes of the BLAKE3 key (avoids hex-decoding in `known::note`).
+    key_bytes: [u8; 16],
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
@@ -55,14 +57,28 @@ unsafe impl Send for Pending {}
 // SAFETY: as above.
 unsafe impl Sync for Pending {}
 
+struct HashFmt<'a>(&'a mut blake3::Hasher);
+
+impl std::fmt::Write for HashFmt<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.update(s.as_bytes());
+        Ok(())
+    }
+}
+
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
-        let mut key = blake3::Hasher::new();
+        let mut hasher = blake3::Hasher::new();
         for s in &shaders {
-            key.update(s.stage.as_bytes());
-            key.update(s.hash.as_bytes());
+            hasher.update(s.stage.as_bytes());
+            hasher.update(s.hash.as_bytes());
         }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        if let Some(g) = &graphics {
+            g.write_description(&mut HashFmt(&mut hasher));
+        }
+        let digest = hasher.finalize();
+        let mut key_bytes = [0u8; 16];
+        key_bytes.copy_from_slice(&digest.as_bytes()[..16]);
         Pending {
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             compute: graphics.is_none() && !shaders.is_empty(),
@@ -71,13 +87,20 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
+            key: digest.to_hex()[..32].to_owned(),
+            key_bytes,
             used: AtomicBool::new(false),
         }
     }
 
-    pub(super) fn key(&self) -> &str {
-        &self.key
+    pub(super) fn key_bytes(&self) -> [u8; 16] {
+        self.key_bytes
+    }
+
+    /// Marks this pipeline as permanently unavailable without waking any worker.
+    pub(super) fn mark_failed(&self) {
+        self.queue_state.store(MAKING, Ordering::Relaxed);
+        let _ = self.made.set(None);
     }
 
     fn make(&self) {
@@ -98,9 +121,12 @@ impl Pending {
             };
             let _ = self.made.set(made);
         }
-        let (lock, done) = &DONE;
-        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-        done.notify_all();
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if WAITERS.load(Ordering::Relaxed) > 0 {
+            let (lock, done) = &DONE;
+            let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+            done.notify_all();
+        }
     }
 }
 
@@ -315,9 +341,10 @@ fn lost(slot: usize) {
     if p.was_slow.swap(false, Ordering::Relaxed) {
         let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         queue.slow_now = queue.slow_now.saturating_sub(1);
-        AVAILABLE.notify_all();
+        AVAILABLE_ANY.notify_one();
     }
-    {
+    std::sync::atomic::fence(Ordering::SeqCst);
+    if WAITERS.load(Ordering::Relaxed) > 0 {
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -361,6 +388,9 @@ pub(crate) fn hashes(p: &Pending) -> String {
 
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
+/// Number of threads currently waiting in [`wait`]; avoids taking `DONE`'s
+/// mutex when early-started pipelines finish with nobody waiting.
+static WAITERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
@@ -411,9 +441,17 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
-/// The host pipeline if it is made (or is made within the frame's budget);
+/// Resolution state of a pending host pipeline, so callers can populate a
+/// lock-free positive or negative cache once resolved.
+pub(crate) enum ReadyState<'a> {
+    Ready(&'a HostPipeline),
+    Failed,
+    Pending,
+}
+
+/// The host pipeline state if it is made (or is made within the frame's budget);
 /// queues it on first use.
-pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+pub(crate) fn ready_state(p: &Arc<Pending>) -> ReadyState<'_> {
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -423,7 +461,21 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
-    p.made.get()?.as_ref()
+    match p.made.get() {
+        Some(Some(hp)) => ReadyState::Ready(hp),
+        Some(None) => ReadyState::Failed,
+        None => ReadyState::Pending,
+    }
+}
+
+/// The host pipeline if it is made (or is made within the frame's budget);
+/// queues it on first use.
+#[cfg(test)]
+pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    match ready_state(p) {
+        ReadyState::Ready(hp) => Some(hp),
+        ReadyState::Failed | ReadyState::Pending => None,
+    }
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -493,6 +545,7 @@ fn wait(p: &Pending, frame: u64) {
     let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
     let started = Instant::now();
     let (lock, done) = &DONE;
+    WAITERS.fetch_add(1, Ordering::SeqCst);
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
         let rest = left.saturating_sub(started.elapsed());
@@ -502,6 +555,7 @@ fn wait(p: &Pending, frame: u64) {
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
+    WAITERS.fetch_sub(1, Ordering::AcqRel);
     let waited = started.elapsed().min(left);
     waiting.end();
     if screen && waited > Duration::from_millis(500) {
@@ -631,7 +685,11 @@ impl Queue {
 }
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
-static AVAILABLE: Condvar = Condvar::new();
+/// Separate condvars for general workers vs screen/compute-only workers so
+/// pushing a regular graphics pipeline never spuriously wakes `screens_only`
+/// workers, and each push wakes only one worker instead of a thundering herd.
+static AVAILABLE_ANY: Condvar = Condvar::new();
+static AVAILABLE_SCREEN: Condvar = Condvar::new();
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
@@ -645,14 +703,19 @@ fn start(p: &Arc<Pending>, priority: u8) {
         }
         return;
     }
+    let is_screen = priority == REQUESTED
+        && ((p.screen && !screen_budget().is_zero()) || (p.compute && !compute_budget().is_zero()));
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
-        // (One woken could be a worker that takes passes over the screen
-        // alone: it would leave the pipeline to nobody.)
-        AVAILABLE.notify_all();
+        if is_screen {
+            AVAILABLE_SCREEN.notify_one();
+            AVAILABLE_ANY.notify_one();
+        } else {
+            AVAILABLE_ANY.notify_one();
+        }
     }
 }
 
@@ -661,11 +724,12 @@ const SCREEN_WORKERS: usize = 2;
 
 fn next(screens_only: bool) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let cond = if screens_only { &AVAILABLE_SCREEN } else { &AVAILABLE_ANY };
     loop {
         if let Some(p) = queue.pop(screens_only, slow_limit()) {
             return p;
         }
-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        queue = cond.wait(queue).unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -731,7 +795,7 @@ fn spawn_worker(screens_only: bool) -> bool {
                 if p.was_slow.load(Ordering::Relaxed) {
                     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                     queue.slow_now -= 1;
-                    AVAILABLE.notify_all();
+                    AVAILABLE_ANY.notify_one();
                 }
                 if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                     drained();

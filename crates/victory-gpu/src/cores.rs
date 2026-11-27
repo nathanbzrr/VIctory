@@ -176,6 +176,13 @@ fn lane_core() -> bool {
 /// Threads that asked: a handle of each, and whether it is the submitting one.
 static ASKED: std::sync::Mutex<Vec<(usize, bool)>> = std::sync::Mutex::new(Vec::new());
 
+/// The system's processor sets of group 0, cached once (CPU topology does not
+/// change while the process runs).
+fn cached_cpu_sets() -> &'static [(u32, u8, u8)] {
+    static SETS: std::sync::OnceLock<Vec<(u32, u8, u8)>> = std::sync::OnceLock::new();
+    SETS.get_or_init(cpu_sets)
+}
+
 /// What the threads of the process, and those that asked, are told now
 /// ([`lane_core`], which may have changed).
 pub(crate) fn settle() {
@@ -183,9 +190,9 @@ pub(crate) fn settle() {
     if stage() == 0 {
         return;
     }
-    let sets = cpu_sets();
-    let fast = fast_of(&sets);
-    let one = one_core(&sets).filter(|_| lane_core());
+    let sets = cached_cpu_sets();
+    let fast = fast_of(sets);
+    let one = one_core(sets).filter(|_| lane_core());
     let others: &[u32] = one.as_ref().map_or(&[], |o| &o.1);
     let null = std::ptr::null::<u32>();
     // SAFETY: our own process and the system's own set ids (none: all).
@@ -210,7 +217,7 @@ pub(crate) fn settle() {
     tracing::info!(
         fast = fast.len(),
         of = sets.len(),
-        by_cache = fast_by_class(&sets).is_empty() && !fast.is_empty(),
+        by_cache = fast_by_class(sets).is_empty() && !fast.is_empty(),
         threads = ASKED.lock().unwrap_or_else(|e| e.into_inner()).len(),
         "our threads' processors (VICTORY_CACHE_CORES)"
     );
@@ -257,10 +264,10 @@ fn ask(what: &str, from: u32) {
     }
     static FAST: std::sync::OnceLock<(Vec<u32>, usize)> = std::sync::OnceLock::new();
     let (fast, of) = FAST.get_or_init(|| {
-        let sets = cpu_sets();
+        let sets = cached_cpu_sets();
         // (whether there can be fast sets at all: `VICTORY_CACHE_CORES` may
         // change while the title runs, and `settle` follows it)
-        (fast_sets(&sets, false), sets.len())
+        (fast_sets(sets, false), sets.len())
     });
     let lane_own = lane_core() && what == "victory-submit";
     // All alike (or nothing known): nothing to ask for unless `VICTORY_LANE_CORE=1`

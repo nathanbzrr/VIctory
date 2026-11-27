@@ -199,16 +199,25 @@ impl GraphicsState {
                 }
                 12 => {
                     let layout = at.add(8).cast::<D3D12_INPUT_LAYOUT_DESC>().read_unaligned();
-                    if layout.pInputElementDescs.is_null() {
+                    if layout.pInputElementDescs.is_null() || layout.NumElements == 0 {
+                        self.names.clear();
+                        self.inputs.clear();
                         return;
                     }
+                    let count = (layout.NumElements as usize).min(D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT as usize);
                     let elements = std::slice::from_raw_parts(
                         layout.pInputElementDescs,
-                        layout.NumElements as usize,
+                        count,
                     );
                     self.names = elements
                         .iter()
-                        .map(|e| CStr::from_ptr(e.SemanticName.0.cast()).to_owned())
+                        .map(|e| {
+                            if e.SemanticName.0.is_null() {
+                                CString::default()
+                            } else {
+                                CStr::from_ptr(e.SemanticName.0.cast()).to_owned()
+                            }
+                        })
                         .collect();
                     self.inputs = elements
                         .iter()
@@ -248,9 +257,31 @@ impl GraphicsState {
         }
     }
 
-    /// Everything the state holds, as text: part of a pipeline's name in
-    /// the library and of the key a title pipeline is started early by.
-    pub(crate) fn describe(&self) -> String {
+    /// Writes [`Self::describe`] into any [`std::fmt::Write`] sink without
+    /// allocating an outer `String` (used to hash 80,000+ startup pipelines
+    /// with byte-for-byte identical keys).
+    pub(super) fn write_description(&self, out: &mut impl std::fmt::Write) {
+        let bounds = if self.depth_bounds {
+            " depth-bounds"
+        } else {
+            ""
+        };
+        if self.inputs.is_empty() {
+            let _ = write!(
+                out,
+                "{:?} {} {:?} {:?}{bounds} [] {} {} {:?} {} {:?}",
+                self.blend,
+                self.sample_mask,
+                self.rasterizer,
+                self.depth,
+                self.strip_cut.0,
+                self.topology.0,
+                self.targets,
+                self.depth_format.0,
+                self.samples
+            );
+            return;
+        }
         let inputs: Vec<String> = self
             .inputs
             .iter()
@@ -262,12 +293,8 @@ impl GraphicsState {
                 )
             })
             .collect();
-        let bounds = if self.depth_bounds {
-            " depth-bounds"
-        } else {
-            ""
-        };
-        format!(
+        let _ = write!(
+            out,
             "{:?} {} {:?} {:?}{bounds} {inputs:?} {} {} {:?} {} {:?}",
             self.blend,
             self.sample_mask,
@@ -278,7 +305,15 @@ impl GraphicsState {
             self.targets,
             self.depth_format.0,
             self.samples
-        )
+        );
+    }
+
+    /// Everything the state holds, as text: part of a pipeline's name in
+    /// the library and of the key a title pipeline is started early by.
+    pub(crate) fn describe(&self) -> String {
+        let mut out = String::with_capacity(512);
+        self.write_description(&mut out);
+        out
     }
 
     fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
@@ -407,12 +442,36 @@ pub(crate) struct HostPipeline {
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
-fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
+pub(super) fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&reason) {
         seen.push(reason);
         tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
+    }
+    None
+}
+
+/// Checks at pipeline-creation time whether `shaders` + `g` can never produce
+/// a host pipeline (unsupported stages, missing vertex/mesh shader, or plain
+/// graphics description without graphics state), so we can populate the
+/// negative cache immediately without ever waking pipeline workers.
+pub(super) fn static_refusal(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<&'static str> {
+    let is_compute = matches!(shaders, [cs] if cs.stage == "compute");
+    if is_compute {
+        return None;
+    }
+    if shaders
+        .iter()
+        .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
+    {
+        return Some("only vertex, mesh, pixel and compute stages are translated");
+    }
+    if !shaders.iter().any(|s| matches!(s.stage, "vertex" | "mesh")) {
+        return Some("no vertex or mesh shader");
+    }
+    if g.is_none() {
+        return Some("graphics state not kept (plain description)");
     }
     None
 }

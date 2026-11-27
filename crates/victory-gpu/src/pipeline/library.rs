@@ -628,6 +628,7 @@ struct Later(HSTRING, ID3D12PipelineState);
 unsafe impl Send for Later {}
 
 static LATER: Mutex<Vec<Later>> = Mutex::new(Vec::new());
+static LATER_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Stores `item` under a read of `saving`, or, while a save holds it alone,
 /// puts it in `later` without waiting.
@@ -637,6 +638,7 @@ fn store_or_defer<T>(saving: &RwLock<()>, later: &Mutex<Vec<T>>, item: T, store:
         Err(TryLockError::Poisoned(e)) => e.into_inner(),
         Err(TryLockError::WouldBlock) => {
             later.lock().unwrap_or_else(|e| e.into_inner()).push(item);
+            LATER_PENDING.store(true, Ordering::Release);
             return;
         }
     };
@@ -660,6 +662,9 @@ fn drain<T, G>(later: &Mutex<Vec<T>>, locks: impl FnOnce() -> G, mut store: impl
 /// [`one_call`] then a read of `saving`, as [`pipeline`] does. A name
 /// stored meanwhile (made again by another thread) is refused, as there.
 fn store_later(library: &Library) {
+    if !LATER_PENDING.swap(false, Ordering::AcqRel) {
+        return;
+    }
     let locks = || {
         let all = one_call();
         let stores = library.saving.read();
@@ -696,13 +701,28 @@ fn save_seconds(value: Option<&str>) -> u64 {
 /// there for a save that holds the library.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    if !now {
+        if !USED_CHANGED.load(Ordering::Relaxed)
+            && library.added.load(Ordering::Relaxed) == 0
+            && !LATER_PENDING.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let last_ms = LAST_MS.load(Ordering::Relaxed);
+        let now_ms = crate::host::now_ms();
+        if last_ms != 0 && now_ms.saturating_sub(last_ms) < save_every().as_millis() as u64 {
+            return;
+        }
+    }
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < save_every()) {
             return;
         }
         *last = Some(std::time::Instant::now());
+        LAST_MS.store(crate::host::now_ms().max(1), Ordering::Relaxed);
     }
     let _saving = crate::timeline::span("pipeline: save the library and early list");
     store_later(library);
@@ -743,7 +763,7 @@ pub(crate) fn save(now: bool) {
     store_later(library);
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
-    let used: Vec<String> = used().iter().flatten().cloned().collect();
+    let used: Vec<String> = used_lock().read().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -759,7 +779,12 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
-    let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
+    let slow: Vec<String> = slow_lock()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(key, ms)| format!("{key} {ms}"))
+        .collect();
     let written = library_written
         .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
@@ -829,27 +854,25 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 const SLOW_FILE: &str = "slow-pipelines.txt";
 /// A pipeline that takes this long is one ([`slow`]).
 pub(crate) const SLOW_MS: u64 = 1000;
-static SLOW: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(None);
+static SLOW: OnceLock<RwLock<std::collections::HashMap<String, u64>>> = OnceLock::new();
 
-fn slow_ones() -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<String, u64>>> {
-    let mut slow = SLOW.lock().unwrap_or_else(|e| e.into_inner());
-    if slow.is_none() {
+fn slow_lock() -> &'static RwLock<std::collections::HashMap<String, u64>> {
+    SLOW.get_or_init(|| {
         let listed = DIR.get().and_then(|d| std::fs::read_to_string(d.join(SLOW_FILE)).ok()).unwrap_or_default();
-        *slow = Some(
+        RwLock::new(
             listed
                 .lines()
                 .filter_map(|l| l.split_once(' '))
                 .filter_map(|(key, ms)| Some((key.to_owned(), ms.parse().ok()?)))
                 .collect(),
-        );
-    }
-    slow
+        )
+    })
 }
 
 /// Whether making the title pipeline with `key` took [`SLOW_MS`] in this or
 /// an earlier run.
 pub(crate) fn slow(key: &str) -> bool {
-    slow_ones().as_ref().is_some_and(|s| s.contains_key(key))
+    slow_lock().read().unwrap_or_else(|e| e.into_inner()).contains_key(key)
 }
 
 /// The title pipeline with `key` took `ms` to make.
@@ -857,8 +880,12 @@ pub(crate) fn note_time(key: &str, ms: u64) {
     if ms < SLOW_MS {
         return;
     }
-    let mut slow = slow_ones();
-    let known = slow.get_or_insert_default().entry(key.to_owned()).or_insert(0);
+    let lock = slow_lock();
+    if lock.read().unwrap_or_else(|e| e.into_inner()).get(key).is_some_and(|&known| ms <= known) {
+        return;
+    }
+    let mut slow = lock.write().unwrap_or_else(|e| e.into_inner());
+    let known = slow.entry(key.to_owned()).or_insert(0);
     if ms > *known {
         *known = ms;
         // With the next save of the early list.
@@ -867,21 +894,19 @@ pub(crate) fn note_time(key: &str, ms: u64) {
 }
 
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
-static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static USED: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
-fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
-    let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
-    if used.is_none() {
+fn used_lock() -> &'static RwLock<HashSet<String>> {
+    USED.get_or_init(|| {
         let listed = DIR
             .get()
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
         let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
         tracing::info!(pipelines = set.len(), "title pipelines to start early");
-        *used = Some(set);
-    }
-    used
+        RwLock::new(set)
+    })
 }
 
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
@@ -894,13 +919,19 @@ pub(crate) fn wanted_early(key: &str) -> bool {
     if *ALL.get_or_init(|| std::env::var_os("VICTORY_EARLY_ALL").is_some_and(|v| v == "1")) {
         return true;
     }
-    used().as_ref().is_some_and(|s| s.contains(key))
+    used_lock().read().unwrap_or_else(|e| e.into_inner()).contains(key)
 }
 
 /// A draw or dispatch requested the title pipeline with `key`.
 pub(crate) fn note_used(key: &str) {
-    let mut used = used();
-    let set = used.get_or_insert_with(HashSet::new);
+    let lock = used_lock();
+    {
+        let set = lock.read().unwrap_or_else(|e| e.into_inner());
+        if set.len() >= EARLY_MAX || set.contains(key) {
+            return;
+        }
+    }
+    let mut set = lock.write().unwrap_or_else(|e| e.into_inner());
     if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }

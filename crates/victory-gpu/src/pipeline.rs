@@ -58,6 +58,8 @@ pub(crate) struct ComputeHead {
 /// same bytes.
 pub(crate) struct Shader {
     pub(crate) stage: &'static str,
+    /// Full BLAKE3 content hash (avoids re-hashing container bytes in `known` / `translate_linked`).
+    pub(crate) full_hash: [u8; 32],
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
@@ -115,6 +117,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             Arc::new(Shader {
                 stage,
+                full_hash: *full.as_bytes(),
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
@@ -209,6 +212,7 @@ impl Shader {
         let _ = cell.set(Some(translated));
         Arc::new(Shader {
             stage: source.stage,
+            full_hash: source.full_hash,
             hash: source.hash.clone(),
             container: source.container.clone(),
             ambient: source.ambient,
@@ -236,10 +240,7 @@ pub(crate) fn translate_linked(
     ps: Option<&Shader>,
 ) -> Option<(Arc<Shader>, Option<Arc<Shader>>)> {
     static LINKED: Mutex<Option<HashMap<LinkedKey, Option<LinkedPair>>>> = Mutex::new(None);
-    let key: LinkedKey = (
-        *blake3::hash(&ms.container).as_bytes(),
-        ps.map(|p| *blake3::hash(&p.container).as_bytes()),
-    );
+    let key: LinkedKey = (ms.full_hash, ps.map(|p| p.full_hash));
     if let Some(hit) = LINKED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -518,27 +519,40 @@ fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
     })
 }
 
+/// Sentinel value for [`Pipeline::cached_host`] indicating the pipeline
+/// permanently has no host pipeline (lock-free negative cache).
+#[cfg(windows)]
+const HOST_NEGATIVE: usize = 1;
+
 #[repr(C)]
 struct Pipeline {
     object: Object,
     packet: [u32; 8],
-    /// Each used stage's container.
-    shaders: Vec<Arc<Shader>>,
+    /// Fast lock-free host pipeline pointer cache on the first cache line:
+    /// `0` = pending, `1` = negative cache (permanently none), `> 1` = `*const host::HostPipeline`.
+    #[cfg(windows)]
+    cached_host: std::sync::atomic::AtomicUsize,
+    /// Precomputed at creation: matches `VICTORY_SKIP_PIPELINES`.
+    #[cfg(windows)]
+    skipped: bool,
+    /// One of the ray-tracing structure builder's ([`Builder`]).
+    #[cfg(windows)]
+    builder: bool,
     /// Whether a list has bound it yet (its shaders are logged then).
     bound: std::sync::atomic::AtomicBool,
+    /// Each used stage's container.
+    shaders: Vec<Arc<Shader>>,
     /// What its host pipeline is made from, and the host pipeline once made
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
-    /// One of the ray-tracing structure builder's ([`Builder`]).
-    #[cfg(windows)]
-    builder: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
 /// Stage names, in description order.
 const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geometry"];
 
+#[inline]
 fn pipeline<'a>(this: This) -> &'a Pipeline {
     // SAFETY: the title passes one of our pipelines.
     unsafe { &*this.cast::<Pipeline>() }
@@ -551,7 +565,9 @@ pub(crate) fn bound(this: This) {
         return;
     }
     let p = pipeline(this);
-    if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    if p.bound.load(std::sync::atomic::Ordering::Relaxed)
+        || p.bound.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
         return;
     }
     let frame = crate::frame::current();
@@ -563,12 +579,45 @@ pub(crate) fn bound(this: This) {
 /// The host pipeline of a title pipeline; `None` if one of its shaders does
 /// not translate, the host refuses it, or it is still being made (its first
 /// use starts that, see [`make`]).
+///
+/// Uses a lock-free inline positive + negative pointer cache on [`Pipeline`]
+/// so steady-state draws (~4,500/frame) and permanently dropped draws
+/// (~270/frame) resolve with a single atomic load and zero pointer chasing.
 #[cfg(windows)]
+#[inline]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    make::ready(&pipeline(this).host)
+    let p = pipeline(this);
+    let cached = p.cached_host.load(std::sync::atomic::Ordering::Acquire);
+    if cached > HOST_NEGATIVE {
+        // SAFETY: `p.host` (`Arc<make::Pending>`) owns the `OnceLock<Option<HostPipeline>>`
+        // for the entire lifetime of `Pipeline`, and its address is immutable once set.
+        return Some(unsafe { &*(cached as *const host::HostPipeline) });
+    }
+    if cached == HOST_NEGATIVE {
+        return None;
+    }
+    host_pipeline_slow(p)
+}
+
+#[cfg(windows)]
+#[cold]
+fn host_pipeline_slow(p: &Pipeline) -> Option<&host::HostPipeline> {
+    match make::ready_state(&p.host) {
+        make::ReadyState::Ready(hp) => {
+            p.cached_host
+                .store(std::ptr::from_ref(hp) as usize, std::sync::atomic::Ordering::Release);
+            Some(hp)
+        }
+        make::ReadyState::Failed => {
+            p.cached_host
+                .store(HOST_NEGATIVE, std::sync::atomic::Ordering::Release);
+            None
+        }
+        make::ReadyState::Pending => None,
+    }
 }
 
 /// Host pipelines queued and not made yet.
@@ -604,7 +653,7 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 }
 
 #[cfg(windows)]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
+fn skipped_shader_in(shaders: &[Arc<Shader>]) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
@@ -613,15 +662,24 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     if hashes.is_empty() {
         return None;
     }
-    p.shaders
+    shaders
         .iter()
         .find(|shader| hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skipped_shader(p: &Pipeline) -> Option<&str> {
+    if !p.skipped {
+        return None;
+    }
+    skipped_shader_in(&p.shaders)
+}
+
 #[cfg(windows)]
+#[inline]
 pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+    !this.is_null() && pipeline(this).skipped
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
@@ -679,11 +737,33 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
+    let skipped = skipped_shader_in(&shaders).is_some();
+    #[cfg(windows)]
+    let refused_reason = if skipped {
+        None
+    } else if shaders.is_empty() {
+        Some("no vertex or mesh shader")
+    } else {
+        host::static_refusal(&shaders, graphics.as_deref())
+    };
+    #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
-    known::note(host.key(), &shaders, host.graphics.as_deref());
+    known::note(host.key_bytes(), &shaders, host.graphics.as_deref());
     #[cfg(windows)]
-    make::early(&host);
+    let initial_cache = if skipped {
+        host.mark_failed();
+        HOST_NEGATIVE
+    } else if let Some(reason) = refused_reason {
+        if !shaders.is_empty() {
+            host::refuse(reason, &shaders);
+        }
+        host.mark_failed();
+        HOST_NEGATIVE
+    } else {
+        make::early(&host);
+        0
+    };
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
@@ -697,11 +777,15 @@ fn hand_out(
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
         #[cfg(windows)]
-        host,
+        cached_host: std::sync::atomic::AtomicUsize::new(initial_cache),
+        #[cfg(windows)]
+        skipped,
         #[cfg(windows)]
         builder,
-        shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
+        shaders,
+        #[cfg(windows)]
+        host,
     });
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
@@ -1020,6 +1104,52 @@ mod tests {
                 (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),
                 (1, 28)
             );
+            // Streamed key formatting matches `GraphicsState::describe()` byte-for-byte.
+            let mut streamed = String::new();
+            g.write_description(&mut streamed);
+            assert_eq!(streamed, g.describe());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn statically_refused_pipeline_populates_lock_free_negative_cache() {
+        let (vs, ps) = ([1u8, 2, 3], [4u8; 5]);
+        let none = || Bytecode {
+            code: std::ptr::null(),
+            size: 0,
+        };
+        let desc = GraphicsHead {
+            root: std::ptr::null(),
+            stages: [
+                Bytecode {
+                    code: vs.as_ptr(),
+                    size: vs.len(),
+                },
+                Bytecode {
+                    code: ps.as_ptr(),
+                    size: ps.len(),
+                },
+                none(),
+                none(),
+                none(),
+            ],
+        };
+        let mut p = std::ptr::null();
+        assert_eq!(
+            create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            S_OK
+        );
+        // Plain graphics pipelines (no GraphicsState) immediately populate the
+        // lock-free negative cache without waking workers.
+        assert_eq!(
+            pipeline(p)
+                .cached_host
+                .load(std::sync::atomic::Ordering::Acquire),
+            HOST_NEGATIVE
+        );
+        assert!(host_pipeline(p).is_none());
+        assert!(host_pipeline(std::ptr::null()).is_none());
+        assert!(!is_skipped(p));
     }
 }

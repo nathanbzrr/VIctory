@@ -93,38 +93,40 @@ fn book() -> Option<&'static Recorder> {
 }
 
 /// The title created a pipeline.
-pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) {
-    let Some(recorder) = book() else { return };
-    let mut id = [0u8; 16];
-    for (at, b) in id.iter_mut().enumerate() {
-        *b = key.get(2 * at..2 * at + 2).and_then(|x| u8::from_str_radix(x, 16).ok()).unwrap_or(0);
-    }
-    let mut book = recorder.book.lock().unwrap_or_else(|e| e.into_inner());
-    if shaders.is_empty() || !book.keys.insert(id) {
+pub(super) fn note(id: [u8; 16], shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) {
+    if shaders.is_empty() {
         return;
     }
-    let mut entry = id.to_vec();
-    entry.push(shaders.len() as u8);
-    for s in shaders {
-        let hash = *blake3::hash(&s.container).as_bytes();
-        let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u8;
-        entry.push(stage);
-        entry.extend(hash);
-        if book.shaders.insert(hash) {
-            let new = &mut book.new[0];
-            new.push(stage);
-            new.extend(hash);
-            new.extend((s.container.len() as u32).to_le_bytes());
-            new.extend(&s.container);
+    let Some(recorder) = book() else { return };
+    {
+        let mut book = recorder.book.lock().unwrap_or_else(|e| e.into_inner());
+        if !book.keys.insert(id) {
+            return;
         }
+        let mut entry = id.to_vec();
+        entry.push(shaders.len() as u8);
+        for s in shaders {
+            let hash = s.full_hash;
+            let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u8;
+            entry.push(stage);
+            entry.extend(hash);
+            if book.shaders.insert(hash) {
+                let new = &mut book.new[0];
+                new.push(stage);
+                new.extend(hash);
+                new.extend((s.container.len() as u32).to_le_bytes());
+                new.extend(&s.container);
+            }
+        }
+        entry.push(u8::from(graphics.is_some()));
+        if let Some(g) = graphics {
+            g.put(&mut entry);
+        }
+        book.new[1].extend((entry.len() as u32).to_le_bytes());
+        book.new[1].extend(entry);
+        book.added += 1;
     }
-    entry.push(u8::from(graphics.is_some()));
-    if let Some(g) = graphics {
-        g.put(&mut entry);
-    }
-    book.new[1].extend((entry.len() as u32).to_le_bytes());
-    book.new[1].extend(entry);
-    book.added += 1;
+    recorder.writer.notify_added();
 }
 
 /// Appends pipelines noted since the last successful write, if the book is active.

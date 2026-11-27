@@ -10918,13 +10918,18 @@ impl<'a> Lower<'a> {
                 r
             }
             "v_bfm_b32" => {
-                // ((1 << src0[4:0]) - 1) << src1[4:0]
+                // ((1 << src0[4:0]) - 1) << src1[4:0] = Bfi(src0, src1, -1, 0)
+                // Single DXIL quaternary Bfi (opcode 53) instead of 5 ALU ops.
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
-                let one = k(self, 1);
-                let (a, b) = (m31(self, a), m31(self, b));
-                let m = self.s.m.bin(c, Bin::Shl, one, a);
-                let m = self.s.m.bin(c, Bin::Sub, m, one);
-                self.s.m.bin(c, Bin::Shl, m, b)
+                let (ones, zero) = (k(self, u32::MAX), k(self, 0));
+                self.s.op(
+                    c,
+                    "quaternary.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    53,
+                    &[a, b, ones, zero],
+                )
             }
             "v_cvt_pk_u8_f32" => {
                 // src0 rounded to nearest even and saturated to a byte, into

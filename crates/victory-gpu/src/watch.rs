@@ -175,22 +175,34 @@ impl Notes {
     }
 
     /// The notes of pages `[first, last)` in page order, `each` of them
-    /// until it says no: whether it never did. A part at a time.
+    /// until it says no: whether it never did. A part at a time, without
+    /// heap allocation on the hot single- or multi-chunk path.
     fn each(&self, first: usize, last: usize, mut each: impl FnMut(usize, u64) -> bool) -> bool {
-        match pieces(first, last) {
-            Some(pieces) => pieces.into_iter().all(|(from, to)| {
-                let s = self.read(shard_of(from));
-                s.written.range(from..to).all(|(&p, &w)| each(p, w))
-            }),
-            None => {
-                let mut all: Vec<(usize, u64)> = Vec::new();
-                for shard in 0..SHARDS {
-                    all.extend(self.read(shard).written.range(first..last).map(|(&p, &w)| (p, w)));
-                }
-                all.sort_unstable();
-                all.into_iter().all(|(p, w)| each(p, w))
-            }
+        if first >= last {
+            return true;
         }
+        let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+        if a == b {
+            let s = self.read(a % SHARDS);
+            return s.written.range(first..last).all(|(&p, &w)| each(p, w));
+        }
+        if b - a < 4 * SHARDS {
+            for piece in a..=b {
+                let from = first.max(piece << SHARD_SHIFT);
+                let to = last.min((piece + 1) << SHARD_SHIFT);
+                let s = self.read(piece % SHARDS);
+                if !s.written.range(from..to).all(|(&p, &w)| each(p, w)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        let mut all: Vec<(usize, u64)> = Vec::new();
+        for shard in 0..SHARDS {
+            all.extend(self.read(shard).written.range(first..last).map(|(&p, &w)| (p, w)));
+        }
+        all.sort_unstable();
+        all.into_iter().all(|(p, w)| each(p, w))
     }
 
     /// The notes of pages `[first, last)` in page order. A part at a time.
@@ -207,34 +219,51 @@ impl Notes {
     /// (`write`) or reading. Taken in order: whoever waits for a part holds
     /// only lower ones, so no two holders wait for each other.
     fn hold(&self, shards: u64, write: bool) -> Held<'_> {
-        let mut held = Held { shards, read: Vec::new(), write: Vec::new() };
+        let count = shards.count_ones() as usize;
+        if count == 0 {
+            return Held::Empty;
+        }
+        if count == 1 {
+            let shard = shards.trailing_zeros() as usize;
+            return if write {
+                Held::OneWrite(shard, self.write(shard))
+            } else {
+                Held::OneRead(shard, self.read(shard))
+            };
+        }
+        let mut read = if write { Vec::new() } else { Vec::with_capacity(count) };
+        let mut write_guards = if write { Vec::with_capacity(count) } else { Vec::new() };
         let mut m = shards;
         while m != 0 {
             let shard = m.trailing_zeros() as usize;
             m &= m - 1;
-            let lock = &self.0[shard].0;
             if write {
-                let guard = match lock.try_write() {
-                    Ok(g) => g,
-                    Err(_) => {
-                        let began = std::time::Instant::now();
-                        let g = lock.write().unwrap_or_else(|e| e.into_inner());
-                        port7_waited(P7_PART_WAITS, began);
-                        g
-                    }
-                };
-                held.write.push(guard);
+                write_guards.push(self.write(shard));
             } else {
-                held.read.push(self.read(shard));
+                read.push(self.read(shard));
             }
         }
-        held
+        Held::Many { shards, read, write: write_guards }
+    }
+
+    fn write(&self, shard: usize) -> std::sync::RwLockWriteGuard<'_, Shard> {
+        let lock = &self.0[shard].0;
+        match lock.try_write() {
+            Ok(g) => g,
+            Err(_) => {
+                let began = std::time::Instant::now();
+                let g = lock.write().unwrap_or_else(|e| e.into_inner());
+                port7_waited(P7_PART_WAITS, began);
+                g
+            }
+        }
     }
 }
 
 /// The pieces of pages `[first, last)` in page order, each in one part;
 /// `None` for a range of more pieces than is worth walking (then each part
 /// is looked at once).
+#[cfg(test)]
 fn pieces(first: usize, last: usize) -> Option<Vec<(usize, usize)>> {
     if first >= last {
         return Some(Vec::new());
@@ -246,50 +275,92 @@ fn pieces(first: usize, last: usize) -> Option<Vec<(usize, usize)>> {
     Some((a..=b).map(|piece| (first.max(piece << SHARD_SHIFT), last.min((piece + 1) << SHARD_SHIFT))).collect())
 }
 
-/// Parts of [`Notes`] held ([`Notes::hold`]).
-struct Held<'a> {
-    shards: u64,
-    read: Vec<std::sync::RwLockReadGuard<'a, Shard>>,
-    write: Vec<std::sync::RwLockWriteGuard<'a, Shard>>,
+/// Parts of [`Notes`] held ([`Notes::hold`]): inline for the common
+/// single-shard case so hot refreshes avoid heap allocations.
+enum Held<'a> {
+    Empty,
+    OneRead(usize, std::sync::RwLockReadGuard<'a, Shard>),
+    OneWrite(usize, std::sync::RwLockWriteGuard<'a, Shard>),
+    Many {
+        shards: u64,
+        read: Vec<std::sync::RwLockReadGuard<'a, Shard>>,
+        write: Vec<std::sync::RwLockWriteGuard<'a, Shard>>,
+    },
 }
 
 impl Held<'_> {
     /// The place among those held of the part of `page`.
-    fn place(&self, page: usize) -> usize {
+    fn place(shards: u64, page: usize) -> usize {
         let shard = shard_of(page);
-        assert!(self.shards >> shard & 1 != 0, "page {page:#x}: its part is not held");
-        (self.shards & ((1u64 << shard) - 1)).count_ones() as usize
+        assert!(shards >> shard & 1 != 0, "page {page:#x}: its part is not held");
+        (shards & ((1u64 << shard) - 1)).count_ones() as usize
     }
 
     fn shard(&self, page: usize) -> &Shard {
-        let at = self.place(page);
-        if self.write.is_empty() { &self.read[at] } else { &self.write[at] }
+        match self {
+            Held::OneRead(s, g) => {
+                assert_eq!(*s, shard_of(page), "page {page:#x}: its part is not held");
+                g
+            }
+            Held::OneWrite(s, g) => {
+                assert_eq!(*s, shard_of(page), "page {page:#x}: its part is not held");
+                g
+            }
+            Held::Many { shards, read, write } => {
+                let at = Self::place(*shards, page);
+                if write.is_empty() { &read[at] } else { &write[at] }
+            }
+            Held::Empty => panic!("page {page:#x}: its part is not held"),
+        }
     }
 
     /// See [`Shard::note`]; held for writing.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
-        let at = self.place(page);
-        self.write[at].note(page, parts, now)
+        match self {
+            Held::OneWrite(s, g) => {
+                assert_eq!(*s, shard_of(page), "page {page:#x}: its part is not held");
+                g.note(page, parts, now)
+            }
+            Held::Many { shards, write, .. } => {
+                let at = Self::place(*shards, page);
+                write[at].note(page, parts, now)
+            }
+            _ => panic!("page {page:#x}: its part is not held for writing"),
+        }
     }
 
     /// The notes of pages `[first, last)` in page order; their parts held.
     fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
-        match pieces(first, last) {
-            Some(pieces) => pieces
-                .into_iter()
-                .flat_map(|(from, to)| self.shard(from).written.range(from..to).map(|(&p, &w)| (p, w)))
-                .collect(),
-            None => {
-                let all = if self.write.is_empty() {
-                    self.read.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)).collect::<Vec<_>>()
-                } else {
-                    self.write.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)).collect::<Vec<_>>()
-                };
-                let mut all = all;
-                all.sort_unstable();
-                all
-            }
+        if first >= last {
+            return Vec::new();
         }
+        let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+        if a == b {
+            return self.shard(first).written.range(first..last).map(|(&p, &w)| (p, w)).collect();
+        }
+        if b - a < 4 * SHARDS {
+            let mut out = Vec::new();
+            for piece in a..=b {
+                let from = first.max(piece << SHARD_SHIFT);
+                let to = last.min((piece + 1) << SHARD_SHIFT);
+                out.extend(self.shard(from).written.range(from..to).map(|(&p, &w)| (p, w)));
+            }
+            return out;
+        }
+        let mut all = match self {
+            Held::Many { read, write, .. } => {
+                if write.is_empty() {
+                    read.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)).collect::<Vec<_>>()
+                } else {
+                    write.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)).collect::<Vec<_>>()
+                }
+            }
+            Held::OneRead(_, s) => s.written.range(first..last).map(|(&p, &w)| (p, w)).collect(),
+            Held::OneWrite(_, s) => s.written.range(first..last).map(|(&p, &w)| (p, w)).collect(),
+            Held::Empty => Vec::new(),
+        };
+        all.sort_unstable();
+        all
     }
 }
 
@@ -1375,7 +1446,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // now on. (The range is still held: no other asking of any of it came
     // between.)
     if guards_asked && light() {
-        publish(&pages.iter().map(|p| p.0).collect::<Vec<_>>());
+        publish_iter(pages.iter().map(|p| p.0));
     }
     Some(answer)
 }
@@ -1559,13 +1630,41 @@ thread_local! {
 /// ([`Claims`]).
 static BUSY: Bits = Bits::new();
 
-/// Claims of blocks ([`BUSY`]), let go when dropped.
-struct Claims(Vec<usize>);
+/// Claims of blocks ([`BUSY`]), let go when dropped. Uses an inline slot for
+/// single-block claims so faults, `publish`, and 1-block guards avoid heap
+/// allocations without ever re-assigning `self` (which would trigger `Drop`).
+struct Claims {
+    first: Option<usize>,
+    rest: Vec<usize>,
+}
 
 impl Claims {
+    /// Claims a single block without heap allocation.
+    fn wait_one(block: usize) -> Claims {
+        let mut tries = 0u32;
+        let mut spun = 0u64;
+        while !BUSY.try_set(block) {
+            tries += 1;
+            spun += 1;
+            if tries < 64 {
+                std::hint::spin_loop();
+            } else {
+                // Another thread's `VirtualProtect` of the block.
+                std::thread::yield_now();
+            }
+        }
+        if spun != 0 {
+            port6_count(P6_CLAIM_SPINS, spun);
+        }
+        Claims { first: Some(block), rest: Vec::new() }
+    }
+
     /// The claims of `blocks` (in order, each once), waited for one after
     /// the other: who waits holds only claims of lower blocks.
     fn wait_for(blocks: &[usize]) -> Claims {
+        if let &[block] = blocks {
+            return Self::wait_one(block);
+        }
         debug_assert!(blocks.windows(2).all(|w| w[0] < w[1]));
         let mut spun = 0u64;
         for &block in blocks {
@@ -1584,14 +1683,18 @@ impl Claims {
         if spun != 0 {
             port6_count(P6_CLAIM_SPINS, spun);
         }
-        Claims(blocks.to_vec())
+        Claims { first: None, rest: blocks.to_vec() }
     }
 
     /// The claim of `block` if it is free; nothing waited for.
     fn try_one(&mut self, block: usize) -> bool {
         let got = BUSY.try_set(block);
         if got {
-            self.0.push(block);
+            if self.first.is_none() && self.rest.is_empty() {
+                self.first = Some(block);
+            } else {
+                self.rest.push(block);
+            }
         } else {
             port6_count(P6_CLAIMS_MISSED, 1);
         }
@@ -1599,17 +1702,20 @@ impl Claims {
     }
 
     fn none() -> Claims {
-        Claims(Vec::new())
+        Claims { first: None, rest: Vec::new() }
     }
 
     fn holds(&self, block: usize) -> bool {
-        self.0.contains(&block)
+        self.first == Some(block) || self.rest.contains(&block)
     }
 }
 
 impl Drop for Claims {
     fn drop(&mut self) {
-        for &block in &self.0 {
+        if let Some(block) = self.first {
+            BUSY.clear(block);
+        }
+        for &block in &self.rest {
             BUSY.clear(block);
         }
     }
@@ -1975,9 +2081,12 @@ fn open_faulted(at: usize) -> (usize, std::time::Duration) {
     let g = guards_shared();
     let waited = began.elapsed();
     port6_count(P6_FAULT_WAIT_NS, waited.as_nanos() as u64);
-    let mut views: Vec<usize> = vec![block];
+    let mut views: Option<Vec<usize>> = None;
     loop {
-        let _claims = Claims::wait_for(&views);
+        let _claims = match &views {
+            None => Claims::wait_one(block),
+            Some(v) => Claims::wait_for(v),
+        };
         if !g.protected.contains(block) {
             return (0, waited);
         }
@@ -1989,9 +2098,13 @@ fn open_faulted(at: usize) -> (usize, std::time::Duration) {
             now.push(block);
             now.sort_unstable();
             now.dedup();
-            if now.iter().any(|b| views.binary_search(b).is_err()) {
+            let missing = match &views {
+                None => now.iter().any(|&b| b != block),
+                Some(v) => now.iter().any(|b| v.binary_search(b).is_err()),
+            };
+            if missing {
                 // Their claims too, in order: again.
-                views = now;
+                views = Some(now);
                 continue;
             }
             Some(now)
@@ -2008,13 +2121,13 @@ fn open_faulted(at: usize) -> (usize, std::time::Duration) {
 }
 
 /// An asking made blocks of `pages` clean and noted them in the journal.
-fn publish(pages: &[usize]) {
+fn publish_iter(pages: impl IntoIterator<Item = usize>) {
     if port_guard() {
         // A block's claim while its bit is set: a fault opening it meanwhile
         // clears the bit after this sets it, never before.
         let g = guards_shared();
-        for &page in pages {
-            let _claim = Claims::wait_for(&[page]);
+        for page in pages {
+            let _claim = Claims::wait_one(page);
             if g.clean.contains(page) || g.held.contains(page) {
                 PUBLISHED.set(page);
                 if BESIDE.any(page, page + 1) {
@@ -2024,8 +2137,8 @@ fn publish(pages: &[usize]) {
         }
         return;
     }
-    let g = guards();
-    for &page in pages {
+    let g = guards_shared();
+    for page in pages {
         if g.clean.contains(page) || g.held.contains(page) {
             PUBLISHED.set(page);
             // (Put there since: whoever did clears the bit after this is
@@ -2035,6 +2148,11 @@ fn publish(pages: &[usize]) {
             }
         }
     }
+}
+
+#[allow(dead_code)]
+fn publish(pages: &[usize]) {
+    publish_iter(pages.iter().copied());
 }
 
 /// Whether placeholders are known for what they are (`VICTORY_KNOWN_HOLES=0`:
@@ -2120,7 +2238,7 @@ pub(crate) fn look_at_holes() {
     }
     static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let blocks: Vec<usize> = {
-        let g = guards();
+        let g = guards_shared();
         let from = FROM.load(std::sync::atomic::Ordering::Relaxed);
         let part: Vec<usize> = g.held.range(from..).take(g.held.len() / PARTS + 1).collect();
         FROM.store(part.last().map_or(0, |b| b + 1), std::sync::atomic::Ordering::Relaxed);
@@ -2701,7 +2819,7 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
     if len == 0 {
         return false;
     }
-    let g = guards();
+    let g = guards_shared();
     (at / BLOCK..=(at + len - 1) / BLOCK)
         .all(|b| !g.clean.contains(b) && !g.absent.contains(b) && !g.protected.contains(b))
 }
@@ -3579,9 +3697,16 @@ pub(crate) fn change_over() {
         return;
     }
     let started = std::time::Instant::now();
+    let mut tries = 0u32;
     while changes() == now && started.elapsed().as_millis() < 2 {
-        for _ in 0..50 {
+        tries += 1;
+        if tries <= 16 {
             std::hint::spin_loop();
+        } else if tries <= 64 {
+            std::thread::yield_now();
+        } else {
+            // SAFETY: yields remainder of timeslice instead of burning a core.
+            unsafe { windows_sys::Win32::System::Threading::Sleep(1) };
         }
     }
 }
@@ -3596,7 +3721,7 @@ fn change_done() -> u64 {
             return now;
         }
         tries += 1;
-        if tries < 100 {
+        if tries < 16 {
             std::hint::spin_loop();
             continue;
         }
@@ -3604,7 +3729,7 @@ fn change_done() -> u64 {
             return now;
         }
         // SAFETY: gives the processor to another thread.
-        unsafe { windows_sys::Win32::System::Threading::Sleep(u32::from(tries > 200)) };
+        unsafe { windows_sys::Win32::System::Threading::Sleep(u32::from(tries > 48)) };
     }
 }
 
