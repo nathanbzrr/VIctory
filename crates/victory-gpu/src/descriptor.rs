@@ -893,6 +893,7 @@ pub(crate) fn with_view_heap<T>(f: impl FnOnce(&host::HostHeap) -> T) -> Option<
 /// `heap`, if that heap still exists, the constant buffer view of `size`
 /// bytes of `buffer` at `gpu`.
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn constant_slot(
     heap: usize,
     index: u32,
@@ -907,6 +908,36 @@ pub(crate) fn constant_slot(
     {
         host.constant_at(index, buffer, gpu, size);
     }
+}
+
+/// Runs `f` with a lookup closure under a single `SHADER_HEAPS` read lock,
+/// avoiding thousands of per-slot `RwLock` acquisitions during `card_steps`.
+#[cfg(windows)]
+pub(crate) fn constant_slots_batch(
+    buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    base_gpu: u64,
+    mut visit: impl FnMut(&mut dyn FnMut(usize, u32, u64, u32)),
+) {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut last_heap: (usize, Option<&host::HostHeap>) = (0, None);
+    let mut set_slot = |heap: usize, index: u32, offset: u64, size: u32| {
+        let host = if heap == last_heap.0 {
+            last_heap.1
+        } else {
+            let found = if heaps.iter().any(|&(_, _, h)| h == heap) {
+                // SAFETY: registered heaps are live while `SHADER_HEAPS` is locked.
+                unsafe { &*(heap as *const Heap) }.host.get().and_then(|h| h.as_ref())
+            } else {
+                None
+            };
+            last_heap = (heap, found);
+            found
+        };
+        if let Some(host) = host {
+            host.constant_at_known(index, buffer, base_gpu + offset, offset, size);
+        }
+    };
+    visit(&mut set_slot);
 }
 
 #[cfg(windows)]
@@ -1387,6 +1418,8 @@ static WAITING: std::sync::Mutex<std::collections::BTreeMap<usize, Vec<u64>>> =
 /// Textures given their host copy since [`make_waiting`] last ran.
 #[cfg(windows)]
 static MADE_LATE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+#[cfg(windows)]
+static HAS_MADE_LATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Title texture `resource` was given its host copy (called under that
 /// texture's own lock: nothing else is locked here).
@@ -1396,6 +1429,7 @@ pub(crate) fn texture_made(resource: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(resource);
+    HAS_MADE_LATE.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// The slot at `handle` was written with a view of texture `resource`,
@@ -1428,6 +1462,9 @@ fn wait_for(resource: usize, handle: u64) {
 /// the thread that submits: a slot is read when a list runs.
 #[cfg(windows)]
 pub(crate) fn make_waiting() {
+    if !HAS_MADE_LATE.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
     let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
     for resource in made {
         let handles = WAITING
@@ -1515,6 +1552,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 }
 
 /// The words of the record at `handle`, if they are a view's.
+#[allow(dead_code)]
 pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
     if handle == 0 {
         return None;
@@ -1522,6 +1560,11 @@ pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
     // SAFETY: the handle is a descriptor slot the title passes back.
     let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
     (words[0] == VIEW_TAG).then_some(words)
+}
+
+/// The view for pre-read record words `words`, if they are a valid view record.
+pub(crate) fn view_from_words(words: [u32; 3]) -> Option<View> {
+    (words[0] == VIEW_TAG).then(|| view_at(words[1], words[2])).flatten()
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -1548,6 +1591,11 @@ pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle:
     if let Some([lo, hi, size, _]) = words(desc) {
         let address = u64::from(lo) | u64::from(hi) << 32;
         record(handle, View::Constant(address, size));
+    } else if handle != 0 {
+        // Null CBV descriptor clears any previous record in this slot (#2449).
+        // SAFETY: the handle is a descriptor slot in a live title heap.
+        unsafe { (handle as *mut [u32; 3]).write_unaligned([0; 3]) };
+        mirror(handle);
     }
 }
 

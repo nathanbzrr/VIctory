@@ -162,6 +162,7 @@ pub(super) unsafe fn send(
     ranges: &[Range<'_>],
     mut record: impl FnMut(usize, &ID3D12Resource, u64),
 ) -> Option<Slot> {
+    let began = std::time::Instant::now();
     let total: u64 = ranges.iter().map(|r| r.3.next_multiple_of(256)).sum();
     if total == 0 || total > MOST {
         STATS[3].fetch_add(1, Relaxed);
@@ -203,9 +204,27 @@ pub(super) unsafe fn send(
             slot.allocator.Reset()?;
             slot.list.Reset(&slot.allocator, None)?;
             let mut at = 0u64;
-            for &(_, offset, cpu, bytes) in ranges {
-                slot.list.CopyBufferRegion(&bounce, at, cpu, offset, bytes);
+            let mut i = 0;
+            while i < ranges.len() {
+                let (_, offset, cpu, mut bytes) = ranges[i];
+                let start_at = at;
                 at += bytes.next_multiple_of(256);
+                // Coalesce immediately adjacent ranges on the same CPU buffer
+                // when the first range's length is already 256-byte aligned so
+                // `record()` offsets into `bounce` remain exact.
+                let cpu_raw = windows::core::Interface::as_raw(cpu);
+                while i + 1 < ranges.len()
+                    && bytes.is_multiple_of(256)
+                    && windows::core::Interface::as_raw(ranges[i + 1].2) == cpu_raw
+                    && ranges[i + 1].1 == offset + bytes
+                {
+                    i += 1;
+                    let next_bytes = ranges[i].3;
+                    bytes += next_bytes;
+                    at += next_bytes.next_multiple_of(256);
+                }
+                slot.list.CopyBufferRegion(&bounce, start_at, cpu, offset, bytes);
+                i += 1;
             }
             slot.list.Close()?;
             q.queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&slot.list)?)]);
@@ -221,22 +240,33 @@ pub(super) unsafe fn send(
         STATS[3].fetch_add(1, Relaxed);
         return None;
     }
+    let fence = q.fence.clone();
+    let sent = q.sent;
+    // Release `QUEUE` before waiting/recording on the drawing queue so the
+    // landing thread's `give_back` does not contend with submission recording.
+    drop(guard);
     // SAFETY: a fence of ours that the copy queue signals.
-    if let Err(e) = unsafe { drawing.Wait(&q.fence, q.sent) } {
+    if let Err(e) = unsafe { drawing.Wait(&fence, sent) } {
         // The drawing queue cannot be made to wait: wait here, so that
         // what follows still finds the bytes.
         tracing::warn!(error = %e, "the drawing queue could not wait for the up queue: waited on the CPU");
         // SAFETY: as above; a null event waits until the value is reached.
-        let _ = unsafe { q.fence.SetEventOnCompletion(q.sent, windows::Win32::Foundation::HANDLE::default()) };
+        let _ = unsafe { fence.SetEventOnCompletion(sent, windows::Win32::Foundation::HANDLE::default()) };
     }
     let mut at = 0u64;
+    let mut total_bytes = 0u64;
     for (i, r) in ranges.iter().enumerate() {
         record(i, &bounce, at);
+        total_bytes += r.3;
         at += r.3.next_multiple_of(256);
     }
     STATS[0].fetch_add(1, Relaxed);
-    STATS[1].fetch_add(ranges.iter().map(|r| r.3).sum::<u64>(), Relaxed);
+    STATS[1].fetch_add(total_bytes, Relaxed);
     STATS[2].fetch_add(ranges.len() as u64, Relaxed);
+    crate::port_cbv::TRACE_UPQ[0].fetch_add(1, Relaxed);
+    crate::port_cbv::TRACE_UPQ[1].fetch_add(total_bytes, Relaxed);
+    crate::port_cbv::TRACE_UPQ[2].fetch_add(ranges.len() as u64, Relaxed);
+    crate::port_cbv::TRACE_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     Some(slot)
 }
 

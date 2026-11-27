@@ -23,10 +23,102 @@ const ARENA: usize = 4 << 20;
 struct Arena {
     at: usize,
     free: usize,
-    /// Per block whether it is handed out.
-    taken: Vec<bool>,
+    /// Per block whether it is handed out (bitmask words, 64 blocks per word).
+    taken: Vec<u64>,
     /// Per block whether it has ever been handed out before (fresh VirtualAlloc2 pages are OS-zeroed).
-    used_before: Vec<bool>,
+    used_before: Vec<u64>,
+    blocks: usize,
+}
+
+impl Arena {
+    fn new(at: usize, blocks: usize) -> Self {
+        let words = blocks.div_ceil(64);
+        Self {
+            at,
+            free: blocks,
+            taken: vec![0; words],
+            used_before: vec![0; words],
+            blocks,
+        }
+    }
+
+    #[inline]
+    fn is_taken(&self, i: usize) -> bool {
+        (self.taken[i / 64] & (1u64 << (i % 64))) != 0
+    }
+
+    /// Finds the first run of `n` free blocks using O(1) bit ops for common 1-block or <=64-block arenas.
+    fn find_gap(&self, n: usize) -> Option<usize> {
+        if n == 1 {
+            for (w_idx, &word) in self.taken.iter().enumerate() {
+                if word != u64::MAX {
+                    let bit = (!word).trailing_zeros() as usize;
+                    let idx = w_idx * 64 + bit;
+                    return (idx < self.blocks).then_some(idx);
+                }
+            }
+            return None;
+        }
+        if self.blocks <= 64 && n <= 64 {
+            let valid = if self.blocks == 64 { u64::MAX } else { (1u64 << self.blocks) - 1 };
+            let mask = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+            let used = self.taken[0] | !valid;
+            let mut shift = 0;
+            while shift + n <= self.blocks {
+                let window = (used >> shift) & mask;
+                if window == 0 {
+                    return Some(shift);
+                }
+                // Advance past the highest set bit inside `window`.
+                let skip = (64 - window.leading_zeros()) as usize;
+                shift += skip;
+            }
+            return None;
+        }
+        let mut free = 0;
+        for i in 0..self.blocks {
+            free = if self.is_taken(i) { 0 } else { free + 1 };
+            if free == n {
+                return Some(i + 1 - n);
+            }
+        }
+        None
+    }
+
+    /// Marks `first..first + n` as taken and returns whether any block in that range was used before.
+    fn claim(&mut self, first: usize, n: usize) -> bool {
+        let mut needs_zero = false;
+        let end = first + n;
+        let mut i = first;
+        while i < end {
+            let w = i / 64;
+            let bit = i % 64;
+            let take = (64 - bit).min(end - i);
+            let mask = if take == 64 { u64::MAX } else { ((1u64 << take) - 1) << bit };
+            self.taken[w] |= mask;
+            if (self.used_before[w] & mask) != 0 {
+                needs_zero = true;
+            }
+            self.used_before[w] |= mask;
+            i += take;
+        }
+        self.free -= n;
+        needs_zero
+    }
+
+    fn release(&mut self, first: usize, n: usize) {
+        let end = (first + n).min(self.blocks);
+        let mut i = first;
+        while i < end {
+            let w = i / 64;
+            let bit = i % 64;
+            let drop_n = (64 - bit).min(end - i);
+            let mask = if drop_n == 64 { u64::MAX } else { ((1u64 << drop_n) - 1) << bit };
+            self.taken[w] &= !mask;
+            i += drop_n;
+        }
+        self.free += end.saturating_sub(first);
+    }
 }
 
 static ARENAS: Mutex<Vec<Arena>> = Mutex::new(Vec::new());
@@ -46,6 +138,7 @@ fn low() -> bool {
 }
 
 /// The first place of `n` free blocks side by side.
+#[cfg(test)]
 fn gap(taken: &[bool], n: usize) -> Option<usize> {
     let mut free = 0;
     for (i, &t) in taken.iter().enumerate() {
@@ -102,7 +195,7 @@ impl Upload {
                 .iter()
                 .enumerate()
                 .filter(|(_, arena)| arena.free >= n)
-                .find_map(|(a, arena)| Some((a, gap(&arena.taken, n)?)));
+                .find_map(|(a, arena)| Some((a, arena.find_gap(n)?)));
             let (a, first) = match found {
                 Some(place) => place,
                 None => {
@@ -110,20 +203,12 @@ impl Upload {
                     let at = reserve(blocks * BLOCK)?;
                     crate::shadow::register(at, at as u64, (blocks * BLOCK) as u64);
                     tracing::info!(at = format_args!("{at:#x}"), bytes = blocks * BLOCK, "memory for lists' uploads, where shaders reach it by address");
-                    arenas.push(Arena {
-                        at,
-                        free: blocks,
-                        taken: vec![false; blocks],
-                        used_before: vec![false; blocks],
-                    });
+                    arenas.push(Arena::new(at, blocks));
                     (arenas.len() - 1, 0)
                 }
             };
             let arena = &mut arenas[a];
-            arena.taken[first..first + n].fill(true);
-            arena.free -= n;
-            let needs_zero = arena.used_before[first..first + n].iter().any(|&u| u);
-            arena.used_before[first..first + n].fill(true);
+            let needs_zero = arena.claim(first, n);
             (a, arena.at + first * BLOCK, needs_zero)
         };
         if needs_zero {
@@ -148,8 +233,7 @@ impl Drop for Upload {
         let mut arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(arena) = arenas.get_mut(a) {
             let first = (at - arena.at) / BLOCK;
-            arena.taken[first..first + n].fill(false);
-            arena.free += n;
+            arena.release(first, n);
         }
     }
 }
@@ -158,9 +242,12 @@ impl Drop for Upload {
 /// [`BLOCK`]s).
 pub(crate) fn block(address: usize) -> Option<(usize, usize)> {
     let arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
-    let arena = arenas.iter().find(|a| (a.at..a.at + a.taken.len() * BLOCK).contains(&address))?;
+    let arena = arenas.iter().find(|a| (a.at..a.at + a.blocks * BLOCK).contains(&address))?;
     let first = (address - arena.at) / BLOCK;
-    let n = arena.taken[first..].iter().take_while(|t| **t).count();
+    let mut n = 0;
+    while first + n < arena.blocks && arena.is_taken(first + n) {
+        n += 1;
+    }
     (n > 0).then_some((arena.at + first * BLOCK, n * BLOCK))
 }
 
@@ -195,5 +282,18 @@ mod tests {
         assert_eq!(gap(&[true, false, true, false, false, true], 1), Some(1));
         assert_eq!(gap(&[true, false, true, false, false, true], 2), Some(3));
         assert_eq!(gap(&[true, false, true, false, false, true], 3), None);
+
+        let mut arena = Arena::new(0x1000_0000, 64);
+        assert!(!arena.claim(0, 1));
+        assert!(!arena.claim(2, 1));
+        assert!(!arena.claim(5, 59));
+        assert_eq!(arena.find_gap(1), Some(1));
+        assert_eq!(arena.find_gap(2), Some(3));
+        assert_eq!(arena.find_gap(3), None);
+        arena.release(2, 1);
+        assert_eq!(arena.find_gap(4), Some(1));
+        assert!(arena.claim(1, 4));
+        assert_eq!(arena.free, 0);
+        assert_eq!(arena.find_gap(1), None);
     }
 }

@@ -46,13 +46,90 @@ pub(crate) fn in_place_on() -> bool {
     on() && crate::toggled!("VICTORY_PORT_CBV_PLACE")
 }
 
+/// Shadow-direct CBV mode (`VICTORY_PORT_CBV_SHADOW`):
+/// - `0`: restrict direct raw-twin CBVs to `Shadow::in_place()` only (default if off).
+/// - `1`: allow all card-backed shadow buffers (`Shadow::carded()`).
+/// - `2`: allow card-backed shadow buffers that currently have no pending GPU writes
+///   (`!shadow.writes_pending()`), avoiding `merge_under_writes` / `settle_stale`
+///   stalls on write-contested heaps while still bypassing copies for read-only rings.
+pub(crate) fn shadow_mode() -> u8 {
+    if !in_place_on() {
+        return 0;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_PORT_CBV_SHADOW").ok().as_deref() {
+        Some("0") => 0,
+        Some("2") => 2,
+        Some("1") => 1,
+        // Default: safe mode (0 unless explicitly opted into shadow-direct, or 2 when enabled).
+        _ => 0,
+    })
+}
+
+/// Non-destructive snapshot of the 7 counters (for `VICTORY_SUBMIT_TRACE=1`).
+pub(crate) fn trace_snapshot() -> [u64; 7] {
+    std::array::from_fn(|i| STATS[i].load(Relaxed))
+}
+
+/// Monotonic diagnostic mirrors for `VICTORY_SUBMIT_TRACE=1` (keeps `host.rs` untouched).
+pub(crate) static TRACE_CARD_STEPS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+pub(crate) static TRACE_UPQ: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Microsecond timers for `VICTORY_SUBMIT_TRACE=1`: `[card_steps_us, upq_us, tables_us, bind_us]`.
+pub(crate) static TRACE_US: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Lock-free set of shadow IDs that any shader has ever declared GPU UAV writes
+/// to (e.g. the 174 MB skinning heap). Used by `shadow_mode() == 2` so direct
+/// shadow CBVs never push `Step::Refresh` onto write-contested heaps (avoiding
+/// `merge_under_writes` / `settle_stale` GPU stalls).
+static GPU_WRITTEN: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+
+#[inline]
+pub(crate) fn mark_gpu_written(shadow_id: u64) {
+    if shadow_id == 0 {
+        return;
+    }
+    for slot in &GPU_WRITTEN {
+        let cur = slot.load(Relaxed);
+        if cur == shadow_id {
+            return;
+        }
+        if cur == 0 {
+            if slot.compare_exchange(0, shadow_id, Relaxed, Relaxed).is_ok() {
+                return;
+            }
+            if slot.load(Relaxed) == shadow_id {
+                return;
+            }
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn is_gpu_written(shadow_id: u64) -> bool {
+    if shadow_id == 0 {
+        return false;
+    }
+    for slot in &GPU_WRITTEN {
+        let cur = slot.load(Relaxed);
+        if cur == 0 {
+            return false;
+        }
+        if cur == shadow_id {
+            return true;
+        }
+    }
+    // Table saturated: conservatively treat as potentially GPU-written.
+    true
+}
+
 /// Since the last line: tables' constant buffers given in place, their bytes;
-/// copied as before because not in place, because not on 16 bytes; title
-/// slots' constant buffers whose twin is a raw view.
-static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// copied as before because not in place/carded, because not on 16 bytes;
+/// title slots' constant buffers whose twin is a raw view; tables' constant
+/// buffers given directly from a card-backed shadow copy, their bytes.
+static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 thread_local! {
-    static LOCAL: std::cell::Cell<[u64; 6]> = const { std::cell::Cell::new([0; 6]) };
+    static LOCAL: std::cell::Cell<[u64; 8]> = const { std::cell::Cell::new([0; 8]) };
 }
 
 #[inline]
@@ -63,14 +140,14 @@ fn bump(i: usize, n: u64, j: Option<(usize, u64)>) {
         if let Some((k, m)) = j {
             v[k] += m;
         }
-        v[5] += 1;
-        if v[5] >= 256 {
-            for (dst, &src) in STATS.iter().zip(&v[..5]) {
+        v[7] += 1;
+        if v[7] >= 256 {
+            for (dst, &src) in STATS.iter().zip(&v[..7]) {
                 if src != 0 {
                     dst.fetch_add(src, Relaxed);
                 }
             }
-            v = [0; 6];
+            v = [0; 8];
         }
         c.set(v);
     });
@@ -81,8 +158,13 @@ pub(crate) fn in_place(size: u32) {
     bump(0, 1, Some((1, u64::from(size))));
 }
 
+/// A table's constant buffer of `size` bytes was read directly from a card-backed shadow copy.
+pub(crate) fn shadow_direct(size: u32) {
+    bump(5, 1, Some((6, u64::from(size))));
+}
+
 /// A table's constant buffer was copied as before: `aligned` false when it
-/// is in place but not on 16 bytes.
+/// is in place/carded but not on 16 bytes.
 pub(crate) fn copied(aligned: bool) {
     bump(if aligned { 2 } else { 3 }, 1, None);
 }
@@ -105,10 +187,12 @@ pub(crate) fn log(frames: f64) {
     }
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames.max(1e-9)).collect();
     tracing::info!(
-        "renderer port 5 (VICTORY_PORT_CBV=1) per frame: {:.0} tables' constant buffers read by the card in place ({:.1} KB not copied, \
-         no step at submission); copied as before: {:.0} not in place, {:.0} not on 16 bytes; {:.0} title slots' constant buffers with a raw twin",
+        "renderer port 5 (VICTORY_PORT_CBV=1) per frame: {:.0} in place ({:.1} KB) + {:.0} direct shadow ({:.1} KB not copied, \
+         no fill step); copied as before: {:.0} not in place/carded, {:.0} not on 16 bytes; {:.0} title slots' constant buffers with a raw twin",
         s[0],
         s[1] / 1024.0,
+        s[5],
+        s[6] / 1024.0,
         s[2],
         s[3],
         s[4],

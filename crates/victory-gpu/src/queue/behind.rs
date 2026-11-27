@@ -492,7 +492,13 @@ impl<W: Work> Lane<W> {
             let next = {
                 let mut state = self.lock();
                 let at = state.items.iter().position(|e| e.queue == entry.queue && e.number < limit);
-                at.and_then(|at| Some((at, state.items.remove(at)?)))
+                match at {
+                    // Presents can never be taken along with a submission: avoid
+                    // removing and re-inserting them in the deque.
+                    Some(at) if state.items[at].what.shows() => None,
+                    Some(at) => state.items.remove(at).map(|e| (at, e)),
+                    None => None,
+                }
             };
             let Some((at, next)) = next else {
                 break;
@@ -765,6 +771,8 @@ impl Work for Job {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a queue still stood at a wait at a present: it was not met"));
         }
+        let is_present = matches!(self, Job::Present(..));
+        let is_run = matches!(self, Job::Run(..) | Job::Joined(..));
         match self {
             // (A folded one is unfolded, never done.)
             Job::Wait(..) | Job::Value(..) | Job::Lists(..) => {}
@@ -817,7 +825,14 @@ impl Work for Job {
         }
         // (The mark was this submission's alone.)
         crate::port_journal::set_mark(0);
-        STATS[BUSY].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+        let us = began.elapsed().as_micros() as u64;
+        STATS[BUSY].fetch_add(us, Relaxed);
+        if is_run {
+            crate::port_cbv::TRACE_US[2].fetch_add(us, Relaxed);
+        } else if is_present {
+            crate::port_cbv::TRACE_US[3].fetch_add(us, Relaxed);
+            trace_present();
+        }
     }
 }
 
@@ -1062,6 +1077,102 @@ pub(super) fn present(
     let _waiting = crate::timeline::span("a present waits for the one before it to be sent");
     LANE.wait_presents(frames_most());
     STATS[AT_PRESENT].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+}
+
+/// Optional diagnostic telemetry emitted every 5 s from `Job::Present`
+/// (`VICTORY_SUBMIT_TRACE=1`, default off). Works even when the display is
+/// asleep/occluded (`DXGI_STATUS_OCCLUDED`) without altering `Meter` counters.
+fn trace_present() {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SUBMIT_TRACE").is_some_and(|v| v == "1")) {
+        return;
+    }
+    struct Prev {
+        at: Instant,
+        frames: u32,
+        busy: u64,
+        runs: u64,
+        joined: u64,
+        drawn: u64,
+        prep: [u64; 4],
+        card: [u64; 4],
+        upq: [u64; 4],
+        cbv: [u64; 7],
+        us: [u64; 4],
+        heap_us: u64,
+    }
+    static STATE: Mutex<Option<Prev>> = Mutex::new(None);
+    let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    let cur_prep = || std::array::from_fn(|i| crate::host::PREPARING[i].load(Relaxed));
+    let cur_card = || std::array::from_fn(|i| crate::port_cbv::TRACE_CARD_STEPS[i].load(Relaxed));
+    let cur_upq = || std::array::from_fn(|i| crate::port_cbv::TRACE_UPQ[i].load(Relaxed));
+    let cur_us = || std::array::from_fn(|i| crate::port_cbv::TRACE_US[i].load(Relaxed));
+    let prev = guard.get_or_insert_with(|| Prev {
+        at: now,
+        frames: 0,
+        busy: STATS[BUSY].load(Relaxed),
+        runs: STATS[RUNS].load(Relaxed),
+        joined: STATS[JOINED].load(Relaxed),
+        drawn: crate::draw::drawn(),
+        prep: cur_prep(),
+        card: cur_card(),
+        upq: cur_upq(),
+        cbv: crate::port_cbv::trace_snapshot(),
+        us: cur_us(),
+        heap_us: crate::draw::HEAP_BUFFER_MICROS.load(Relaxed),
+    });
+    prev.frames += 1;
+    let elapsed = now.duration_since(prev.at);
+    if elapsed < Duration::from_secs(5) {
+        return;
+    }
+    let f = f64::from(prev.frames).max(1.0);
+    let secs = elapsed.as_secs_f64();
+    let fps = f / secs;
+    let ms = secs * 1000.0 / f;
+    let busy = STATS[BUSY].load(Relaxed);
+    let runs = STATS[RUNS].load(Relaxed);
+    let joined = STATS[JOINED].load(Relaxed);
+    let drawn = crate::draw::drawn();
+    let prep = cur_prep();
+    let card = cur_card();
+    let upq = cur_upq();
+    let cbv = crate::port_cbv::trace_snapshot();
+    let us = cur_us();
+    let heap_us = crate::draw::HEAP_BUFFER_MICROS.load(Relaxed);
+    let d_busy = busy.saturating_sub(prev.busy) as f64 / 1000.0 / f;
+    let d_runs = runs.saturating_sub(prev.runs) as f64 / f;
+    let d_joined = joined.saturating_sub(prev.joined) as f64 / f;
+    let d_drawn = drawn.saturating_sub(prev.drawn) as f64 / f;
+    let copy_ms = prep[0].saturating_sub(prev.prep[0]) as f64 / 1000.0 / f;
+    let copy_mb = prep[1].saturating_sub(prev.prep[1]) as f64 / 1e6 / f;
+    let tex_ms = prep[2].saturating_sub(prev.prep[2]) as f64 / 1000.0 / f;
+    let tex_mb = prep[3].saturating_sub(prev.prep[3]) as f64 / 1e6 / f;
+    let card_fills = card[0].saturating_sub(prev.card[0]) as f64 / f;
+    let card_copies = card[1].saturating_sub(prev.card[1]) as f64 / f;
+    let card_kb = card[2].saturating_sub(prev.card[2]) as f64 / 1024.0 / f;
+    let card_ref = card[3].saturating_sub(prev.card[3]) as f64 / f;
+    let upq_subs = upq[0].saturating_sub(prev.upq[0]) as f64 / f;
+    let upq_mb = upq[1].saturating_sub(prev.upq[1]) as f64 / 1_048_576.0 / f;
+    let cbv_place = cbv[0].saturating_sub(prev.cbv[0]) as f64 / f;
+    let cbv_shadow = cbv[5].saturating_sub(prev.cbv[5]) as f64 / f;
+    let cbv_shadow_kb = cbv[6].saturating_sub(prev.cbv[6]) as f64 / 1024.0 / f;
+    let cbv_copy = cbv[2].saturating_sub(prev.cbv[2]) as f64 / f;
+    let cbv_align = cbv[3].saturating_sub(prev.cbv[3]) as f64 / f;
+    let card_ms = us[0].saturating_sub(prev.us[0]) as f64 / 1000.0 / f;
+    let upq_ms = us[1].saturating_sub(prev.us[1]) as f64 / 1000.0 / f;
+    let run_ms = us[2].saturating_sub(prev.us[2]) as f64 / 1000.0 / f;
+    let pres_ms = us[3].saturating_sub(prev.us[3]) as f64 / 1000.0 / f;
+    let d_heap_ms = heap_us.saturating_sub(prev.heap_us) as f64 / 1000.0 / f;
+    tracing::info!(
+        "SUBMIT_TRACE: {fps:.2} fps ({ms:.1} ms/f) | busy={d_busy:.1}ms(run={run_ms:.1} pres={pres_ms:.1} card={card_ms:.1} upq={upq_ms:.1}) \
+         runs={d_runs:.1} joined={d_joined:.1} draws={d_drawn:.0} | \
+         copies={copy_ms:.1}ms/{copy_mb:.1}MB tex={tex_ms:.1}ms/{tex_mb:.1}MB heap_buf={d_heap_ms:.1}ms | \
+         card_steps={card_fills:.0}f/{card_copies:.1}c/{card_kb:.0}KB/ref={card_ref:.2} | upq={upq_subs:.1}s/{upq_mb:.1}MB | \
+         port_cbv=place:{cbv_place:.0} shadow:{cbv_shadow:.0}({cbv_shadow_kb:.0}KB) copy:{cbv_copy:.0} unalign:{cbv_align:.0}"
+    );
+    *prev = Prev { at: now, frames: 0, busy, runs, joined, drawn, prep, card, upq, cbv, us, heap_us };
 }
 
 /// For the frame-rate line.

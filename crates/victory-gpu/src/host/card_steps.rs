@@ -523,15 +523,20 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
     Ok(shadow)
 }
 
-/// What the steps of `runs` do, and which step each is (its list by address,
-/// its place in it). `written`: what flights may write.
-fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
+/// What the steps of `runs` do, which step each is (its list by address, its
+/// place in it), and any `FillTo` captured while the list lock is already held
+/// (avoiding thousands of redundant mutex locks and linear searches in `take_steps`).
+fn does_of(
+    written: &[(usize, usize)],
+    runs: &[&HostList],
+) -> (Vec<Does>, Vec<(usize, usize)>, Vec<Option<FillTo>>) {
     let mut does = Vec::new();
-    // Which step each is. One list's lock at a time: a submission may
-    // name a list twice.
     let mut steps = Vec::new();
+    let mut targets = Vec::new();
     for list in runs {
+        let list_addr = std::ptr::from_ref::<HostList>(list) as usize;
         for (i, step) in list.deferred().copies.iter().enumerate() {
+            let mut fill_target = None;
             does.push(match step {
                 &Step::Copy(dst, src, len) => Does::Copy {
                     dst,
@@ -539,12 +544,15 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     len,
                     asked: copy_blocked(written, dst, src, len).is_some(),
                 },
-                Step::Fill(_, src, len, to) => Does::Fill {
-                    src: *src,
-                    len: *len,
-                    asked: read_blocked(written, *src, *len),
-                    to: to.is_some(),
-                },
+                Step::Fill(_, src, len, to) => {
+                    fill_target = to.clone();
+                    Does::Fill {
+                        src: *src,
+                        len: *len,
+                        asked: read_blocked(written, *src, *len),
+                        to: to.is_some(),
+                    }
+                }
                 Step::Texture(staging) => {
                     let (at, len) = staging.memory();
                     Does::Read {
@@ -563,10 +571,11 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                 Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
                 Step::GpuWrite(..) | Step::Host(..) => continue,
             });
-            steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
+            steps.push((list_addr, i));
+            targets.push(fill_target);
         }
     }
-    (does, steps)
+    (does, steps, targets)
 }
 
 /// With flights in the air: before which of `runs` the submission is cut so
@@ -584,7 +593,7 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     }
     let written = line().written.clone();
     blocked_by(&written, runs, false)?;
-    let (does, steps) = does_of(&written, runs);
+    let (does, steps, _) = does_of(&written, runs);
     let mut behind = None;
     if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
         return None;
@@ -595,35 +604,74 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     (place(reader)? >= cut).then_some(cut)
 }
 
-/// Whether every page of `[from, to)` can be read (through the kernel:
-/// asking Windows walks the page tables, milliseconds in the title's heap).
-/// `known`: pages that could be, of the same submission: its fills' places
-/// lie eight to a page, and each was read whole to find out.
-fn mapped(from: usize, to: usize, known: &mut HashMap<usize, ()>) -> bool {
+/// Per-submission cache of verified readable memory regions and pages, using a
+/// single `VirtualQuery` to verify whole committed spans (e.g. the 174 MB heap)
+/// instead of hundreds of per-page `ReadProcessMemory` syscalls.
+#[derive(Default)]
+struct MappedCache {
+    /// Verified committed readable regions `(start, end)`.
+    regions: Vec<(usize, usize)>,
+    /// Verified individual pages (fallback when a region is guarded or mixed).
+    pages: HashMap<usize, ()>,
+}
+
+/// Whether every page of `[from, to)` can be read.
+fn mapped(from: usize, to: usize, cache: &mut MappedCache) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+        VirtualQuery,
+    };
     const PAGE: usize = 4096;
-    (from / PAGE..to.div_ceil(PAGE)).all(|page| {
-        known.contains_key(&page) || {
-            let there = read_into((page * PAGE).max(from) as *const u8, &mut [0]);
-            if there {
-                known.insert(page, ());
-            }
-            there
+    const READABLE: u32 = PAGE_READONLY
+        | PAGE_READWRITE
+        | PAGE_WRITECOPY
+        | PAGE_EXECUTE_READ
+        | PAGE_EXECUTE_READWRITE
+        | PAGE_EXECUTE_WRITECOPY;
+    if cache.regions.iter().any(|&(lo, hi)| from >= lo && to <= hi) {
+        return true;
+    }
+    let mut cur = from;
+    while cur < to {
+        if let Some(&(_, hi)) = cache.regions.iter().find(|&&(lo, hi)| cur >= lo && cur < hi) {
+            cur = hi;
+            continue;
         }
-    })
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            VirtualQuery(
+                cur as *const core::ffi::c_void,
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        } != 0;
+        if ok && mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_GUARD) == 0 && (mbi.Protect & READABLE) != 0 {
+            let r_lo = mbi.BaseAddress as usize;
+            let r_hi = r_lo.saturating_add(mbi.RegionSize);
+            if r_hi > cur {
+                if cache.regions.len() < 64 {
+                    cache.regions.push((r_lo, r_hi));
+                }
+                cur = r_hi;
+                continue;
+            }
+        }
+        // Fallback: probe page-by-page via `read_into` (handles guarded pages).
+        let page = cur / PAGE;
+        if !cache.pages.contains_key(&page) {
+            if !read_into(cur as *const u8, &mut [0]) {
+                return false;
+            }
+            cache.pages.insert(page, ());
+        }
+        cur = (page + 1) * PAGE;
+    }
+    true
 }
 
 /// A table by addresses and numbers of ours.
 type HashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<AddressHash>>;
-
-/// Where the bytes of the fill that is `step` (its list by address, its place
-/// in it) go.
-fn fill_to(runs: &[&HostList], step: (usize, usize)) -> Option<FillTo> {
-    let list = runs.iter().find(|l| std::ptr::from_ref::<HostList>(l) as usize == step.0)?;
-    match list.deferred().copies.get(step.1)? {
-        Step::Fill(_, _, _, to) => to.clone(),
-        _ => None,
-    }
-}
 
 /// A step done on the card.
 struct Op {
@@ -659,8 +707,8 @@ fn record(
 ) {
     let common = D3D12_RESOURCE_STATE_COMMON;
     let (source, dest) = (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-    let mut sources: Vec<&ID3D12Resource> = Vec::new();
-    let mut dests: Vec<&ID3D12Resource> = Vec::new();
+    let mut sources: Vec<&ID3D12Resource> = Vec::with_capacity(reads.len().min(8));
+    let mut dests: Vec<&ID3D12Resource> = Vec::with_capacity(writes.len().min(8));
     for (all, list) in [(reads, &mut sources), (writes, &mut dests)] {
         for &(buffer, ..) in all {
             if !list.iter().any(|b| b.as_raw() == buffer.as_raw()) {
@@ -670,7 +718,8 @@ fn record(
     }
     let both = |b: &ID3D12Resource| dests.iter().any(|d| d.as_raw() == b.as_raw());
     let constants = source | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
-    let mut barriers = vec![transition(between, dest, constants)];
+    let mut barriers = Vec::with_capacity(1 + sources.len());
+    barriers.push(transition(between, dest, constants));
     barriers.extend(sources.iter().map(|b| transition(b, source, if both(b) { dest } else { common })));
     let done: Vec<D3D12_RESOURCE_BARRIER> = dests.iter().map(|b| transition(b, dest, common)).collect();
     // SAFETY: an open list; live buffers, and the callers' ranges lie in
@@ -717,7 +766,7 @@ unsafe impl Send for Own {}
 
 /// Those that have landed: closed, their steps dropped.
 static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
-const POOL_MOST: usize = 16;
+const POOL_MOST: usize = 24;
 
 pub(super) fn trim() {
     let dropped: Vec<Own> = {
@@ -733,11 +782,11 @@ pub(super) fn trim() {
 static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// What [`Host::card_steps`] took off a submission: the list that does it,
-/// for the submission to run first, and the steps the CPU leaves out (their
-/// list by address, their place in it).
+/// for the submission to run first, and per-list bitmasks of taken step
+/// indices (eliminates 5k+ `HashSet` inserts and 20k+ probes per frame).
 pub(super) struct Taken {
     own: Own,
-    steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    steps: Vec<(usize, Vec<u64>)>,
     copied: Vec<(Arc<Shadow>, usize, usize)>,
 }
 
@@ -747,8 +796,15 @@ impl Taken {
     }
 
     /// Whether step `i` of `list` is done by this.
+    #[inline]
     pub(super) fn takes(&self, list: &HostList, i: usize) -> bool {
-        self.steps.contains(&(std::ptr::from_ref(list) as usize, i))
+        let addr = std::ptr::from_ref(list) as usize;
+        for (a, bits) in &self.steps {
+            if *a == addr {
+                return bits.get(i >> 6).is_some_and(|w| (w & (1u64 << (i & 63))) != 0);
+            }
+        }
+        false
     }
 
     fn copied(&self) -> impl Iterator<Item = Writer> {
@@ -784,15 +840,20 @@ impl Host {
         if stage() == 0 || !relay_exact() {
             return None;
         }
-        let (written, copies) = {
+        let began = std::time::Instant::now();
+        let written = {
             let line = line();
             if line.written.is_empty() {
                 return None;
             }
-            (line.written.clone(), copies(&line))
+            line.written.clone()
         };
         let looked = crate::timeline::span("steps on the card: whether in the way");
         blocked_by(&written, runs, false)?;
+        let copies = {
+            let line = line();
+            copies(&line)
+        };
         let read = copied_read(&copies, runs);
         looked.end();
         let taken = if read {
@@ -800,10 +861,12 @@ impl Host {
         } else {
             self.take_steps(&written, runs)
         };
+        crate::port_cbv::TRACE_US[0].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
         match taken {
             Ok(taken) => taken,
             Err(why) => {
                 DONE[3].fetch_add(1, Ordering::Relaxed);
+                crate::port_cbv::TRACE_CARD_STEPS[3].fetch_add(1, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
                 refused(why);
                 let _ = why;
@@ -814,7 +877,7 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
-        let (does, steps) = does_of(written, runs);
+        let (does, steps, mut targets) = does_of(written, runs);
         let chosen = plan(&does, stage(), placed_order(), &mut None)?;
         if chosen.is_empty() {
             return Ok(None);
@@ -836,7 +899,7 @@ impl Host {
         // Some 2,800 fills a frame, of a few hundred places: what holds each
         // is looked for once, as long as no copy is added to the writers.
         let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
-        let mut room = HashMap::default();
+        let mut room = MappedCache::default();
         let mut end = 0u64;
         for &(i, level) in &chosen {
             let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
@@ -892,7 +955,7 @@ impl Host {
                     held.retain(|&(s, l), _| !meet((s, s + l), (dst, dst + len)));
                     To::Copy(to, dst)
                 }
-                _ => match fill_to(runs, steps[i]) {
+                _ => match targets[i].take() {
                     Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
                     Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
                     None => continue,
@@ -912,17 +975,17 @@ impl Host {
         for op in &ops {
             let len = op.len as u64;
             let from = &op.from.0;
-            let fits = |buffer: &ID3D12Resource, offset: u64| {
-                // SAFETY: ops retains the resource throughout this check.
-                let width = unsafe { buffer.GetDesc() }.Width;
-                offset.checked_add(len).is_some_and(|end| end <= width)
-            };
+            let fits_width = |width: u64, offset: u64| offset.checked_add(len).is_some_and(|end| end <= width);
             let valid_destination = match &op.to {
-                To::Copy(to, dst) => fits(&to.buffer, to.offset(*dst as u64)),
-                To::Buffer(buffer) => fits(buffer, 0),
+                To::Copy(to, dst) => fits_width(to.width(), to.offset(*dst as u64)),
+                To::Buffer(buffer) => {
+                    // SAFETY: ops retains the resource throughout this check.
+                    let width = unsafe { buffer.GetDesc() }.Width;
+                    fits_width(width, 0)
+                }
                 To::Slot(..) => true,
             };
-            if !valid_destination || !fits(&from.buffer, from.offset(op.from.1 as u64))
+            if !valid_destination || !fits_width(from.width(), from.offset(op.from.1 as u64))
                 || op.at.checked_add(len).is_none_or(|end| end > BETWEEN)
             {
                 static REJECTED: AtomicU64 = AtomicU64::new(0);
@@ -990,27 +1053,51 @@ impl Host {
         // (11,000 slots a frame in a street, two descriptors each: on
         // several threads, a slot always on the same one, in the steps'
         // order.)
-        let parts = if ops.len() < 256 { 1 } else { 8 };
+        let parts = if ops.len() < 256 { 1 } else { 4 };
         crate::land::each_under(parts, &|part| {
-            for op in &ops {
-                if let To::Slot(heap, index) = &op.to
-                    && *index as usize / 4 % parts == part
-                {
-                    // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+            crate::descriptor::constant_slots_batch(&own.between, gpu, |set_slot| {
+                for op in &ops {
+                    if let To::Slot(heap, index) = &op.to
+                        && *index as usize / 4 % parts == part
+                    {
+                        // (A heap that is gone: nothing can read the slot.)
+                        set_slot(*heap, *index, op.at, op.len as u32);
+                    }
                 }
-            }
+            });
         });
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
-        DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
+        let fills = (ops.len() - copies) as u64;
+        let bytes: u64 = ops.iter().map(|op| op.len as u64).sum();
+        DONE[0].fetch_add(fills, Ordering::Relaxed);
         DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
-        DONE[2].fetch_add(ops.iter().map(|op| op.len as u64).sum(), Ordering::Relaxed);
+        DONE[2].fetch_add(bytes, Ordering::Relaxed);
+        crate::port_cbv::TRACE_CARD_STEPS[0].fetch_add(fills, Ordering::Relaxed);
+        crate::port_cbv::TRACE_CARD_STEPS[1].fetch_add(copies as u64, Ordering::Relaxed);
+        crate::port_cbv::TRACE_CARD_STEPS[2].fetch_add(bytes, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         noted(&ops);
         spent.end();
+        let mut taken_steps: Vec<(usize, Vec<u64>)> = Vec::with_capacity(runs.len().min(16));
+        for &(i, _) in &chosen {
+            let (addr, idx) = steps[i];
+            let entry = if let Some(last) = taken_steps.last_mut().filter(|e| e.0 == addr) {
+                &mut last.1
+            } else if let Some(pos) = taken_steps.iter().position(|e| e.0 == addr) {
+                &mut taken_steps[pos].1
+            } else {
+                taken_steps.push((addr, Vec::new()));
+                &mut taken_steps.last_mut().unwrap().1
+            };
+            let w = idx >> 6;
+            if entry.len() <= w {
+                entry.resize(w + 1, 0);
+            }
+            entry[w] |= 1u64 << (idx & 63);
+        }
         Ok(Some(Taken {
             own,
-            steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
+            steps: taken_steps,
             copied,
         }))
     }
