@@ -137,27 +137,46 @@ fn next_pressure_physical(was: bool, physical: u64) -> bool {
     if was { physical < 2560 * MIB } else { physical <= 1536 * MIB }
 }
 
-fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
+fn next_pressure_for_host(was: bool, physical: u64, commit: u64, total_phys: u64) -> bool {
     if physical_only() {
         return next_pressure_physical(was, physical);
     }
-    if was {
+    // On <= 20 GiB RAM hosts (e.g. 16 GB DDR4), Windows normally keeps
+    // `ullAvailPhys` around 1.4-3.0 GiB during gameplay because of standby
+    // file cache and WDDM/file-backed working set. Using 32/64 GB thresholds
+    // (3->5 GiB phys / 4->6 GiB commit) latched `PRESSURED=true` permanently
+    // and triggered a 1 Hz wipe of every upload/send/prelude/scratch/snapshot
+    // pool (`send_allocs = 117 / 15s`, +10 ms/frame). Enter pressure at
+    // <= 768 MiB phys or <= 2 GiB commit, and clear at >= 1.25 GiB phys and
+    // >= 3 GiB commit.
+    if total_phys > 0 && total_phys <= 20 * GIB {
+        if was {
+            physical < 1280 * MIB || commit < 3072 * MIB
+        } else {
+            physical <= 768 * MIB || commit <= 2048 * MIB
+        }
+    } else if was {
         physical < 5 * GIB || commit < 6 * GIB
     } else {
         physical <= 3 * GIB || commit <= 4 * GIB
     }
 }
 
+#[cfg(test)]
+fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
+    next_pressure_for_host(was, physical, commit, 32 * GIB)
+}
+
 /// Returns pressure for the idle upload sweep. A failed sample keeps the last state.
 pub(crate) fn refresh() -> bool {
     let was = PRESSURED.load(Ordering::Relaxed);
     let Some(status) = memory_status() else { return was };
-    let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
+    let (physical, commit, total_phys) = (status.ullAvailPhys, status.ullAvailPageFile, status.ullTotalPhys);
     let limit_prefetch = on();
     if limit_prefetch {
         HEADROOM.store(physical.min(commit), Ordering::Relaxed);
     }
-    let pressure = next_pressure(was, physical, commit);
+    let pressure = next_pressure_for_host(was, physical, commit, total_phys);
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);
         if pressure {
@@ -213,6 +232,360 @@ pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited
     }
 }
 
+// ---------------------------------------------------------------------------
+// Dynamic DXGI Auto-VRAM Policy (8 / 12 / 16 / 24+ GB adapters)
+// ---------------------------------------------------------------------------
+
+/// Hardware VRAM class detected from DXGI (`DedicatedVideoMemory` and live
+/// `DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), or forced via `VICTORY_VRAM_MODE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VramTier {
+    Gb8,
+    Gb12,
+    Gb16,
+    Gb24,
+}
+
+impl VramTier {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            VramTier::Gb8 => "8GB",
+            VramTier::Gb12 => "12GB",
+            VramTier::Gb16 => "16GB",
+            VramTier::Gb24 => "24GB+",
+        }
+    }
+}
+
+/// Auto-scaled VRAM & shared-memory budgets derived from the host GPU's real
+/// DXGI video memory budget, host RAM size, and active console profile.
+/// Every field can still be overridden individually via its `VICTORY_*` env var.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VramPolicy {
+    pub(crate) tier: VramTier,
+    pub(crate) dedicated_bytes: u64,
+    pub(crate) local_budget_bytes: u64,
+    pub(crate) shared_budget_bytes: u64,
+    /// Texture-cache keep watermark (% of local VRAM budget).
+    pub(crate) texture_keep_percent: u64,
+    /// Texture-queue admission ceiling (% of local VRAM budget).
+    pub(crate) texture_room_percent: u64,
+    /// Render-target headroom reserved during world load (MiB).
+    pub(crate) targets_room_mb: u64,
+    /// Smallest title buffer promoted to local VRAM (KiB).
+    pub(crate) card_buffers_min_kb: u64,
+    /// Max aggregate title-buffer VRAM copies (MiB).
+    pub(crate) card_buffers_max_mb: u64,
+    /// Max aggregate loose-window VRAM copies (MiB; direct VRAM on Win10/11).
+    pub(crate) card_windows_mb: u64,
+    /// Max VRAM occupancy (%) for placing loose windows in VRAM.
+    pub(crate) card_windows_percent: u64,
+    /// Max Resizable BAR (`GPU_UPLOAD`) mapped window budget (MiB, Win11 WDDM 3.0+).
+    pub(crate) windows_bar_mb: u64,
+    /// Max VRAM occupancy (%) for BAR-mapped windows.
+    pub(crate) windows_bar_percent: u64,
+    /// Texture pool reclaim watermark (% of local VRAM budget).
+    pub(crate) pool_reclaim_percent: u64,
+    /// Empty 64 MiB texture blocks kept when `keep_freed` is enabled.
+    pub(crate) pool_spare_kept: usize,
+    /// Max `NON_LOCAL` texture staging ring cap (MiB; `u64::MAX` = uncapped).
+    pub(crate) staging_nonlocal_cap_mb: u64,
+    /// Max `NON_LOCAL` loose-window budget under RAM pressure (MiB).
+    pub(crate) window_budget_mb: u64,
+}
+
+/// Parses an optional env setting where unset, empty, or `"auto"` means
+/// "use the dynamic DXGI auto-scaled value", and a valid unsigned integer
+/// acts as an explicit manual override.
+pub(crate) fn parse_env_auto_u64(setting: Option<&str>) -> Option<u64> {
+    let trimmed = setting?.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    trimmed.parse::<u64>().ok()
+}
+
+/// Reads a `VICTORY_*` environment variable as a manual `u64` override,
+/// returning `None` when unset or set to `"auto"`.
+pub(crate) fn env_override_u64(name: &str) -> Option<u64> {
+    let val = std::env::var(name).ok();
+    parse_env_auto_u64(val.as_deref())
+}
+
+fn parse_vram_mode(setting: Option<&str>) -> Option<VramTier> {
+    let s = setting?.trim().to_ascii_lowercase();
+    match s.as_str() {
+        "" | "auto" => None,
+        "8" | "8g" | "8gb" => Some(VramTier::Gb8),
+        "12" | "12g" | "12gb" => Some(VramTier::Gb12),
+        "16" | "16g" | "16gb" => Some(VramTier::Gb16),
+        "24" | "24g" | "24gb" | "32" | "32gb" => Some(VramTier::Gb24),
+        _ => None,
+    }
+}
+
+/// Classifies the GPU into 8 / 12 / 16 / 24+ GB tiers from DXGI's
+/// `DedicatedVideoMemory` and live local `Budget`.
+///
+/// Uses live `budget_bytes` when available (since WDDM reserves ~5–10% for the
+/// OS/DWM, a 16 GB card reports ~14.5–15.5 GB budget, 12 GB reports ~10.8–11.6 GB,
+/// 8 GB reports ~7.0–7.6 GB, 24 GB reports ~22.5–23.5 GB) so shared workloads
+/// automatically step down safely instead of overcommitting.
+pub(crate) fn classify_vram_tier(dedicated_bytes: u64, budget_bytes: u64) -> VramTier {
+    let dedicated_mb = dedicated_bytes >> 20;
+    let budget_mb = budget_bytes >> 20;
+    if budget_mb > 0 {
+        if budget_mb <= 8_704 {
+            VramTier::Gb8
+        } else if budget_mb <= 12_800 {
+            VramTier::Gb12
+        } else if budget_mb <= 18_432 {
+            VramTier::Gb16
+        } else {
+            VramTier::Gb24
+        }
+    } else if dedicated_mb <= 9_728 {
+        VramTier::Gb8
+    } else if dedicated_mb <= 13_824 {
+        VramTier::Gb12
+    } else if dedicated_mb <= 19_456 {
+        VramTier::Gb16
+    } else {
+        VramTier::Gb24
+    }
+}
+
+/// Computes the dynamic VRAM policy for a given hardware/profile snapshot.
+pub(crate) fn compute_vram_policy(
+    mode_override: Option<VramTier>,
+    dedicated_bytes: u64,
+    local_budget_bytes: u64,
+    shared_budget_bytes: u64,
+    series_s: bool,
+    total_ram_bytes: u64,
+) -> VramPolicy {
+    let tier = mode_override.unwrap_or_else(|| classify_vram_tier(dedicated_bytes, local_budget_bytes));
+    let budget_mb = if local_budget_bytes > 0 {
+        local_budget_bytes >> 20
+    } else {
+        match tier {
+            VramTier::Gb8 => 7_400,
+            VramTier::Gb12 => 11_400,
+            VramTier::Gb16 => 15_400,
+            VramTier::Gb24 => 23_200,
+        }
+    };
+    let tight_host_ram = (total_ram_bytes > 0 && total_ram_bytes <= 20 * GIB)
+        || (shared_budget_bytes > 0 && shared_budget_bytes <= (8 << 30) + (512 << 20));
+
+    match tier {
+        VramTier::Gb8 => VramPolicy {
+            tier,
+            dedicated_bytes,
+            local_budget_bytes,
+            shared_budget_bytes,
+            texture_keep_percent: 72,
+            texture_room_percent: 84,
+            targets_room_mb: 1280,
+            card_buffers_min_kb: 512,
+            card_buffers_max_mb: (budget_mb / 6).clamp(768, 1280),
+            card_windows_mb: 0,
+            card_windows_percent: 75,
+            windows_bar_mb: 0,
+            windows_bar_percent: 75,
+            pool_reclaim_percent: 80,
+            pool_spare_kept: 4,
+            staging_nonlocal_cap_mb: if tight_host_ram { 128 } else { 512 },
+            window_budget_mb: if tight_host_ram { 96 } else { 256 },
+        },
+        VramTier::Gb12 => VramPolicy {
+            tier,
+            dedicated_bytes,
+            local_budget_bytes,
+            shared_budget_bytes,
+            texture_keep_percent: if series_s { 84 } else { 80 },
+            texture_room_percent: 91,
+            targets_room_mb: 1280,
+            card_buffers_min_kb: 128,
+            card_buffers_max_mb: (budget_mb / 5).clamp(1536, 2560),
+            card_windows_mb: if series_s { 1536 } else { 1024 },
+            card_windows_percent: 84,
+            windows_bar_mb: if series_s { 2048 } else { 1536 },
+            windows_bar_percent: 85,
+            pool_reclaim_percent: 88,
+            pool_spare_kept: 10,
+            staging_nonlocal_cap_mb: if tight_host_ram { 192 } else { 512 },
+            window_budget_mb: if tight_host_ram { 128 } else { 256 },
+        },
+        VramTier::Gb16 => VramPolicy {
+            tier,
+            dedicated_bytes,
+            local_budget_bytes,
+            shared_budget_bytes,
+            // On a 16 GB GPU (~14.9-15.45 GB live DXGI budget):
+            // - With >=32 GB host RAM, fill ~90-94% of live DXGI VRAM (91% keep /
+            //   95% room -> ~13.2-14.2 GB) while leaving ~1.0-1.4 GB against WDDM paging.
+            // - On <=20 GB host RAM (e.g. 16 GB DDR4), cap at 84% keep / 90% room
+            //   (~12.1 GB VRAM, ~2.2 GB shared, ~8.1 GB RAM WS) so Windows does not
+            //   page working set at >10 GB WS (measured +1.8 FPS and -46% max spike
+            //   vs 91% on 16 GB RAM; manual VICTORY_TEXTURE_KEEP_PERCENT still overrides).
+            texture_keep_percent: if tight_host_ram {
+                if series_s { 84 } else { 80 }
+            } else if series_s {
+                91
+            } else {
+                88
+            },
+            texture_room_percent: if tight_host_ram { 90 } else { 95 },
+            targets_room_mb: if tight_host_ram { 2048 } else { 1280 },
+            card_buffers_min_kb: 64,
+            card_buffers_max_mb: (budget_mb / 4).clamp(3072, 4096),
+            card_windows_mb: if tight_host_ram {
+                if series_s { 2816 } else { 2048 }
+            } else if series_s {
+                3584
+            } else {
+                2560
+            },
+            card_windows_percent: if tight_host_ram { 82 } else { 89 },
+            windows_bar_mb: if series_s { 4096 } else { 3072 },
+            windows_bar_percent: if tight_host_ram { 85 } else { 90 },
+            pool_reclaim_percent: if tight_host_ram { 86 } else { 92 },
+            pool_spare_kept: if tight_host_ram { 12 } else { 16 },
+            staging_nonlocal_cap_mb: if tight_host_ram { 192 } else { u64::MAX },
+            window_budget_mb: if tight_host_ram { 128 } else { 512 },
+        },
+        VramTier::Gb24 => VramPolicy {
+            tier,
+            dedicated_bytes,
+            local_budget_bytes,
+            shared_budget_bytes,
+            texture_keep_percent: 92,
+            texture_room_percent: 96,
+            targets_room_mb: 1536,
+            card_buffers_min_kb: 64,
+            card_buffers_max_mb: (budget_mb / 3).clamp(4096, 8192),
+            card_windows_mb: 5120,
+            card_windows_percent: 91,
+            windows_bar_mb: 5120,
+            windows_bar_percent: 91,
+            pool_reclaim_percent: 93,
+            pool_spare_kept: 24,
+            staging_nonlocal_cap_mb: if tight_host_ram { 256 } else { u64::MAX },
+            window_budget_mb: if tight_host_ram { 256 } else { 1024 },
+        },
+    }
+}
+
+/// Active dynamic VRAM policy for this session, resolved once from DXGI
+/// (`DedicatedVideoMemory` + `DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), host RAM,
+/// and console profile (`--console series-s` / `series-x`).
+pub(crate) fn vram_policy() -> VramPolicy {
+    static POLICY: OnceLock<VramPolicy> = OnceLock::new();
+    *POLICY.get_or_init(|| {
+        let mode_raw = std::env::var("VICTORY_VRAM_MODE").ok();
+        let mode_override = parse_vram_mode(mode_raw.as_deref());
+        let adapter = crate::dxgi::host_adapter_vram();
+        let (dedicated_bytes, local_budget_bytes, shared_budget_bytes, is_uma) = match adapter {
+            Some(v) => (v.dedicated_bytes, v.local_budget_bytes, v.shared_budget_bytes, v.is_uma),
+            None => (0, 0, 0, false),
+        };
+        let total_ram_bytes = memory_status().map_or(0, |s| s.ullTotalPhys);
+        let series_s = crate::console::current().is_series_s();
+        let mut policy = compute_vram_policy(
+            mode_override,
+            dedicated_bytes,
+            local_budget_bytes,
+            shared_budget_bytes,
+            series_s,
+            total_ram_bytes,
+        );
+        // On UMA / integrated GPUs (where local & shared are the same physical
+        // RAM), copying loose windows into a separate DEFAULT heap adds copy
+        // traffic without escaping PCIe; disable VRAM window staging there.
+        if is_uma {
+            policy.card_windows_mb = 0;
+            policy.windows_bar_mb = 0;
+        }
+        tracing::info!(
+            tier = policy.tier.label(),
+            mode = mode_raw.as_deref().unwrap_or("auto"),
+            console = crate::console::current().name(),
+            uma = is_uma,
+            dedicated_mb = policy.dedicated_bytes >> 20,
+            vram_budget_mb = policy.local_budget_bytes >> 20,
+            shared_budget_mb = policy.shared_budget_bytes >> 20,
+            host_ram_mb = total_ram_bytes >> 20,
+            keep_pct = policy.texture_keep_percent,
+            room_pct = policy.texture_room_percent,
+            targets_room_mb = policy.targets_room_mb,
+            card_min_kb = policy.card_buffers_min_kb,
+            card_max_mb = policy.card_buffers_max_mb,
+            card_windows_mb = policy.card_windows_mb,
+            card_windows_pct = policy.card_windows_percent,
+            staging_cap_mb = if policy.staging_nonlocal_cap_mb == u64::MAX { 0 } else { policy.staging_nonlocal_cap_mb },
+            "auto VRAM policy active"
+        );
+        policy
+    })
+}
+
+/// Effective texture-cache keep watermark (% of local VRAM budget):
+/// explicit `VICTORY_TEXTURE_KEEP_PERCENT=<40..95>` overrides, while unset or
+/// `"auto"` uses [`vram_policy`].
+fn base_texture_keep_percent() -> u64 {
+    static PCT: OnceLock<u64> = OnceLock::new();
+    *PCT.get_or_init(|| {
+        env_override_u64("VICTORY_TEXTURE_KEEP_PERCENT")
+            .map_or_else(|| vram_policy().texture_keep_percent, |p| p.clamp(40, 95))
+    })
+}
+
+/// Pure texture-eviction helper matching `host::vram_keep`, with dynamic
+/// commit-headroom protection so 16 GB RAM hosts stay OOM-free even when
+/// external apps consume system commit.
+pub(crate) fn vram_keep_for(budget: u64, used: u64, base_keep_pct: u64, avail_commit: Option<u64>) -> (u64, u64) {
+    const KEPT_MS: u64 = 600_000;
+    const IDLE_MS: u64 = 5_000;
+    const SHORT_MS: u64 = 3_000;
+    if budget == 0 {
+        return (IDLE_MS, u64::MAX);
+    }
+    // Step down the texture keep watermark gently if OS commit headroom gets
+    // low (every VRAM MiB carries a WDDM backing commit charge).
+    let k = match avail_commit {
+        Some(commit) if commit < 1536 * MIB => base_keep_pct.saturating_sub(20).max(45),
+        Some(commit) if commit < 3 * GIB => base_keep_pct.saturating_sub(10).max(50),
+        _ => base_keep_pct,
+    };
+    let share = |percent: u64| budget / 100 * percent;
+    if used < share(k) {
+        (KEPT_MS, u64::MAX)
+    } else if used < share((k + 5).min(97)) {
+        (IDLE_MS, used - share(k.saturating_sub(4)))
+    } else {
+        (SHORT_MS, used - share(k.saturating_sub(7)))
+    }
+}
+
+/// Dynamic replacement for `host::vram_keep` called by `resource::let_go_idle`:
+/// scales automatically by DXGI VRAM tier (`auto`) while still respecting manual
+/// `VICTORY_TEXTURE_KEEP_PERCENT` overrides and live host commit headroom.
+/// Setting `VICTORY_VRAM_MODE=legacy` delegates directly to `host::vram_keep`.
+pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    if *LEGACY.get_or_init(|| {
+        std::env::var("VICTORY_VRAM_MODE")
+            .ok()
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("legacy"))
+    }) {
+        return crate::host::vram_keep(budget, used);
+    }
+    let base = base_texture_keep_percent();
+    let commit = on().then(|| sample_commit(crate::host::coarse_ms()));
+    vram_keep_for(budget, used, base, commit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +633,66 @@ mod tests {
         assert_eq!(prefetch_limit(512 << 20, true, false, false, 0), 64 << 20);
         assert_eq!(prefetch_limit(512 << 20, true, true, false, 0), 16 << 20);
         assert_eq!(prefetch_limit(192 << 20, false, false, false, 0), 192 << 20);
+    }
+
+    #[test]
+    fn dxgi_auto_vram_tier_classification_and_policies() {
+        // 8 GB GPU (~7.4 GB budget)
+        assert_eq!(classify_vram_tier(8 * GIB, 7_400 * MIB), VramTier::Gb8);
+        // 12 GB GPU (~11.2 GB budget)
+        assert_eq!(classify_vram_tier(12 * GIB, 11_200 * MIB), VramTier::Gb12);
+        // 16 GB GPU (RX 9060 XT: 16253 MB dedicated, 15450 MB budget)
+        assert_eq!(classify_vram_tier(16_253 * MIB, 15_450 * MIB), VramTier::Gb16);
+        // 24 GB GPU (~23.2 GB budget)
+        assert_eq!(classify_vram_tier(24 * GIB, 23_200 * MIB), VramTier::Gb24);
+
+        let p8 = compute_vram_policy(None, 8 * GIB, 7_400 * MIB, 7_473 * MIB, true, 16 * GIB);
+        let p12 = compute_vram_policy(None, 12 * GIB, 11_200 * MIB, 7_473 * MIB, true, 16 * GIB);
+        let p16_16ram = compute_vram_policy(None, 16_253 * MIB, 15_450 * MIB, 7_473 * MIB, true, 16 * GIB);
+        let p16_32ram = compute_vram_policy(None, 16_253 * MIB, 15_450 * MIB, 16 * GIB, true, 32 * GIB);
+        let p24 = compute_vram_policy(None, 24 * GIB, 23_200 * MIB, 16 * GIB, true, 32 * GIB);
+
+        assert_eq!(p8.tier, VramTier::Gb8);
+        assert_eq!(p8.card_windows_mb, 0);
+        assert!(p8.texture_keep_percent < p12.texture_keep_percent);
+        assert!(p12.texture_keep_percent <= p16_16ram.texture_keep_percent);
+        assert!(p16_16ram.texture_keep_percent < p16_32ram.texture_keep_percent);
+        assert!(p16_32ram.texture_keep_percent < p24.texture_keep_percent);
+        // 16 GB GPU on 16 GB RAM avoids OS working-set paging (~12.1 GB VRAM, ~2.2 GB shared)
+        assert_eq!(p16_16ram.texture_keep_percent, 84);
+        assert_eq!(p16_16ram.texture_room_percent, 90);
+        assert_eq!(p16_16ram.card_windows_mb, 2816);
+        assert_eq!(p16_16ram.staging_nonlocal_cap_mb, 192);
+        // 16 GB GPU on >=32 GB RAM unlocks ~90-94% of live DXGI VRAM (~13.2-14.2 GB)
+        assert_eq!(p16_32ram.texture_keep_percent, 91);
+        assert_eq!(p16_32ram.texture_room_percent, 95);
+        assert!(p16_32ram.card_buffers_max_mb > 2560);
+        assert!(p16_32ram.card_windows_mb >= 3584);
+    }
+
+    #[test]
+    fn env_auto_parsing_and_commit_guard() {
+        assert_eq!(parse_env_auto_u64(None), None);
+        assert_eq!(parse_env_auto_u64(Some("")), None);
+        assert_eq!(parse_env_auto_u64(Some("auto")), None);
+        assert_eq!(parse_env_auto_u64(Some(" AUTO ")), None);
+        assert_eq!(parse_env_auto_u64(Some("65")), Some(65));
+        assert_eq!(parse_vram_mode(Some("auto")), None);
+        assert_eq!(parse_vram_mode(Some("16gb")), Some(VramTier::Gb16));
+        assert_eq!(parse_vram_mode(Some("8")), Some(VramTier::Gb8));
+
+        let budget = 15_450 * MIB;
+        // Healthy commit headroom keeps textures up to 83% (~12.8 GB)
+        assert_eq!(vram_keep_for(budget, 12_000 * MIB, 83, Some(6 * GIB)).0, 600_000);
+        // Low commit (<3 GiB) steps watermark down to 73% (~11.3 GB) to avoid OOM
+        assert_eq!(vram_keep_for(budget, 12_000 * MIB, 83, Some(2 * GIB)).0, 5_000);
+        // Critical commit (<1.5 GiB) steps watermark down to 63% (~9.7 GB)
+        assert_eq!(vram_keep_for(budget, 12_000 * MIB, 83, Some(1 * GIB)).0, 3_000);
+        // 16 GB RAM hosts do not latch permanent pressure at 1.4-2.2 GiB free RAM + 5-6 GiB commit
+        assert!(!next_pressure_for_host(false, 1280 * MIB, 6 * GIB, 16 * GIB));
+        assert!(next_pressure_for_host(false, 768 * MIB, 6 * GIB, 16 * GIB));
+        assert!(next_pressure_for_host(false, 2500 * MIB, 2048 * MIB, 16 * GIB));
+        assert!(next_pressure_for_host(true, 1024 * MIB, 4 * GIB, 16 * GIB));
+        assert!(!next_pressure_for_host(true, 1280 * MIB, 3072 * MIB, 16 * GIB));
     }
 }

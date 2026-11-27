@@ -107,15 +107,30 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Self weak handle for O(dirty) enrollment into [`DIRTY_CARDED`].
+    self_weak: std::sync::OnceLock<std::sync::Weak<Shadow>>,
+}
+
+/// CPU-side backing for a copy whose shader-visible buffer lives in local VRAM.
+enum CardCpu {
+    /// Traditional D3D12 `NON_LOCAL` (`L0`) shared buffer (used when
+    /// `VICTORY_SEND_OWN=0` or `VICTORY_UPCHECK` is active).
+    Gpu(ID3D12Resource),
+    /// Plain host heap buffer (outside WDDM `NON_LOCAL` Shared GPU memory!)
+    /// sized to exact `len.next_multiple_of(64)` instead of 64 KiB padding.
+    /// Held here to keep the backing allocation alive for `Shadow::data`.
+    Cpu(#[allow(dead_code)] Box<[u8]>),
+    /// Zero-staging direct VRAM mode for read-only loose windows: no duplicate
+    /// CPU copy and no `NON_LOCAL` GPU buffer (`send::take` reads title memory
+    /// safely via `copy_mapped`).
+    Direct,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
 /// shaders see.
 struct Card {
-    /// The CPU's side, in the PC's memory: what `data` maps. Title memory
-    /// is copied into it as into any copy, and what changed in it goes to
-    /// the card's side before the next submission.
-    staging: ID3D12Resource,
+    /// The CPU's side (D3D12 shared buffer, plain host heap, or direct).
+    cpu: CardCpu,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -181,6 +196,7 @@ pub(crate) fn cards() -> bool {
 /// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
 ///   capping at 25% of local budget (at most 8 GiB) so "before" twins (up to 2x)
 ///   still leave headroom for textures and render targets.
+#[cfg(test)]
 fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
     let Some(budget_bytes) = local_vram_budget else {
         return (16, 512);
@@ -200,6 +216,7 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
 /// Resolve `(min_bytes, max_bytes)` from the adapter's local VRAM budget and
 /// optional explicit MiB overrides from `VICTORY_CARD_BUFFERS_MIN_MB` /
 /// `VICTORY_CARD_BUFFERS_MB`.
+#[cfg(test)]
 fn resolve_card_limits(
     local_vram_budget: Option<u64>,
     min_mb_override: Option<u64>,
@@ -222,33 +239,62 @@ fn resolve_card_limits(
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
-        let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
-        let (mut min_bytes, max_bytes) = resolve_card_limits(
-            vram_budget,
-            env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
-            env_mb("VICTORY_CARD_BUFFERS_MB"),
-        );
-        // `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the
-        // least size in KiB, so that it can go under 1 MiB: 64 is every title
-        // buffer. Copies under 1 MiB are nearly all there are and few bytes;
-        // in the PC's memory every load, store and atomic a shader does on
-        // them crosses the bus.
-        if let Some(kib) = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok())
-            && kib > 0
-        {
-            min_bytes = kib << 10;
-        }
+        let policy = crate::residency::vram_policy();
+        let min_mb_override = crate::residency::env_override_u64("VICTORY_CARD_BUFFERS_MIN_MB");
+        let max_mb_override = crate::residency::env_override_u64("VICTORY_CARD_BUFFERS_MB");
+        let min_kb_override = crate::residency::env_override_u64("VICTORY_CARD_BUFFERS_MIN_KB").filter(|&k| k > 0);
+        let mut min_bytes = if let Some(kib) = min_kb_override {
+            kib << 10
+        } else if let Some(mib) = min_mb_override {
+            mib.saturating_mul(1 << 20).max(1 << 20)
+        } else {
+            policy.card_buffers_min_kb << 10
+        };
+        let max_bytes = max_mb_override.unwrap_or(policy.card_buffers_max_mb).saturating_mul(1 << 20);
         if card_all() {
             min_bytes = 0;
         }
         tracing::info!(
-            vram_budget_mb = vram_budget.map(|b| b >> 20),
+            vram_tier = policy.tier.label(),
+            vram_budget_mb = policy.local_budget_bytes >> 20,
             card_buffers_min_kb = min_bytes >> 10,
             card_buffers_max_mb = max_bytes >> 20,
             "card buffer limits"
         );
         (min_bytes, max_bytes)
+    })
+}
+
+/// Whether `VICTORY_SEND_OWN` is active (default on): submissions copy dirty
+/// ranges into a transient upload buffer via `shadow.card_data()`, so a card
+/// copy's CPU side does not need to occupy WDDM `NON_LOCAL` Shared GPU memory.
+fn send_own_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_OWN").is_none_or(|v| v != "0"))
+}
+
+/// Whether card buffers may keep their CPU-side reference in plain host heap
+/// memory (`CardCpu::Cpu`) instead of a D3D12 `NON_LOCAL` shared buffer.
+fn card_cpu_heap_ok() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        send_own_enabled()
+            && !crate::host::upcheck::on()
+            && std::env::var_os("VICTORY_CARD_CPU_HEAP").is_none_or(|v| v != "0")
+    })
+}
+
+/// Whether read-only loose windows placed in local VRAM may skip allocating a
+/// CPU-side shadow altogether (`CardCpu::Direct`), saving 100% of their
+/// `NON_LOCAL` Shared GPU footprint, 100% of duplicate CPU commit, and half
+/// the CPU copy work.
+fn window_direct_ok() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        card_cpu_heap_ok()
+            && !send_changed()
+            && !windows_own()
+            && std::env::var_os("VICTORY_CARD_WINDOWS_DIRECT").is_none_or(|v| v != "0")
     })
 }
 
@@ -327,6 +373,23 @@ pub(crate) fn card_room_kept() -> u64 {
 
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+/// Subset of [`CARDED`] that actually received dirty ranges since the last
+/// [`card_dirty`] drain, avoiding an O(4,900+) `Weak::upgrade` scan on every
+/// submission.
+static DIRTY_CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// Registers a newly-created carded [`Shadow`] in [`CARDED`] and initializes
+/// its `self_weak` handle for O(dirty) tracking.
+fn register_carded(shadow: &Arc<Shadow>) {
+    let weak = Arc::downgrade(shadow);
+    let _ = shadow.self_weak.set(weak.clone());
+    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    // Lazily prune dead weak entries when the vec grows large.
+    if carded.len() >= 1024 && carded.len().is_multiple_of(512) {
+        carded.retain(|w| w.strong_count() > 0);
+    }
+    carded.push(weak);
+}
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
@@ -475,7 +538,17 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        crate::residency::env_override_u64("VICTORY_CARD_WINDOWS_MB")
+            .unwrap_or_else(|| crate::residency::vram_policy().card_windows_mb)
+            << 20
+    })
+}
+
+fn window_card_percent() -> u64 {
+    static PCT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PCT.get_or_init(|| {
+        crate::residency::env_override_u64("VICTORY_CARD_WINDOWS_PERCENT")
+            .map_or_else(|| crate::residency::vram_policy().card_windows_percent, |p| p.clamp(50, 97))
     })
 }
 
@@ -513,7 +586,9 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 fn window_mapped_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        crate::residency::env_override_u64("VICTORY_WINDOWS_BAR_MB")
+            .unwrap_or_else(|| crate::residency::vram_policy().windows_bar_mb)
+            << 20
     })
 }
 
@@ -521,9 +596,13 @@ fn window_mapped_most() -> u64 {
 /// its CPU-mapped memory ([`window_mapped_for`]).
 fn windows_bar_percent() -> u64 {
     static P: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *P.get_or_init(|| bar_line(std::env::var("VICTORY_WINDOWS_BAR_PERCENT").ok().as_deref()))
+    *P.get_or_init(|| {
+        crate::residency::env_override_u64("VICTORY_WINDOWS_BAR_PERCENT")
+            .map_or_else(|| crate::residency::vram_policy().windows_bar_percent, |p| p.clamp(50, 97))
+    })
 }
 
+#[cfg(test)]
 fn bar_line(setting: Option<&str>) -> u64 {
     setting.and_then(|v| v.trim().parse::<u64>().ok()).map_or(80, |p| p.clamp(50, 97))
 }
@@ -579,7 +658,7 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * window_card_percent()
     {
         return None;
     }
@@ -651,21 +730,27 @@ impl SentRuns {
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
-    let mut out = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    let pending = {
+        let mut q = DIRTY_CARDED.lock().unwrap_or_else(|e| e.into_inner());
+        if q.is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(&mut *q)
+    };
+    let mut out = Vec::with_capacity(pending.len());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|weak| {
+    for weak in pending {
         let Some(shadow) = weak.upgrade() else {
-            return false;
+            continue;
         };
         let ranges = shadow
             .card
             .as_ref()
-            .filter(|c| c.touched.swap(false, Ordering::AcqRel))
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+                c.touched.store(false, Ordering::Release);
                 let ranges = joined(std::mem::take(&mut *dirty));
-                if relay() {
+                if relay() && !ranges.is_empty() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.forget(fetched);
                     sent.note_joined(sent_as, ranges.clone());
@@ -676,8 +761,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         if !ranges.is_empty() {
             out.push((shadow, ranges));
         }
-        true
-    });
+    }
     out
 }
 
@@ -691,7 +775,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut all: Vec<Arc<Shadow>> = buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
     all.extend(LOOSE.write().unwrap_or_else(|e| e.into_inner()).values().cloned());
-    all.retain(|s| s.place.is_none() && s.watched.load(Ordering::Relaxed) == 1);
+    all.retain(|s| s.place.is_none() && !s.data.is_null() && s.watched.load(Ordering::Relaxed) == 1);
     all.sort_by_key(|s| s.id);
     let next = NEXT.load(Ordering::Relaxed);
     let turn = all.partition_point(|s| s.id < next);
@@ -3208,11 +3292,9 @@ pub(crate) fn window_use() -> [u64; 8] {
 fn window_budget() -> Option<u64> {
     static MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *MB.get_or_init(|| {
-        std::env::var("VICTORY_WINDOW_BUDGET_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|&v| v > 0)
-            .map(|v| v.saturating_mul(1 << 20))
+        let mb = crate::residency::env_override_u64("VICTORY_WINDOW_BUDGET_MB")
+            .unwrap_or_else(|| crate::residency::vram_policy().window_budget_mb);
+        (mb > 0).then(|| mb.saturating_mul(1 << 20))
     })
 }
 
@@ -3297,13 +3379,25 @@ pub(crate) fn let_go_idle() {
             }
         }
     }
-    if let Some([_, _, shared_budget, shared_used]) = host().and_then(|h| h.video_memory())
+    let vmem = host().and_then(|h| h.video_memory());
+    if let Some([_, _, shared_budget, shared_used]) = vmem
         && shared_budget > 0
         && u128::from(shared_used) * 100 >= u128::from(shared_budget) * 70
     {
         idle_ms = idle_ms.min(2_000);
         keep = keep.min(budget.unwrap_or(256 << 20) / 2);
     }
+    // Separate VRAM-resident windows (direct card windows / BAR windows) from
+    // NON_LOCAL Shared-RAM windows: the RAM window budget only governs
+    // Shared-RAM windows, while VRAM windows stay resident until local VRAM
+    // crosses (keep_pct + 5)% and are then evicted incrementally (max 8 per
+    // 1-second sweep) so there are zero burst-eviction frame spikes.
+    let vram_emergency = vmem.is_some_and(|[v_budget, v_used, ..]| {
+        let line = (crate::residency::vram_policy().texture_keep_percent + 4).min(96);
+        v_budget > 0 && u128::from(v_used) * 100 >= u128::from(v_budget) * u128::from(line)
+    });
+    let vram_idle_ms = if vram_emergency { 5_000 } else { 600_000 };
+    const MAX_VRAM_EVICT_PER_SWEEP: usize = 8;
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -3311,28 +3405,43 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let mut eligible: Vec<(u64, (u64, u64), usize, u64)> = map
-            .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
-            })
-            .map(|(&key, s)| {
-                (s.used.load(Ordering::Relaxed), key, Arc::as_ptr(s) as usize, s.len)
-            })
-            .collect();
-        eligible.sort_unstable_by_key(|&(used, _, _, _)| used);
+        let mut eligible_shared: Vec<(u64, (u64, u64), usize, u64)> = Vec::new();
+        let mut eligible_vram: Vec<(u64, (u64, u64))> = Vec::new();
+        let mut gone_keys: Vec<(u64, u64)> = Vec::new();
+        for (&key, s) in map.iter() {
+            if Arc::strong_count(s) != 1 || crate::host::references(&s.buffer) != 1 {
+                continue;
+            }
+            let used = s.used.load(Ordering::Relaxed);
+            let vram_only = s.card_direct() || s.mapped;
+            if vram_only {
+                if crate::host::long_ago(used, vram_idle_ms, IDLE_FRAMES) {
+                    eligible_vram.push((used, key));
+                }
+            } else if crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
+                eligible_shared.push((used, key, Arc::as_ptr(s) as usize, s.len));
+            }
+        }
+        if !eligible_vram.is_empty() {
+            eligible_vram.sort_unstable_by_key(|&(used, _)| used);
+            for (_, key) in eligible_vram.into_iter().take(MAX_VRAM_EVICT_PER_SWEEP) {
+                gone_keys.push(key);
+            }
+        }
+        eligible_shared.sort_unstable_by_key(|&(used, _, _, _)| used);
         let victims = if keep == u64::MAX {
-            (0..eligible.len()).collect()
+            (0..eligible_shared.len()).collect()
         } else {
-            let entries: Vec<(u64, u64, usize)> = eligible
+            let entries: Vec<(u64, u64, usize)> = eligible_shared
                 .iter()
                 .map(|&(used, _, id, len)| (used, len, id))
                 .collect();
             window_victims(&entries, keep)
         };
-        victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
+        for i in victims {
+            gone_keys.push(eligible_shared[i].1);
+        }
+        gone_keys.into_iter().filter_map(|k| map.remove(&k)).collect()
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -3506,6 +3615,7 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
+            self_weak: std::sync::OnceLock::new(),
         }
     }
 
@@ -4387,7 +4497,7 @@ impl Shadow {
     /// title's that arrived between the refresh and the look.
     fn refresh_check(&self, from: usize, to: usize) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) {
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) || self.data.is_null() {
             return;
         }
         const SAMPLE: usize = 256;
@@ -4618,8 +4728,8 @@ impl Shadow {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
-            if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
+        let Some(card) = self.card.as_ref().filter(|_| !self.data.is_null() && (self.changes_only.load(Ordering::Relaxed) || send_changed())) else {
+            if known && self.card.is_some() && !self.data.is_null() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
                 return self.take_landed(from, to);
             }
             return self.copy(from, to);
@@ -4666,6 +4776,15 @@ impl Shadow {
         let _census = crate::census::tag();
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        if self.card_direct() {
+            // Direct VRAM window: no CPU staging copy; `send::take` reads
+            // dirty ranges safely from title memory via `copy_mapped`.
+            self.card_changed(from - start, to - start);
+            return to - from;
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         if self.card.is_some() && from < to && crate::host::upcheck::on() {
@@ -4725,8 +4844,13 @@ impl Shadow {
                 _ => dirty.push((from, to)),
             }
         }
-        // (Under the lock: what takes the list sees it or finds it set.)
-        card.touched.store(true, Ordering::Release);
+        // Under `card.dirty` lock (same lock `card_dirty` takes before clearing
+        // `touched`): enqueue into `DIRTY_CARDED` exactly once on false -> true.
+        let enroll = !card.touched.swap(true, Ordering::AcqRel);
+        drop(dirty);
+        if enroll && let Some(weak) = self.self_weak.get() {
+            DIRTY_CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak.clone());
+        }
     }
 
     /// Whether shaders were ever declared to write it.
@@ -4748,14 +4872,22 @@ impl Shadow {
         let bytes = &bytes[self.start as usize + from - address..][..to - from];
         let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
         if self.card.is_some() {
-            // SAFETY: inside the mapping of the CPU's side, in a range no
-            // refresh writes; the lock keeps the landing out.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
+            if !self.data.is_null() {
+                // SAFETY: inside the mapping of the CPU's side, in a range no
+                // refresh writes; the lock keeps the landing out.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
+            }
         } else if let Some(snapshot) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             // SAFETY: the snapshot's allocation holds the copy's length.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), snapshot.as_mut_ptr().add(from), bytes.len()) };
         }
         self.changed(from, to);
+    }
+
+    /// Whether this card copy uses zero-staging direct VRAM mode (no CPU-side
+    /// duplicate buffer; `send::take` reads title memory safely via `copy_mapped`).
+    pub(crate) fn card_direct(&self) -> bool {
+        self.card.is_some() && self.data.is_null()
     }
 
     /// Of a copy in the card's memory: where its CPU side is.
@@ -4770,6 +4902,11 @@ impl Shadow {
         if self.card.is_none() || at >= to {
             return Vec::new();
         }
+        if self.data.is_null() {
+            let mut out = vec![0u8; to - at];
+            crate::host::copy_mapped(out.as_mut_ptr(), (self.start as usize + at) as *const u8, to - at, false);
+            return out;
+        }
         // SAFETY: inside the mapping; the caller holds the submission lock,
         // under which it is written but for what is being landed.
         unsafe { std::slice::from_raw_parts(self.data.add(at).cast_const(), to - at) }.to_vec()
@@ -4781,12 +4918,17 @@ impl Shadow {
         self.card.as_ref().map_or_else(Vec::new, |c| c.dirty.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
 
-    /// Of a copy in the card's memory: the CPU's side (PC memory), the
-    /// card side's bytes from before if made yet, and their size.
+    /// Of a copy in the card's memory: the CPU's side (PC memory, or `&self.buffer`
+    /// when `VICTORY_SEND_OWN` uses host-heap/direct backing), the card side's
+    /// bytes from before if made yet, and their size.
     pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((&card.staging, before, card.size))
+        let staging = match &card.cpu {
+            CardCpu::Gpu(res) => res,
+            CardCpu::Cpu(_) | CardCpu::Direct => &self.buffer,
+        };
+        Some((staging, before, card.size))
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -4902,7 +5044,7 @@ impl Shadow {
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
-        if self.card.is_none() || at + gpu.len() > self.len as usize {
+        if self.card.is_none() || self.data.is_null() || at + gpu.len() > self.len as usize {
             return 0;
         }
         // SAFETY: inside the mapping (checked above); only the submitting
@@ -4967,7 +5109,7 @@ impl Shadow {
         let Some(card) = &self.card else {
             return 0;
         };
-        if at + gpu.len() > self.len as usize {
+        if self.data.is_null() || at + gpu.len() > self.len as usize {
             return 0;
         }
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -5018,7 +5160,7 @@ impl Shadow {
         let mut shadow = Shadow::new(none(), data, 0, start, len);
         if card {
             shadow.card = Some(Card {
-                staging: none(),
+                cpu: CardCpu::Gpu(none()),
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
@@ -5073,6 +5215,9 @@ impl Shadow {
         let Some(card) = &self.card else {
             return 0;
         };
+        if self.data.is_null() {
+            return 0;
+        }
         let waiting = std::time::Instant::now();
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
         crate::land::spent(crate::land::stat::LOCK, waiting);
@@ -5162,7 +5307,7 @@ impl Shadow {
 
 #[cfg(test)]
 mod land_tests {
-    use super::{Card, PIECE, Shadow};
+    use super::{Card, CardCpu, PIECE, Shadow};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -5174,11 +5319,11 @@ mod land_tests {
         unsafe { std::ptr::write_bytes(data, 0, len) };
         let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
         shadow.card = Some(Card {
-            staging: buffer,
+            cpu: CardCpu::Gpu(buffer),
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
-                touched: Default::default(),
+            touched: Default::default(),
             size: len as u64,
         });
         Some(shadow)
@@ -5582,29 +5727,56 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
-                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
+        // Try placing big title buffers directly into local VRAM first when
+        // `VICTORY_SEND_OWN` allows plain host-heap CPU backing: avoids
+        // allocating a duplicate WDDM `NON_LOCAL` shared buffer and eliminates
+        // 64 KiB padding on thousands of small card buffers.
+        let (buffer, data, card) = if card_cpu_heap_ok()
+            && let Some(on_card) = card_for(size)
+        {
+            crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
+            tracing::info!(
+                start = format_args!("{:#x}", key.0),
+                len,
+                "a buffer's host copy is in the card's memory"
+            );
+            let alloc_len = (len as usize).max(64).next_multiple_of(64);
+            let mut cpu = vec![0u8; alloc_len].into_boxed_slice();
+            let data = cpu.as_mut_ptr();
+            let card = Card {
+                cpu: CardCpu::Cpu(cpu),
+                before: Mutex::default(),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
                 touched: Default::default(),
-                    size,
-                };
-                (on_card, Some(card))
+                size,
+            };
+            (on_card, data, Some(card))
+        } else {
+            let (buffer, data) = host()?.shared_buffer(size)?;
+            crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+            // A big one, with `cards`: shaders get a buffer in the card's own
+            // memory, and the one just made is the CPU's side.
+            match card_for(size) {
+                Some(on_card) => {
+                    crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
+                    tracing::info!(
+                        start = format_args!("{:#x}", key.0),
+                        len,
+                        "a buffer's host copy is in the card's memory"
+                    );
+                    let card = Card {
+                        cpu: CardCpu::Gpu(buffer),
+                        before: Mutex::default(),
+                        dirty: Mutex::default(),
+                        sent: Mutex::default(),
+                        touched: Default::default(),
+                        size,
+                    };
+                    (on_card, data, Some(card))
+                }
+                None => (buffer, data, None),
             }
-            None => (buffer, None),
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5625,7 +5797,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            register_carded(&shadow);
         }
         entry.shadow = Some(shadow);
     }
@@ -5803,26 +5975,52 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         mb.unwrap_or(4096) << 20
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
-    let (staging, data) = host.shared_buffer(len)?;
-    let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
-        host.uav_buffer(len).or_else(|| {
-            USED.fetch_sub(len, Ordering::Relaxed);
+    let (buffer, data, cpu) = if card_cpu_heap_ok() {
+        let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
+            host.uav_buffer(len).or_else(|| {
+                USED.fetch_sub(len, Ordering::Relaxed);
+                None
+            })
+        } else {
+            if room {
+                USED.fetch_sub(len, Ordering::Relaxed);
+            }
             None
-        })
+        };
+        let buffer = match on_card {
+            Some(buffer) => {
+                BY_ADDRESS_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
+                buffer
+            }
+            None => host.shared_buffer(len)?.0,
+        };
+        let alloc_len = (len as usize).max(64).next_multiple_of(64);
+        let mut heap = vec![0u8; alloc_len].into_boxed_slice();
+        let data = heap.as_mut_ptr();
+        (buffer, data, CardCpu::Cpu(heap))
     } else {
-        if room {
-            USED.fetch_sub(len, Ordering::Relaxed);
-        }
-        None
+        let (staging, data) = host.shared_buffer(len)?;
+        let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
+            host.uav_buffer(len).or_else(|| {
+                USED.fetch_sub(len, Ordering::Relaxed);
+                None
+            })
+        } else {
+            if room {
+                USED.fetch_sub(len, Ordering::Relaxed);
+            }
+            None
+        };
+        let buffer = match on_card {
+            Some(buffer) => {
+                BY_ADDRESS_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
+                buffer
+            }
+            None => host.shared_buffer(len)?.0,
+        };
+        crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
+        (buffer, data, CardCpu::Gpu(staging))
     };
-    let buffer = match on_card {
-        Some(buffer) => {
-            BY_ADDRESS_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
-            buffer
-        }
-        None => host.shared_buffer(len)?.0,
-    };
-    crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address"));
     // (Counted down with the windows' on the card when it goes.)
     WINDOW_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
@@ -5832,7 +6030,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     shadow.window = true;
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
-        staging,
+        cpu,
         before: Mutex::default(),
         dirty: Mutex::default(),
         sent: Mutex::default(),
@@ -5840,7 +6038,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         size: len,
     });
     let shadow = Arc::new(shadow);
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    register_carded(&shadow);
     Some(shadow)
 }
 
@@ -5937,6 +6135,32 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(shadow);
         return finish(shadow);
     }
+    // Zero-staging direct VRAM window: place loose title windows directly in
+    // fast local VRAM without allocating a duplicate WDDM `NON_LOCAL` shared
+    // buffer or duplicate CPU shadow. Moves gigabytes out of Shared GPU into
+    // idle GDDR6 at net-zero extra commit. Keep low 32-bit dynamic rings
+    // (`start < 4 GiB`, typically written every frame) out of direct staging.
+    if window_direct_ok()
+        && start >= (1u64 << 32)
+        && let Some(on_card) = window_room_for(len)
+    {
+        crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} direct on the card"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { on_card.GetGPUVirtualAddress() };
+        let mut shadow = Shadow::new(on_card, std::ptr::null_mut(), gpu, start, len);
+        shadow.window = true;
+        shadow.card = Some(Card {
+            cpu: CardCpu::Direct,
+            before: Mutex::default(),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            touched: Default::default(),
+            size: len,
+        });
+        let shadow = Arc::new(shadow);
+        register_carded(&shadow);
+        return finish(shadow);
+    }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
@@ -5945,7 +6169,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         Some(on_card) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
-                staging: buffer,
+                cpu: CardCpu::Gpu(buffer),
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
@@ -5968,7 +6192,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.card = card;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        register_carded(&shadow);
     }
     finish(shadow)
 }

@@ -32,6 +32,10 @@ impl Console {
             Console::SeriesS => "Xbox Series S",
         }
     }
+
+    pub const fn is_series_s(self) -> bool {
+        matches!(self, Console::SeriesS)
+    }
 }
 
 static SERIES_S: AtomicBool = AtomicBool::new(false);

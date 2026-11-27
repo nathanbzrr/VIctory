@@ -53,6 +53,12 @@ pub(crate) fn on_wine() -> bool {
 
 /// Standard memory the title has handed to the system.
 static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
+/// Exact bytes of physical-page sections currently owned by the title
+/// (`XMemAllocatePhysicalPages` / `Section::drop`), reported in
+/// `XMemGetWorkingSetStatistics` instead of host GPU VRAM commit.
+static TITLE_PHYSICAL_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Exact bytes of default-heap allocations currently owned by the title.
+static TITLE_HEAP_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 // Console additions to the host's flags.
 /// 2 MiB pages; the host reads this bit as large pages, which need a
@@ -358,6 +364,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         user.sub(HEADER)
             .cast::<[usize; 2]>()
             .write([layout.size(), layout.align()]);
+        TITLE_HEAP_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         user.cast()
     }
 }
@@ -376,6 +383,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        TITLE_HEAP_BYTES.fetch_sub(size, Ordering::Relaxed);
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -495,6 +503,7 @@ unsafe impl Sync for Section {}
 impl Drop for Section {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        TITLE_PHYSICAL_BYTES.fetch_sub(self.pages * PAGE, Ordering::Relaxed);
         if let Some(&base) = self.window.get()
             && base != 0
         {
@@ -683,6 +692,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: file-backed mappings have storage.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine() || file_backed);
+    TITLE_PHYSICAL_BYTES.fetch_add(size, Ordering::Relaxed);
     let section = Arc::new(Section {
         handle,
         pages: n,
@@ -710,30 +720,152 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     1
 }
 
-/// `VICTORY_FILE_PHYSICAL=1`: back physical-page sections with a temporary
-/// delete-on-close file instead of Windows pagefile commit charge. Eliminates
-/// ~6 GiB of commit charge on 16 GB RAM hosts so background apps do not push
-/// the system into `0x8007000E` OOM.
+/// Returns true if `dir`'s drive is backed by an NVMe storage bus
+/// (`STORAGE_ADAPTER_DESCRIPTOR.BusType == BusTypeNvme (17)`), queried without
+/// requiring administrator privileges (`dwDesiredAccess = 0`).
+/// Never returns true for SATA SSDs or HDDs.
+#[cfg(windows)]
+fn is_nvme_volume(dir: &std::path::Path) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let Some(drive) = dir.to_str().and_then(|s| {
+        let b = s.as_bytes();
+        (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':').then_some(b[0] as char)
+    }) else {
+        return false;
+    };
+    let vol: Vec<u16> = format!("\\\\.\\{drive}:\0").encode_utf16().collect();
+    // SAFETY: read-only metadata query on a drive handle with `dwDesiredAccess = 0`.
+    let handle = unsafe {
+        CreateFileW(
+            vol.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    #[repr(C)]
+    struct StoragePropertyQuery {
+        property_id: u32,
+        query_type: u32,
+        additional: [u8; 4],
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct StorageAdapterDescriptor {
+        version: u32,
+        size: u32,
+        maximum_transfer_length: u32,
+        maximum_physical_pages: u32,
+        alignment_mask: u32,
+        adapter_uses_pio: u8,
+        adapter_scans_down: u8,
+        command_queueing: u8,
+        accelerated_transfer: u8,
+        bus_type: u8,
+        _pad: [u8; 3],
+        bus_major_version: u16,
+        bus_minor_version: u16,
+        srb_type: u8,
+        address_type: u8,
+        _tail: [u8; 16],
+    }
+    const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D_1400;
+    const STORAGE_ADAPTER_PROPERTY: u32 = 1;
+    const PROPERTY_STANDARD_QUERY: u32 = 0;
+    const BUS_TYPE_NVME: u8 = 17;
+    let query = StoragePropertyQuery {
+        property_id: STORAGE_ADAPTER_PROPERTY,
+        query_type: PROPERTY_STANDARD_QUERY,
+        additional: [0; 4],
+    };
+    let mut desc = StorageAdapterDescriptor::default();
+    let mut returned = 0u32;
+    // SAFETY: valid input/output buffers and open volume handle.
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            (&raw const query).cast(),
+            size_of_val(&query) as u32,
+            (&raw mut desc).cast(),
+            size_of_val(&desc) as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    // SAFETY: closing the handle we just opened.
+    unsafe { CloseHandle(handle) };
+    ok != 0 && returned >= 25 && desc.bus_type == BUS_TYPE_NVME
+}
+
+#[cfg(not(windows))]
+fn is_nvme_volume(_dir: &std::path::Path) -> bool {
+    false
+}
+
+/// Resolves the target directory for `VICTORY_FILE_PHYSICAL`: prefers explicit
+/// `VICTORY_FILE_PHYSICAL_DIR`, then `LOCALAPPDATA` (typically fast system
+/// NVMe `C:`) over `VICTORY_CACHE_DIR` (which may live on a slower SATA SSD).
+fn file_physical_dir() -> PathBuf {
+    std::env::var_os("VICTORY_FILE_PHYSICAL_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .map(|b| PathBuf::from(b).join("victory").join("physical"))
+        })
+        .or_else(|| std::env::var_os("TEMP").map(PathBuf::from))
+        .or_else(|| std::env::var_os("VICTORY_CACHE_DIR").map(PathBuf::from))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+}
+
+/// `VICTORY_FILE_PHYSICAL=1` (or `auto` on `<= 20 GiB` RAM hosts whose
+/// `LOCALAPPDATA` / target volume is a verified NVMe SSD): back physical-page
+/// sections with a temporary delete-on-close file instead of Windows pagefile
+/// commit charge. Eliminates ~4.7-6 GiB of commit charge on 16 GB RAM hosts so
+/// higher VRAM utilization stays well under 18 GB commit with 0 OOM.
+/// Never auto-enables on SATA SSDs or HDDs.
 fn file_physical_enabled() -> bool {
-    static ON: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("VICTORY_FILE_PHYSICAL").is_some_and(|v| v == "1"));
+    static ON: LazyLock<bool> = LazyLock::new(|| match std::env::var("VICTORY_FILE_PHYSICAL") {
+        Ok(v) if v.trim() == "1" => true,
+        Ok(v) if v.trim() == "0" => false,
+        Ok(v) if v.trim().eq_ignore_ascii_case("auto") => {
+            let mut perf = PERFORMANCE_INFORMATION {
+                cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: sized structure.
+            let tight_ram = unsafe { K32GetPerformanceInfo(&mut perf, perf.cb) != 0 }
+                && (perf.PhysicalTotal as u64).saturating_mul(perf.PageSize as u64) <= 20 * (1u64 << 30);
+            let dir = file_physical_dir();
+            let nvme = tight_ram && is_nvme_volume(&dir);
+            tracing::info!(
+                mode = "auto",
+                tight_ram,
+                nvme,
+                dir = %dir.display(),
+                "VICTORY_FILE_PHYSICAL auto probe"
+            );
+            nvme
+        }
+        _ => false,
+    });
     *ON
 }
 
 fn create_physical_section(size: usize) -> Option<(HANDLE, Option<(std::fs::File, PathBuf)>)> {
     if file_physical_enabled() {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        // Prefer an explicit VICTORY_FILE_PHYSICAL_DIR, then LOCALAPPDATA (typically
-        // fast system NVMe C:) over VICTORY_CACHE_DIR (which may live on a slower SATA SSD).
-        let dir = std::env::var_os("VICTORY_FILE_PHYSICAL_DIR")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("LOCALAPPDATA")
-                    .map(|b| PathBuf::from(b).join("victory").join("physical"))
-            })
-            .or_else(|| std::env::var_os("TEMP").map(PathBuf::from))
-            .or_else(|| std::env::var_os("VICTORY_CACHE_DIR").map(PathBuf::from))
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let dir = file_physical_dir();
         if std::fs::create_dir_all(&dir).is_ok() {
             let path = dir.join(format!(
                 "victory-physical-{}-{}.bin",
@@ -2080,9 +2212,22 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
     let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
+    let title_limit = (gpu_optimal + standard).saturating_sub(TRANSFERRED.load(Ordering::Relaxed));
+    // Report the title's own physical + heap allocations rather than the
+    // process's total WDDM commit (which includes host VRAM + shadow copies):
+    // otherwise on Series S with 11-13 GB host VRAM in use, the title would
+    // believe it is >200% over its 7.6 GB console budget and evict textures.
+    let tracked = TITLE_PHYSICAL_BYTES
+        .load(Ordering::Relaxed)
+        .saturating_add(TITLE_HEAP_BYTES.load(Ordering::Relaxed));
+    let title_used = if tracked > 0 {
+        tracked.min(counters.PagefileUsage.max(tracked)).min(title_limit)
+    } else {
+        counters.PagefileUsage.min(title_limit)
+    };
     let stats = WorkingSet {
-        title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
-        title_used: counters.PagefileUsage,
+        title_limit,
+        title_used,
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };

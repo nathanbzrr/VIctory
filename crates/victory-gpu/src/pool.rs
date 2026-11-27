@@ -54,10 +54,11 @@ pub(crate) fn reclaim_on() -> bool {
 pub(crate) fn room(memory: Option<[u64; 4]>, host_pressure: bool) {
     let residency = crate::residency::on();
     let keep_textures = crate::host::keep_freed() && !(residency && host_pressure);
-    let limit = spares(memory, keep_textures);
+    let policy = crate::residency::vram_policy();
+    let limit = spares_for(memory, keep_textures, policy.pool_reclaim_percent, policy.pool_spare_kept);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
-    if (residency || (reclaim_on() && limit < SPARE_KEPT))
+    if (residency || (reclaim_on() && limit < policy.pool_spare_kept))
         && let Ok(mut pool) = TEXTURES.try_lock()
     {
         pool.reclaim(tick, limit, true);
@@ -80,11 +81,18 @@ fn staging_spares(limit: usize, host_pressure: bool, critical_commit: bool) -> u
     }
 }
 
-fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
+fn spares_for(memory: Option<[u64; 4]>, keep: bool, reclaim_pct: u64, spare_kept: usize) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * u128::from(reclaim_pct) => {
+            spare_kept.min(SPARE_KEPT)
+        }
         _ => SPARE,
     }
+}
+
+#[cfg(test)]
+fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
+    spares_for(memory, keep, 85, SPARE_KEPT)
 }
 
 /// Milliseconds until a piece given back is used again. (It was three
@@ -428,9 +436,7 @@ fn staging_bar() -> bool {
 fn staging_nonlocal_cap_bytes(shared_budget: u64) -> u64 {
     static OVERRIDE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     if let Some(bytes) = *OVERRIDE.get_or_init(|| {
-        std::env::var("VICTORY_STAGING_MAX_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
+        crate::residency::env_override_u64("VICTORY_STAGING_MAX_MB")
             .filter(|&mb| mb > 0)
             .map(|mb| mb << 20)
     }) {
@@ -438,7 +444,8 @@ fn staging_nonlocal_cap_bytes(shared_budget: u64) -> u64 {
     }
     const EIGHT_HALF_GIB: u64 = (8 << 30) + (512 << 20);
     if shared_budget > 0 && shared_budget <= EIGHT_HALF_GIB {
-        512 << 20
+        let cap_mb = crate::residency::vram_policy().staging_nonlocal_cap_mb;
+        if cap_mb == u64::MAX { 512 << 20 } else { cap_mb << 20 }
     } else {
         u64::MAX
     }
@@ -469,7 +476,9 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         // staging takes none of the PC's memory; else the PC's, as before.
         let on_card = staging_bar()
             && host.mapped_card_memory()
-            && vmem.is_none_or(|[budget, used, ..]| used + BLOCK <= budget / 100 * 85);
+            && vmem.is_none_or(|[budget, used, ..]| {
+                used + BLOCK <= budget / 100 * crate::residency::vram_policy().pool_reclaim_percent
+            });
         if let Some((buffer, data)) = on_card.then(|| host.mapped_card_buffer(BLOCK, false)).flatten() {
             crate::host::name(&buffer, || "staging of textures (a BAR block)".into());
             return Some(Upload(buffer, data));

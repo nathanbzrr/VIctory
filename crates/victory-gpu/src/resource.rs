@@ -439,6 +439,31 @@ pub(crate) fn twin_plane_resource<'a>(
         .map(|p| unsafe { &*std::ptr::from_ref(&p.texture) })
 }
 
+/// Shared scratch buffers for depth-stencil twin copies, one per power-of-two
+/// size class (upstream #2162): avoids allocating a dedicated VRAM copy buffer
+/// for each of the 35+ depth twins. Safe because every twin copy starts in
+/// `COMMON` and returns the buffer to `COMMON` on the single direct queue.
+#[cfg(windows)]
+fn shared_twin_scratch(
+    host: &crate::host::Host,
+    size: u64,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+    struct Pool(Vec<(u64, ID3D12Resource)>);
+    // SAFETY: D3D12 resources are free-threaded.
+    unsafe impl Send for Pool {}
+    static SCRATCH: std::sync::Mutex<Pool> = std::sync::Mutex::new(Pool(Vec::new()));
+    let class = size.max(1 << 16).next_power_of_two();
+    let mut pool = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, buffer)) = pool.0.iter().find(|(c, _)| *c == class) {
+        return Some(buffer.clone());
+    }
+    let buffer = host.uav_buffer(class)?;
+    crate::host::name(&buffer, || format!("depth twin shared scratch {class:#x}"));
+    pool.0.push((class, buffer.clone()));
+    Some(buffer)
+}
+
 /// The colour twin for a texture described by `desc` whose host copy is
 /// `depth`, if the title asks for depth and unordered access both and the
 /// host can copy between the two: the same size, mips and slices in the
@@ -540,7 +565,7 @@ fn twin_texture(
                 Some(&mut bytes),
             );
         }
-        let Some(buffer) = host.uav_buffer(bytes) else {
+        let Some(buffer) = shared_twin_scratch(host, bytes) else {
             TWINS[1].fetch_add(1, Relaxed);
             return None;
         };
@@ -1296,9 +1321,10 @@ fn video_memory_percent() -> u64 {
 }
 
 /// How many of a streamed placed 2D texture's largest mips to skip so no side
-/// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: 1024, then 512 from 92 %
-/// of the VRAM budget and 256 from 97 %, after `VIctory-vitesse` 7ada43b6).
-/// Keeps 16 GB cards from filling VRAM and stalling thousands of textures.
+/// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: 1024, then 512 from 95 %
+/// of the VRAM budget and 256 from 98 %, after `VIctory-vitesse` 7ada43b6).
+/// Keeps cards from overshooting 100 % VRAM without downscaling textures in
+/// the 90-94 % operating range.
 #[cfg(windows)]
 fn over_cap(desc: &ResourceDesc) -> u32 {
     static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1311,8 +1337,8 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
         return 0;
     }
     let max = set.unwrap_or_else(|| match video_memory_percent() {
-        0..92 => 1024,
-        92..97 => 512,
+        0..95 => 1024,
+        95..98 => 512,
         _ => 256,
     });
     let mut skip = 0u32;
@@ -1834,10 +1860,10 @@ pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+        crate::residency::env_override_u64("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
+            .unwrap_or_else(|| crate::residency::vram_policy().targets_room_mb)
+            .min(8192)
+            << 20
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
@@ -1873,10 +1899,8 @@ pub(crate) fn room_lately() -> bool {
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+        crate::residency::env_override_u64("VICTORY_TEXTURE_ROOM_PERCENT")
+            .map_or_else(|| crate::residency::vram_policy().texture_room_percent, |percent| percent.clamp(50, 97))
     })
 }
 
@@ -2151,7 +2175,7 @@ pub(crate) fn let_go_idle() {
                 let used = used.saturating_sub(crate::pool::texture_room())
                     + crate::shadow::card_room_kept()
                     + targets_room_kept();
-                crate::host::vram_keep(budget, used)
+                crate::residency::vram_keep(budget, used)
             }
             _ => (crate::host::vram_idle_ms(memory), u64::MAX),
         }

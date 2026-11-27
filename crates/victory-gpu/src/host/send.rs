@@ -118,20 +118,24 @@ unsafe impl Send for Memory {}
 /// What submissions that have run gave back.
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
-/// At most this much is kept: 768 MiB, or 256 MiB of the card's memory with
-/// [`on_card`]. `VICTORY_SEND_SPARE_MB` sets it instead (`0`: none kept, all
-/// is freed when its submission has run).
+/// At most this much is kept: 128 MiB on tight-RAM hosts (enough for two
+/// 64 MiB in-flight upload buffers without per-frame CreateCommittedResource
+/// thrashing), 768 MiB otherwise, or 256 MiB of the card's memory with
+/// [`on_card`]. `VICTORY_SEND_SPARE_MB` overrides it (`0`: none kept; `auto`
+/// or unset uses the scaled default).
 fn kept() -> u64 {
     static ASKED: OnceLock<Option<u64>> = OnceLock::new();
-    let asked = *ASKED.get_or_init(|| {
-        std::env::var("VICTORY_SEND_SPARE_MB")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-    });
-    kept_for(asked, on_card())
+    let asked = *ASKED.get_or_init(|| crate::residency::env_override_u64("VICTORY_SEND_SPARE_MB"));
+    match asked {
+        Some(mb) => mb.saturating_mul(1 << 20),
+        None if on_card() => 256 << 20,
+        None if crate::residency::limited_host_ram() => 128 << 20,
+        None => 768 << 20,
+    }
 }
 
 /// [`kept`] for a limit asked in MiB and [`on_card`].
+#[cfg(test)]
 fn kept_for(asked_mb: Option<u64>, card: bool) -> u64 {
     match asked_mb {
         Some(mb) => mb.saturating_mul(1 << 20),
@@ -152,6 +156,9 @@ fn on_card() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_BAR").is_some_and(|v| v == "1"))
 }
 
+static ALLOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIRECT_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 fn memory(host: &Host, size: u64) -> Option<Memory> {
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
@@ -168,6 +175,7 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
         Some(made) => made,
         None => host.upload_buffer(size)?,
     };
+    ALLOCS.fetch_add(1, Ordering::Relaxed);
     name(&buffer, || "bytes a submission sends up".into());
     Some(Memory {
         buffer,
@@ -187,7 +195,22 @@ pub(super) fn give_back(memory: Memory) {
 }
 
 pub(super) fn trim() {
-    let dropped = std::mem::take(&mut *SPARE.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    if crate::residency::critical_commit() {
+        let dropped = std::mem::take(&mut *spare);
+        drop(dropped);
+        return;
+    }
+    // Under moderate host pressure, keep up to 64 MiB of warm upload ring
+    // buffers so active frames do not thrash `CreateCommittedResource` 100+
+    // times every 15 seconds.
+    const WARM_CAP: u64 = 64 << 20;
+    spare.sort_by_key(|m| std::cmp::Reverse(m.size));
+    let mut dropped = Vec::new();
+    while spare.iter().map(|m| m.size).sum::<u64>() > WARM_CAP {
+        dropped.push(spare.remove(0));
+    }
+    drop(spare);
     drop(dropped);
 }
 
@@ -213,8 +236,9 @@ pub(super) struct Own {
 /// Runs whose pairs are one piece of work.
 const RUNS_AT_A_TIME: usize = 4096;
 
-/// Source, ranges and byte offset of their pairs in the submission memory.
-type PairWork<'a> = (usize, &'a [(usize, usize)], u64);
+/// Source, ranges, byte offset of their pairs in the submission memory, and
+/// whether `from` is direct title memory (requiring SEH-safe `copy_mapped`).
+type PairWork<'a> = (usize, &'a [(usize, usize)], u64, bool);
 
 /// Plan the long runs and short-word chunks in a single pass. Pair offsets
 /// are relative to the start of this copy's pair area until its long runs
@@ -222,6 +246,7 @@ type PairWork<'a> = (usize, &'a [(usize, usize)], u64);
 /// followed by the aligned pair area.
 fn plan_copy<'a>(
     from: usize,
+    direct: bool,
     ranges: &'a [(usize, usize)],
     at: &mut u64,
     work: &mut Vec<PairWork<'a>>,
@@ -241,18 +266,19 @@ fn plan_copy<'a>(
             }
         }
         if words > before {
-            work.push((from, chunk, before as u64 * 8));
+            work.push((from, chunk, before as u64 * 8, direct));
         }
     }
     let pairs = (*at, words as u32);
-    for (_, _, to) in &mut work[first_work..] {
+    for (_, _, to, _) in &mut work[first_work..] {
         *to += *at;
     }
     *at += (words as u64 * 8).next_multiple_of(16);
     Copy { runs, pairs }
 }
 
-/// Takes what `dirty` sends up out of the CPU sides.
+/// Takes what `dirty` sends up out of the CPU sides (or safely from title
+/// memory for zero-staging direct VRAM windows).
 pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
     let began = std::time::Instant::now();
     pass(host)?;
@@ -262,40 +288,116 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let mut copies = Vec::with_capacity(dirty.len());
     let mut work = Vec::new();
     for (shadow, ranges) in dirty {
-        copies.push(plan_copy(shadow.card_data() as usize, ranges, &mut at, &mut work));
+        let direct = shadow.card_direct();
+        let from = if direct { shadow.span().0 as usize } else { shadow.card_data() as usize };
+        copies.push(plan_copy(from, direct, ranges, &mut at, &mut work));
     }
     if at == 0 {
         return None;
     }
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
+    let mut direct_moves: Vec<(usize, usize, usize)> = Vec::new();
     for ((shadow, _), copy) in dirty.iter().zip(&copies) {
-        let from = shadow.card_data() as usize;
-        moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
+        if shadow.card_direct() {
+            let from = shadow.span().0 as usize;
+            direct_moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
+        } else {
+            let from = shadow.card_data() as usize;
+            moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
+        }
     }
     let one = |i: usize| {
-        let (from, ranges, to) = work[i];
+        let (from, ranges, to, direct) = work[i];
         let mut to = (memory.data + to as usize) as *mut [u32; 2];
+        let mut scratch = [0u8; SHORT];
         for &(a, b) in ranges.iter().filter(|&&(a, b)| short(a, b - a)) {
-            for offset in (a..b).step_by(4) {
-                // SAFETY: inside the copy's mapping (its CPU side, which
-                // the thread that asked, and waits, alone writes in these
-                // ranges) and inside the memory, which has room for every
-                // pair, a piece of work's behind the last one's.
-                unsafe {
-                    let word = ((from + offset) as *const u32).read_unaligned();
-                    to.write([offset as u32, word]);
-                    to = to.add(1);
+            if direct {
+                let len = b - a;
+                crate::host::copy_mapped(scratch.as_mut_ptr(), (from + a) as *const u8, len, false);
+                for (k, chunk) in scratch[..len].chunks_exact(4).enumerate() {
+                    let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    // SAFETY: inside `memory`, room reserved by `plan_copy`.
+                    unsafe {
+                        to.write([(a + k * 4) as u32, word]);
+                        to = to.add(1);
+                    }
+                }
+            } else {
+                for offset in (a..b).step_by(4) {
+                    // SAFETY: inside the copy's mapping (its CPU side, which
+                    // the thread that asked, and waits, alone writes in these
+                    // ranges) and inside the memory, which has room for every
+                    // pair, a piece of work's behind the last one's.
+                    unsafe {
+                        let word = ((from + offset) as *const u32).read_unaligned();
+                        to.write([offset as u32, word]);
+                        to = to.add(1);
+                    }
                 }
             }
         }
     };
     crate::land::each_under(work.len(), &one);
-    STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
-    STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
+    let total_moved: u64 = moves.iter().chain(&direct_moves).map(|m| m.2 as u64).sum();
+    STATS[0].fetch_add(total_moved, Ordering::Relaxed);
+    STATS[1].fetch_add((moves.len() + direct_moves.len()) as u64, Ordering::Relaxed);
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
-    crate::shadow::copy_all(moves);
-    STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    if !moves.is_empty() {
+        crate::shadow::copy_all(moves);
+    }
+    let direct_total: u64 = direct_moves.iter().map(|m| m.2 as u64).sum();
+    if !direct_moves.is_empty() {
+        const CHUNK: usize = 256 << 10;
+        let direct_bytes = direct_total as usize;
+        if direct_bytes >= CHUNK {
+            let mut parts: Vec<(usize, usize, usize)> = Vec::with_capacity(direct_moves.len() + direct_bytes / CHUNK);
+            for (src, dst, len) in direct_moves {
+                let mut off = 0;
+                while off < len {
+                    let n = (len - off).min(CHUNK);
+                    parts.push((src + off, dst + off, n));
+                    off += n;
+                }
+            }
+            if parts.len() > 1 {
+                crate::land::each_under(parts.len(), &|i| {
+                    let (src, dst, len) = parts[i];
+                    crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                });
+            } else if let Some(&(src, dst, len)) = parts.first() {
+                crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+            }
+        } else {
+            for (src, dst, len) in direct_moves {
+                crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+            }
+        }
+    }
+    let elapsed_us = began.elapsed().as_micros() as u64;
+    STATS[3].fetch_add(elapsed_us, Ordering::Relaxed);
+    DIRECT_STATS[0].fetch_add(direct_total, Ordering::Relaxed);
+    DIRECT_STATS[1].fetch_add(total_moved, Ordering::Relaxed);
+    DIRECT_STATS[2].fetch_add(elapsed_us, Ordering::Relaxed);
+    static LAST_SEND_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let prev = LAST_SEND_LOG.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) >= 15_000
+        && LAST_SEND_LOG.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+    {
+        let d_mb = DIRECT_STATS[0].swap(0, Ordering::Relaxed) >> 20;
+        let t_mb = DIRECT_STATS[1].swap(0, Ordering::Relaxed) >> 20;
+        let ms = DIRECT_STATS[2].swap(0, Ordering::Relaxed) / 1000;
+        let allocs = ALLOCS.swap(0, Ordering::Relaxed);
+        tracing::debug!(
+            direct_mb = d_mb,
+            total_mb = t_mb,
+            take_ms = ms,
+            send_allocs = allocs,
+            kept_mb = kept() >> 20,
+            "send::take 15s summary"
+        );
+    }
     Some(Own { memory, copies, used: at })
 }
 
@@ -419,7 +521,7 @@ mod tests {
             let words = chunk.iter().filter(|&&(a, b)| short(a, b - a))
                 .map(|&(a, b)| (b - a) / 4).sum::<usize>();
             if words != 0 {
-                work.push((from, chunk, to));
+                work.push((from, chunk, to, false));
                 to += words as u64 * 8;
             }
         }
@@ -448,7 +550,7 @@ mod tests {
         let (mut old_work, mut new_work) = (Vec::new(), Vec::new());
         for (i, ranges) in cases.into_iter().enumerate() {
             let old = reference(i, ranges, &mut old_at, &mut old_work);
-            let new = plan_copy(i, ranges, &mut new_at, &mut new_work);
+            let new = plan_copy(i, false, ranges, &mut new_at, &mut new_work);
             assert_eq!(new.runs, old.runs);
             assert_eq!(new.pairs, old.pairs);
             assert_eq!(new_at, old_at);

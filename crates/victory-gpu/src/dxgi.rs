@@ -85,6 +85,72 @@ pub(crate) fn device() -> This {
     &DEVICE
 }
 
+/// Host DXGI adapter memory snapshot combining static `DedicatedVideoMemory`
+/// (`DXGI_ADAPTER_DESC1`) with live WDDM local & shared budgets/usage
+/// (`DXGI_QUERY_VIDEO_MEMORY_INFO`).
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HostAdapterVram {
+    pub(crate) dedicated_bytes: u64,
+    pub(crate) local_budget_bytes: u64,
+    pub(crate) local_used_bytes: u64,
+    pub(crate) shared_budget_bytes: u64,
+    pub(crate) shared_used_bytes: u64,
+    /// True on integrated / UMA GPUs (`D3D12_FEATURE_ARCHITECTURE::UMA`).
+    pub(crate) is_uma: bool,
+}
+
+#[cfg(windows)]
+fn host_adapter_static_info() -> Option<(u64, bool)> {
+    use std::sync::OnceLock;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_ARCHITECTURE, D3D12_FEATURE_DATA_ARCHITECTURE,
+    };
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter3, IDXGIFactory4,
+    };
+    static INFO: OnceLock<Option<(u64, bool)>> = OnceLock::new();
+    let host = crate::host::host()?;
+    *INFO.get_or_init(|| {
+        // SAFETY: querying our live D3D12 device's architecture & adapter LUID.
+        unsafe {
+            let mut arch = D3D12_FEATURE_DATA_ARCHITECTURE::default();
+            let is_uma = host
+                .device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_ARCHITECTURE,
+                    (&raw mut arch).cast(),
+                    size_of_val(&arch) as u32,
+                )
+                .is_ok()
+                && arch.UMA.as_bool();
+            let luid = host.device.GetAdapterLuid();
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(luid).ok()?;
+            let desc = adapter.GetDesc1().ok()?;
+            Some((desc.DedicatedVideoMemory as u64, is_uma))
+        }
+    })
+}
+
+/// Queries the real host GPU adapter's dedicated VRAM, UMA status, and current
+/// DXGI local/shared memory budgets without touching `host.rs`.
+#[cfg(windows)]
+pub(crate) fn host_adapter_vram() -> Option<HostAdapterVram> {
+    let host = crate::host::host()?;
+    let [local_budget_bytes, local_used_bytes, shared_budget_bytes, shared_used_bytes] =
+        host.video_memory()?;
+    let (dedicated_bytes, is_uma) = host_adapter_static_info().unwrap_or((local_budget_bytes, false));
+    Some(HostAdapterVram {
+        dedicated_bytes,
+        local_budget_bytes,
+        local_used_bytes,
+        shared_budget_bytes,
+        shared_used_bytes,
+        is_uma,
+    })
+}
+
 /// `found` if `iid` is one of `known`.
 fn query(kind: usize, iid: *const Iid, known: &[Iid], found: This, out: *mut This) -> HRESULT {
     object::answer(kind, iid, object::is(iid, known).then_some(found), out)
