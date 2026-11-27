@@ -95,7 +95,8 @@ struct Adopted {
     start: u64,
     count: usize,
     slots: &'static [AtomicU8],
-    chunks: &'static [AtomicU8],
+    slots_words: &'static [AtomicU64],
+    chunks_words: &'static [AtomicU64],
     writers: &'static [AtomicUsize],
 }
 
@@ -114,18 +115,28 @@ fn adopt_now(start: u64, count: u32) -> bool {
         return false;
     }
     let count = count as usize;
-    let leak = |n: usize| -> &'static [AtomicU8] { Box::leak((0..n).map(|_| AtomicU8::new(0)).collect()) };
+    let chunks_len = count.div_ceil(CHUNK);
+    // Back both byte maps with 8-byte-aligned AtomicU64 arrays so `take()`
+    // can scan and clear 8 bytes per atomic op while patched stores keep
+    // writing individual bytes into the same memory.
+    let leak_words = |bytes: usize| -> (&'static [AtomicU8], &'static [AtomicU64]) {
+        let words: &'static [AtomicU64] = Box::leak((0..bytes.div_ceil(8)).map(|_| AtomicU64::new(0)).collect());
+        // SAFETY: `AtomicU64` has size 8 and alignment 8; `AtomicU8` has size 1
+        // and alignment 1. The leaked slice has at least `bytes` valid zeroed bytes.
+        let as_bytes = unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<AtomicU8>(), bytes) };
+        (as_bytes, words)
+    };
     // (Never freed: a store of the title's may be marking while the heap
     // goes; a few MB at most.)
-    let slots = leak(count);
-    let chunks = leak(count.div_ceil(CHUNK));
+    let (slots, slots_words) = leak_words(count);
+    let (chunks, chunks_words) = leak_words(chunks_len);
     let writers: &'static [AtomicUsize] = Box::leak((0..(count * 32).div_ceil(1 << 16)).map(|_| AtomicUsize::new(0)).collect());
     MARKS.slots.store(slots.as_ptr().cast_mut(), Release);
     MARKS.chunks.store(chunks.as_ptr().cast_mut(), Release);
     MARKS.start.store(start, Release);
     // Last: a store that sees a length sees the rest.
     MARKS.len.store(count as u64 * 32, Release);
-    *adopted = Some(Adopted { start, count, slots, chunks, writers });
+    *adopted = Some(Adopted { start, count, slots, slots_words, chunks_words, writers });
     tracing::info!(
         start = format_args!("{start:#x}"),
         count,
@@ -182,24 +193,45 @@ pub(crate) fn take(start: u64) -> Option<Vec<(u32, u32)>> {
     let began = std::time::Instant::now();
     let adopted = ADOPTED.read().unwrap_or_else(|e| e.into_inner());
     let a = adopted.as_ref().filter(|a| a.start == start)?;
-    let mut runs: Vec<(u32, u32)> = Vec::new();
+    let mut runs: Vec<(u32, u32)> = Vec::with_capacity(256);
     let mut n = 0u64;
-    for (c, chunk) in a.chunks.iter().enumerate() {
-        if chunk.load(Relaxed) == 0 {
+    let total_chunks = a.count.div_ceil(CHUNK);
+    const WORDS_PER_CHUNK: usize = CHUNK / 8;
+    for (cw_idx, cw_atomic) in a.chunks_words.iter().enumerate() {
+        if cw_atomic.load(Relaxed) == 0 {
             continue;
         }
         // Cleared before its slots are read: a mark set meanwhile sets it again.
-        chunk.swap(0, AcqRel);
-        let first = c * CHUNK;
-        for (i, slot) in a.slots[first..(first + CHUNK).min(a.count)].iter().enumerate() {
-            if slot.load(Relaxed) == 0 || slot.swap(0, AcqRel) == 0 {
-                continue;
+        let mut cw = cw_atomic.swap(0, AcqRel);
+        while cw != 0 {
+            let byte_off = (cw.trailing_zeros() >> 3) as usize;
+            cw &= !(0xffu64 << (byte_off * 8));
+            let c = cw_idx * 8 + byte_off;
+            if c >= total_chunks {
+                break;
             }
-            let index = (first + i) as u32;
-            n += 1;
-            match runs.last_mut() {
-                Some((at, len)) if *at + *len == index => *len += 1,
-                _ => runs.push((index, 1)),
+            let w_start = c * WORDS_PER_CHUNK;
+            let w_end = (w_start + WORDS_PER_CHUNK).min(a.slots_words.len());
+            for (wi, sw_atomic) in a.slots_words[w_start..w_end].iter().enumerate() {
+                if sw_atomic.load(Relaxed) == 0 {
+                    continue;
+                }
+                let mut sw = sw_atomic.swap(0, AcqRel);
+                let word_base = (w_start + wi) * 8;
+                while sw != 0 {
+                    let b = (sw.trailing_zeros() >> 3) as usize;
+                    sw &= !(0xffu64 << (b * 8));
+                    let slot_idx = word_base + b;
+                    if slot_idx >= a.count {
+                        break;
+                    }
+                    let index = slot_idx as u32;
+                    n += 1;
+                    match runs.last_mut() {
+                        Some((at, len)) if *at + *len == index => *len += 1,
+                        _ => runs.push((index, 1)),
+                    }
+                }
             }
         }
     }
@@ -488,9 +520,15 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
     let len = MARKS.len.load(Acquire);
     if len != 0 && n >= 4 {
         let start = MARKS.start.load(Relaxed);
-        let (lo, hi) = ((to as u64).max(start), (to as u64 + n as u64).min(start + len));
-        if lo < hi {
+        let to_u64 = to as u64;
+        let end_u64 = to_u64.saturating_add(n as u64);
+        let heap_end = start + len;
+        if to_u64 < heap_end && end_u64 > start {
+            let lo = to_u64.max(start);
+            let hi = end_u64.min(heap_end);
             COPIES[0].fetch_add(1, Relaxed);
+            let slots_ptr = MARKS.slots.load(Relaxed);
+            let chunks_ptr = MARKS.chunks.load(Relaxed);
             // Each slot whose first word now lies in the copy and is a view's.
             let mut slot = (lo - start).div_ceil(32);
             let mut marked = 0;
@@ -498,25 +536,22 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
                 let at = start + slot * 32;
                 // SAFETY: just written by the copy, inside the heap.
                 if unsafe { (at as *const u32).read_unaligned() } == crate::descriptor::VIEW_TAG {
-                    mark_slot(slot as usize);
+                    let s = slot as usize;
+                    // SAFETY: the maps are leaked, as long as the length says.
+                    unsafe {
+                        (*slots_ptr.add(s)).store(1, Release);
+                        (*chunks_ptr.add(s / CHUNK)).store(1, Release);
+                    }
                     marked += 1;
                 }
                 slot += 1;
             }
-            COPIES[1].fetch_add(marked, Relaxed);
+            if marked > 0 {
+                COPIES[1].fetch_add(marked, Relaxed);
+            }
         }
     }
     out
-}
-
-/// Marks slot `slot` of the marked heap (in it: checked by the caller).
-#[inline]
-fn mark_slot(slot: usize) {
-    // SAFETY: the maps are leaked, as long as the length says.
-    unsafe {
-        (*MARKS.slots.load(Relaxed).add(slot)).store(1, Release);
-        (*MARKS.chunks.load(Relaxed).add(slot / CHUNK)).store(1, Release);
-    }
 }
 
 /// Our own calls' marks since the last line.
@@ -626,15 +661,21 @@ mod tests {
             let a = ADOPTED.read().unwrap();
             let a = a.as_ref().unwrap();
             a.slots[slot].store(1, Release);
-            a.chunks[slot / CHUNK].store(1, Release);
+            // SAFETY: chunks_words backs the chunks byte array with sufficient length.
+            let chunks = unsafe {
+                std::slice::from_raw_parts(a.chunks_words.as_ptr().cast::<AtomicU8>(), a.count.div_ceil(CHUNK))
+            };
+            chunks[slot / CHUNK].store(1, Release);
         };
         store(5);
         mark(start + 6 * 32 + 7);
+        mark(start + 7 * 32);
+        mark(start + 8 * 32);
         mark(start + 300 * 32);
         store(999);
         mark(start - 32);
         mark(start + 1000 * 32);
-        assert_eq!(take(start).unwrap(), [(5, 2), (300, 1), (999, 1)]);
+        assert_eq!(take(start).unwrap(), [(5, 4), (300, 1), (999, 1)]);
         assert_eq!(take(start).unwrap(), []);
         assert!(take(start + 32).is_none());
         let_go(start);

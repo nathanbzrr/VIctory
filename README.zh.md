@@ -21,6 +21,8 @@
 | CPU `preparing` 耗时 | 45.8 ms | **32.2 – 35.4 ms** |
 | 真实帧时间（最低 / 中位） | 68.6 / 73.1 ms | **64.3 / 66.2 – 69.6 ms** |
 | 原生 FPS（关闭 FG） | ~13.7 FPS | **14.5 – 15.5 FPS** |
+| `heap buffers` 通道（峰值 / >50 ms 卡顿） | 821.1 ms（8 次 >50 ms） | **33.8 ms（0 次 >50 ms；稳态 8.6–10.0 ms）** |
+| `settle` 等待与 `take()` 耗时（稳态无 FG） | 0.2–2.6 ms settle / 0.75–1.07 ms `take()` | **0.0 ms settle / 0.31–0.47 ms `take()`** |
 | 显示 FPS（FSR 3.1.6 FG） | 25–27 FPS（VSync 掉至 15–20） | **29.2 – 31.0 FPS**（无 VSync 阶梯） |
 | 帧生成 HUD / 字幕 | 重影与扭曲 | 无鬼影（`HUDLessColor` 3 槽 RGBA8） |
 | Windows 10 D3D12 | 需手动配置 Agility SDK | 内置 `D3D12Core.dll`（Agility SDK 620） |
@@ -30,6 +32,7 @@
 - **内存与 OOM 防护 (`0x8007000E`)：** 全局有界 prelude 池 `(64, 16)`；命令列表与分配器即时回收 (`recycle_landed`) 与延迟资源释放 (`bury_lag`)；`make_list()` / `record_prelude()` 遇 `E_OUTOFMEMORY` 自动回收重试；`NON_LOCAL` 高水位节流（`92%`，`-10%` 迟滞）；可选 NVMe 文件映射物理页（`FILE_FLAG_DELETE_ON_CLOSE` 位于 `%LOCALAPPDATA%\victory\physical`，加载期保留 >11 GB 提交余量）。
 - **呈现与帧生成：** UI 合成前 3 槽 RGBA8 `HUDLessColor` 捕获；三缓冲撕裂交换链（`DXGI_PRESENT_ALLOW_TEARING`）；原生 AMD FSR 4.1.2 ML 超分（旧卡自动回落 FSR 3.1）。
 - **CPU 提交与回读优化：** write-combined 着色器写入保留在显存（`27 -> 0.5 MB/帧`）；128 字节 AVX2 `vptest` 快速跳过与向量化 `merge_piece`；无锁 work-stealing `land` 线程池；64 字节对齐 write-watch 分片；单遍融合 `ask_once`/`stale_under_flights`；无锁描述符 `mirror`；`OnceLock` 命令签名；栈分配 `Few<Barrier, 16>`；64 分片 `PLACED_TEXTURES`；`unfold` 解锁与无锁 `wake()`；锁外 `upload::ARENAS` 清零；6 核辅助线程优先级提升；thin 预规划；detile 前哈希校验；上传缓冲复用。
+- **原生帧步调与卡顿消除（无 FG）：** 异步增量 `sweep()`（`victory-sweep`，`VICTORY_SWEEP_ASYNC=1`）移除每 1.5 秒的同步 `settle(WHY_SYNC)` 停顿；节流后台 `bury()` 回收线程（`victory-bury`，`VICTORY_BURY_ASYNC=1`）；relay 下基于 `Line.seq` 的无锁 `WHY_FENCE`/`WHY_VALUE` 等待；`execute_own` 呈现跳过冗余 `sync_heaps`（`0.0` 无标记轮次）；`port_descriptors::take()` 64 位 `AtomicU64` 扫描（提速 2–3×）；高精度 `frame::wait` 避免 `Sleep(0)` 让出；内置逐帧 `present pacing` 遥测（`avg / p50 / p95 / p99 / 1% low / max / >50 ms / >100 ms`，`VICTORY_FRAME_TIMES_FILE`）与平坦化 `heap buffers`（`VICTORY_TEXTURE_STAGE_MS=4`，`VICTORY_TEXTURE_CATCHUP=0`，0 次 >50 ms 尖峰）。
 - **修复与输入：** 5000 ms compute 管线等待预算修复人物面部缺失；RDNA4 崩溃着色器屏蔽（`240cb516c1af0bc3`）；紫色异常探针过滤；安全异步描述符翻转；纹理 detile 失败重试；PC 键鼠控制（`F2`/`~` 鼠标视角，`F3` FPS 面板）。
 
 ## 当前已知限制（`dev` 分支正在处理）

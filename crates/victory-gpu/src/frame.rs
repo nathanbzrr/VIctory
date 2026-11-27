@@ -153,6 +153,23 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     )
 }
 
+/// Precision wait: sleeps coarse OS ticks until ~1.5 ms before the deadline,
+/// then spins the short tail so Windows timer granularity never adds +1..15 ms
+/// pacing jitter.
+#[inline]
+fn sleep_precise(dur: Duration) {
+    const SPIN_TAIL: Duration = Duration::from_micros(1_500);
+    let target = Instant::now() + dur;
+    if let Some(coarse) = dur.checked_sub(SPIN_TAIL)
+        && !coarse.is_zero()
+    {
+        std::thread::sleep(coarse);
+    }
+    while Instant::now() < target {
+        std::hint::spin_loop();
+    }
+}
+
 /// Device method: blocks until the next tick (or the time-out); an origin
 /// wait then hands out the new frame's token. Other events keep the token
 /// the title passes. Ticks are absolute (start plus whole intervals), so
@@ -184,11 +201,13 @@ pub(crate) extern "system" fn wait(
     }
     let _called = crate::timeline::span("the title's frame wait");
     let hr = if wait > limit {
-        std::thread::sleep(limit);
+        if !limit.is_zero() {
+            sleep_precise(limit);
+        }
         TIMEOUT
     } else {
         if !wait.is_zero() {
-            std::thread::sleep(wait);
+            sleep_precise(wait);
         }
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK

@@ -583,9 +583,53 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
-/// Once a second, before a submission starts: lets go of what nothing
-/// names any more (copies of windows of title memory, staging buffers,
-/// host copies of textures the title fills).
+/// Whether periodic sweeps run asynchronously on a low-priority background
+/// thread without stalling the submitting thread or draining flights in the air
+/// (`VICTORY_SWEEP_ASYNC=0` reverts to synchronous settle + sweep).
+fn sweep_async() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !upcheck::on() && std::env::var_os("VICTORY_SWEEP_ASYNC").is_none_or(|v| v != "0")
+    })
+}
+
+/// Wakes the background sweep thread without blocking the submitting thread.
+fn schedule_sweep_async() {
+    static WAKE: OnceLock<(Mutex<bool>, std::sync::Condvar)> = OnceLock::new();
+    let pair = WAKE.get_or_init(|| {
+        let pair = (Mutex::new(false), std::sync::Condvar::new());
+        let _ = std::thread::Builder::new()
+            .name("victory-sweep".into())
+            .spawn(|| {
+                use windows_sys::Win32::System::Threading::{
+                    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+                };
+                // SAFETY: sets only this background worker's priority.
+                unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+                let Some((lock, cv)) = WAKE.get() else {
+                    return;
+                };
+                loop {
+                    let mut due = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    while !*due {
+                        due = cv.wait(due).unwrap_or_else(|e| e.into_inner());
+                    }
+                    *due = false;
+                    drop(due);
+                    let _ = std::panic::catch_unwind(sweep);
+                }
+            });
+        pair
+    });
+    if let Ok(mut due) = pair.0.try_lock() {
+        *due = true;
+        pair.1.notify_one();
+    }
+}
+
+/// Once a second, before a submission starts (or asynchronously on
+/// `victory-sweep`): lets go of what nothing names any more (copies of windows
+/// of title memory, staging buffers, host copies of textures the title fills).
 /// `VICTORY_SWEEP=0` keeps everything, as before.
 fn sweep() {
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
@@ -641,10 +685,23 @@ fn sweep() {
             "gpu memory heartbeat"
         );
     }
+    let incremental = sweep_async() && !host_pressure;
     crate::pool::room(mem, host_pressure);
+    if incremental {
+        std::thread::yield_now();
+    }
     crate::pipeline::trim_library();
+    if incremental {
+        std::thread::yield_now();
+    }
     crate::shadow::let_go_idle();
+    if incremental {
+        std::thread::yield_now();
+    }
     crate::texture::let_go_idle();
+    if incremental {
+        std::thread::yield_now();
+    }
     crate::resource::let_go_idle();
 }
 
@@ -696,10 +753,15 @@ fn bury_lag() -> u64 {
     })
 }
 
-/// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
-/// numbers come in order, but for threads that overtake each other: one of
-/// those is dropped a little later than it could be.
-fn bury(finished: u64) {
+/// Whether retired D3D12 resources are dropped asynchronously on a background
+/// reaper thread (`VICTORY_BURY_ASYNC=0` drops them inline on `victory-relay`).
+fn bury_async() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BURY_ASYNC").is_none_or(|v| v != "0"))
+}
+
+/// Drops what waited for submissions up to `finished` ([`bury_lag`]) inline.
+fn bury_now(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
     for part in &RETIRED {
         let done: Vec<(u64, Retired)> = {
@@ -711,6 +773,69 @@ fn bury(finished: u64) {
             retired.drain(..n).collect()
         };
         drop(done);
+    }
+}
+
+/// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
+/// numbers come in order, but for threads that overtake each other: one of
+/// those is dropped a little later than it could be.
+fn bury(finished: u64) {
+    if !bury_async() || crate::residency::critical_commit() {
+        bury_now(finished);
+        return;
+    }
+    static TARGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static LAST_WAKE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static WAKE: OnceLock<(Mutex<u64>, std::sync::Condvar)> = OnceLock::new();
+    TARGET.fetch_max(finished, Ordering::Release);
+    // Throttle background reaper wakes to ~100 ms (~10 Hz) so we never contend
+    // with 20k/frame `retire()` calls across the 16 RETIRED shards on 6-core CPUs.
+    let now = coarse_ms();
+    let last = LAST_WAKE.load(Ordering::Relaxed);
+    if now < last + 100
+        || LAST_WAKE
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let pair = WAKE.get_or_init(|| {
+        let pair = (Mutex::new(0u64), std::sync::Condvar::new());
+        let _ = std::thread::Builder::new()
+            .name("victory-bury".into())
+            .spawn(|| {
+                use windows_sys::Win32::System::Threading::{
+                    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+                };
+                // SAFETY: sets only this background worker's priority.
+                unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+                let Some((lock, cv)) = WAKE.get() else {
+                    return;
+                };
+                let mut done_up_to = 0u64;
+                loop {
+                    let target = {
+                        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            let latest = TARGET.load(Ordering::Acquire);
+                            if latest > done_up_to {
+                                *g = latest;
+                                break latest;
+                            }
+                            g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    done_up_to = target;
+                    let _ = std::panic::catch_unwind(|| bury_now(target));
+                }
+            });
+        pair
+    });
+    if let Ok(mut g) = pair.0.try_lock()
+        && finished > *g
+    {
+        *g = finished;
+        pair.1.notify_one();
     }
 }
 
@@ -3170,6 +3295,10 @@ struct Line {
     in_hand: Vec<(usize, crate::queue::Written, usize)>,
     /// With [`card_steps`]: what the flights being landed write.
     landing: Vec<card_steps::Writer>,
+    /// Monotonic count of `Late` items pushed into `line`, and count fully
+    /// landed (for unlocked `settle_now(WHY_FENCE | WHY_VALUE)` under `relay`).
+    seq: u64,
+    landed_seq: u64,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and host lists nothing records
@@ -3186,6 +3315,8 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     landed: Vec::new(),
     in_hand: Vec::new(),
     landing: Vec::new(),
+    seq: 0,
+    landed_seq: 0,
 });
 /// Told when a flight joins [`LINE`] or it is poked.
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
@@ -3672,6 +3803,7 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
         return false;
     }
     line.line.push(Late::Signal(fence, value));
+    line.seq += 1;
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
     drop(line);
     // A signal alone (behind a settle under way) has no flight to wake
@@ -3735,6 +3867,20 @@ pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> Option<bool> {
 /// `why` (one of the `WHY_` places). Not from inside a submission.
 pub(crate) fn settle_now(why: usize) {
     if !late() {
+        return;
+    }
+    if relay() && matches!(why, WHY_FENCE | WHY_VALUE) {
+        // Under the relay, fence and memory-value waits only need items
+        // already queued up to `want` to finish landing; taking `host.submitted`
+        // here would stall `victory-submit` and starve the GPU behind it.
+        let want = {
+            let l = line();
+            if l.line.is_empty() && !l.settling {
+                return;
+            }
+            l.seq
+        };
+        relay_wait(why, |l| l.landed_seq >= want || (l.line.is_empty() && !l.settling));
         return;
     }
     let Some(host) = host() else {
@@ -4786,9 +4932,9 @@ impl Host {
         }
         let code = code.ok_or_else(windows::core::Error::empty)?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
-        // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
-        // in one submission.
-        const RESULTS: u64 = 1 << 20;
+        // Two megabytes of results: 524,288 pieces so multiple frames in flight
+        // do not hit the 50% `card_results_low()` stall threshold.
+        const RESULTS: u64 = 2 << 20;
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
@@ -5567,6 +5713,7 @@ impl Host {
         }
         // In the order given: what tells the title the card is done.
         stage.next("landing: read-backs, telling the title");
+        let landed_items = items.len() as u64;
         let mut last = 0;
         let mut landed = Vec::new();
         let mut telling = std::time::Instant::now();
@@ -5618,6 +5765,8 @@ impl Host {
                 landed: kept,
                 in_hand,
                 landing,
+                seq,
+                landed_seq,
                 ..
             } = &mut *line;
             kept.extend(landed);
@@ -5635,6 +5784,10 @@ impl Host {
                 }
             }
             join_ranges(written, ranges);
+            *landed_seq = landed_seq.saturating_add(landed_items);
+            if items.is_empty() {
+                *landed_seq = *seq;
+            }
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
@@ -5896,7 +6049,7 @@ impl Host {
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
         let most = {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, lists: flying, target, seq, .. } = &mut *line;
             join_ranges(
                 written,
                 sent.back
@@ -5906,6 +6059,7 @@ impl Host {
             );
             *flying += order.len();
             *target = *submitted;
+            let added_writes = sent.writes.len() as u64;
             items.push(Late::Run(Flight {
                 number: sent.number,
                 fence: *target,
@@ -5917,6 +6071,7 @@ impl Host {
                 texture_back_ranges: sent.texture_back_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
+            *seq += 1 + added_writes;
             *flying >= late_most()
         };
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -5952,13 +6107,15 @@ impl Host {
     /// it ran and was waited for after all.
     fn execute_own(&self, list: &HostList) -> u64 {
         late_threads();
-        let Some((submitted, sent)) = self.submit(&[list], &[], true) else {
+        // Present's own copy/compose/panel list never reads the title's placed
+        // descriptor heaps, so skip the redundant descriptor-heap sync round.
+        let Some((submitted, sent)) = self.submit_with(&[list], &[], true, false) else {
             return 0;
         };
         let number = sent.number;
         {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, lists: flying, target, seq, .. } = &mut *line;
             join_ranges(
                 written,
                 sent.back
@@ -5968,6 +6125,7 @@ impl Host {
             );
             *flying += 1;
             *target = *submitted;
+            let added_writes = sent.writes.len() as u64;
             items.push(Late::Run(Flight {
                 number,
                 fence: *target,
@@ -5979,6 +6137,7 @@ impl Host {
                 texture_back_ranges: sent.texture_back_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
+            *seq += 1 + added_writes;
         }
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         LINE_MOVED.notify_one();
@@ -6111,6 +6270,7 @@ impl Host {
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // In the order given: what tells the title the card is done.
+            let landed_items = items.len() as u64;
             let mut last = 0;
             let mut landed = Vec::new();
             for item in items {
@@ -6136,7 +6296,14 @@ impl Host {
                 FINISHED.store(last, Ordering::Release);
                 bury(last);
             }
-            line().landed.extend(landed);
+            {
+                let mut l = line();
+                l.landed_seq = l.landed_seq.saturating_add(landed_items);
+                if l.line.is_empty() {
+                    l.landed_seq = l.seq;
+                }
+                l.landed.extend(landed);
+            }
         }
         if counted {
             self.log_messages();
@@ -6194,6 +6361,16 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        self.submit_with(runs, parts, late, true)
+    }
+
+    fn submit_with<'a>(
+        &'a self,
+        runs: &[&HostList],
+        parts: &[usize],
+        late: bool,
+        sync_heaps: bool,
+    ) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -6239,10 +6416,10 @@ impl Host {
         // Renderer port #7 (from renderer patch #4): the round asked for when
         // the title submitted it, if that is known (`crate::port_journal`).
         let heaps_on = crate::port_journal::on();
-        let heaps_synced = match crate::port_journal::needed() {
+        let heaps_synced = sync_heaps.then(|| match crate::port_journal::needed() {
             0 => crate::descriptor::begin_sync_heaps(),
             mark => crate::descriptor::begin_sync_heaps_after(mark),
-        };
+        });
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {
@@ -6255,12 +6432,21 @@ impl Host {
         let parts: Vec<usize> = parts.iter().map(|&n| n + usize::from(own.is_some())).collect();
         stage.next("submit: the sweep");
         let behind = late && flying();
-        // Before this submission counts as started: what the sweep lets go
-        // of is named by no list, and nothing runs now (behind flights the
-        // sweep waits for a submission that finds none in the air: there is
-        // one at every present).
+        // Periodic sweep: by default runs asynchronously on `victory-sweep`
+        // without draining flights in the air (`VICTORY_SWEEP_ASYNC=0` or
+        // `VICTORY_UPCOPY_CHECK=1` keeps the old synchronous settle + sweep).
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if !behind {
+        if sweep_async() {
+            let now = now_ms();
+            let last = SWEPT.load(Ordering::Relaxed);
+            if now >= last + 1000
+                && SWEPT
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                schedule_sweep_async();
+            }
+        } else if !behind {
             if upcheck::on() {
                 upcheck::at_rest(self);
             }
@@ -6461,9 +6647,11 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
-        let heaps_began = std::time::Instant::now();
-        drop(heaps_synced);
-        crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
+        if let Some(heaps_synced) = heaps_synced {
+            let heaps_began = std::time::Instant::now();
+            drop(heaps_synced);
+            crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
+        }
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -9956,16 +10144,143 @@ fn meter_lines(lines: impl FnOnce() + Send + 'static) {
     }
 }
 
+/// Per-frame present-to-present stability summary (avg / p50 / p95 / p99 / 1% low / max / spikes).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FramePacingStats {
+    count: usize,
+    avg_ms: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    low1_ms: f64,
+    max_ms: f64,
+    spikes_50: usize,
+    spikes_100: usize,
+}
+
+impl FramePacingStats {
+    fn compute(samples: &[f32]) -> Option<Self> {
+        if samples.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<f64> = samples.iter().map(|&v| f64::from(v)).collect();
+        sorted.sort_unstable_by(|a, b| a.total_cmp(b));
+        let n = sorted.len();
+        let sum: f64 = sorted.iter().sum();
+        let avg_ms = sum / n as f64;
+        let pct = |p: f64| -> f64 {
+            let idx = ((p * n as f64).ceil() as usize).saturating_sub(1).min(n - 1);
+            sorted[idx]
+        };
+        let p50_ms = pct(0.50);
+        let p95_ms = pct(0.95);
+        let p99_ms = pct(0.99);
+        let max_ms = sorted[n - 1];
+        let slow_n = ((n as f64 * 0.01).ceil() as usize).max(1).min(n);
+        let low1_ms = sorted[n - slow_n..].iter().sum::<f64>() / slow_n as f64;
+        let spikes_50 = sorted.iter().filter(|&&v| v > 50.0).count();
+        let spikes_100 = sorted.iter().filter(|&&v| v > 100.0).count();
+        Some(Self {
+            count: n,
+            avg_ms,
+            p50_ms,
+            p95_ms,
+            p99_ms,
+            low1_ms,
+            max_ms,
+            spikes_50,
+            spikes_100,
+        })
+    }
+}
+
+struct FramePacing {
+    started: std::time::Instant,
+    since: std::time::Instant,
+    last: Option<std::time::Instant>,
+    last_drawn: u64,
+    samples: Vec<f32>,
+    csv: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+impl FramePacing {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        let csv = std::env::var_os("VICTORY_FRAME_TIMES_FILE")
+            .filter(|v| !v.is_empty())
+            .and_then(|path| {
+                let mut file = std::fs::File::create(path).ok()?;
+                use std::io::Write;
+                let _ = writeln!(file, "elapsed_s,dt_ms,draws");
+                Some(std::io::BufWriter::with_capacity(16 * 1024, file))
+            });
+        Self {
+            started: now,
+            since: now,
+            last: None,
+            last_drawn: crate::draw::drawn(),
+            samples: Vec::with_capacity(512),
+            csv,
+        }
+    }
+
+    fn record(&mut self) {
+        let now = std::time::Instant::now();
+        let drawn = crate::draw::drawn();
+        let draws = drawn.saturating_sub(self.last_drawn);
+        self.last_drawn = drawn;
+        if let Some(prev) = self.last.replace(now) {
+            let dt_ms = (now - prev).as_secs_f64() * 1000.0;
+            self.samples.push(dt_ms as f32);
+            if let Some(csv) = self.csv.as_mut() {
+                use std::io::Write;
+                let elapsed_s = (now - self.started).as_secs_f64();
+                let _ = writeln!(csv, "{elapsed_s:.3},{dt_ms:.3},{draws}");
+            }
+        }
+        if self.since.elapsed() >= std::time::Duration::from_secs(5) && !self.samples.is_empty() {
+            if let Some(csv) = self.csv.as_mut() {
+                use std::io::Write;
+                let _ = csv.flush();
+            }
+            self.since = now;
+            let batch = std::mem::replace(&mut self.samples, Vec::with_capacity(512));
+            meter_lines(move || {
+                if let Some(s) = FramePacingStats::compute(&batch) {
+                    let avg_fps = if s.avg_ms > 0.0 { 1000.0 / s.avg_ms } else { 0.0 };
+                    let low1_fps = if s.low1_ms > 0.0 { 1000.0 / s.low1_ms } else { 0.0 };
+                    tracing::info!(
+                        "present pacing: n={} avg={:.2} ms ({:.1} fps) p50={:.2} ms p95={:.2} ms p99={:.2} ms 1%low={:.2} ms ({:.1} fps) max={:.2} ms spikes50={} spikes100={}",
+                        s.count,
+                        s.avg_ms,
+                        avg_fps,
+                        s.p50_ms,
+                        s.p95_ms,
+                        s.p99_ms,
+                        s.low1_ms,
+                        low1_fps,
+                        s.max_ms,
+                        s.spikes_50,
+                        s.spikes_100,
+                    );
+                }
+            });
+        }
+    }
+}
+
 struct Meter {
     last_present: windows::core::HRESULT,
     since: std::time::Instant,
     frames: u32,
+    occluded_frames: u32,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    pacing: FramePacing,
 }
 
 impl Meter {
@@ -9975,11 +10290,29 @@ impl Meter {
             last_present: windows::Win32::Foundation::S_OK,
             since: now,
             frames: 0,
+            occluded_frames: 0,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            pacing: FramePacing::new(),
+        }
+    }
+
+    /// Records a frame whose swap chain returned `DXGI_STATUS_OCCLUDED` so
+    /// per-frame pacing and periodic telemetry stay alive even when the display
+    /// is asleep or occluded (without changing `record_present` semantics).
+    fn record_occluded(&mut self, hwnd: HWND) {
+        self.pacing.record();
+        self.occluded_frames += 1;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.copy_stats_frames += 1;
+        }
+        if self.since.elapsed() >= std::time::Duration::from_secs(1) {
+            let count = std::mem::take(&mut self.occluded_frames);
+            self.emit_window(hwnd, count, false);
         }
     }
 
@@ -9998,6 +10331,7 @@ impl Meter {
         if status != S_OK {
             return false;
         }
+        self.pacing.record();
         self.frame(hwnd);
         true
     }
@@ -10017,12 +10351,19 @@ impl Meter {
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
+        let count = std::mem::take(&mut self.frames);
+        self.occluded_frames = 0;
+        self.emit_window(hwnd, count, true);
+    }
+
+    fn emit_window(&mut self, hwnd: HWND, count: u32, update_caption: bool) {
+        let elapsed = self.since.elapsed();
         let drawn = crate::draw::drawn();
-        let frames = f64::from(self.frames);
+        let frames = f64::from(count.max(1));
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
-        (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        (self.since, self.drawn) = (std::time::Instant::now(), drawn);
         // The lines (every second, and more every 5 s: sorting, system
         // calls, some forty lines written) are made by a thread of ours
         // ([`meter_lines`]), not by the presenting thread, the lane: about
@@ -10275,6 +10616,9 @@ impl Meter {
                     }
                 }
         });
+        if !update_caption {
+            return;
+        }
         if self.caption.is_none() {
             // The window's own text, read without a message.
             let mut buffer = vec![0u16; 512];
@@ -10318,7 +10662,7 @@ impl Meter {
 
 #[cfg(test)]
 mod present_status_tests {
-    use super::{HWND, Meter};
+    use super::{FramePacingStats, HWND, Meter};
     use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, E_FAIL, S_OK};
 
     #[test]
@@ -10332,6 +10676,22 @@ mod present_status_tests {
         assert!(meter.record_present(hwnd, S_OK));
         assert_eq!(meter.frames, 2);
         assert_eq!(meter.last_present, S_OK);
+    }
+
+    #[test]
+    fn frame_pacing_stats_computes_percentiles_low1_and_spikes() {
+        assert!(FramePacingStats::compute(&[]).is_none());
+        let mut samples = vec![30.0f32; 95];
+        samples.extend([55.0, 60.0, 70.0, 110.0, 150.0]);
+        let s = FramePacingStats::compute(&samples).unwrap();
+        assert_eq!(s.count, 100);
+        assert!((s.p50_ms - 30.0).abs() < 1e-6);
+        assert!((s.p95_ms - 30.0).abs() < 1e-6);
+        assert!((s.p99_ms - 110.0).abs() < 1e-6);
+        assert!((s.low1_ms - 150.0).abs() < 1e-6);
+        assert!((s.max_ms - 150.0).abs() < 1e-6);
+        assert_eq!(s.spikes_50, 5);
+        assert_eq!(s.spikes_100, 2);
     }
 }
 
@@ -10666,6 +11026,9 @@ impl Host {
                 p.panel.frame(p.meter.line_due());
             }
             let presented = p.meter.record_present(p.hwnd, status);
+            if !presented && status == windows::Win32::Foundation::DXGI_STATUS_OCCLUDED {
+                p.meter.record_occluded(p.hwnd);
+            }
             showing.end();
             if !presented { return None; }
             #[cfg(feature = "diagnostics")]

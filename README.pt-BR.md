@@ -21,6 +21,8 @@ Medido em **Ryzen 5 5600 (6C/12T), Radeon RX 9060 XT 16 GB, 16 GB DDR4, Windows 
 | CPU `preparing` | 45.8 ms | **32.2 – 35.4 ms** |
 | Quadro real (mín / med) | 68.6 / 73.1 ms | **64.3 / 66.2 – 69.6 ms** |
 | FPS nativo (sem FG) | ~13.7 FPS | **14.5 – 15.5 FPS** |
+| Passe `heap buffers` (máx. / picos >50 ms) | 821.1 ms (8 picos >50 ms) | **33.8 ms (0 picos >50 ms; estável 8.6–10.0 ms)** |
+| Esperas `settle` e `take()` (estável sem FG) | 0.2–2.6 ms settle / 0.75–1.07 ms `take()` | **0.0 ms settle / 0.31–0.47 ms `take()`** |
 | FPS exibido (FSR 3.1.6 FG) | 25–27 FPS (quedas VSync para 15–20) | **29.2 – 31.0 FPS** (sem quedas VSync) |
 | HUD e legendas no FG | Ghosting e distorção | Limpo (`HUDLessColor` RGBA8 de 3 slots) |
 | Windows 10 D3D12 | Configuração manual do Agility SDK | `D3D12Core.dll` incluso (Agility SDK 620) |
@@ -30,6 +32,7 @@ Medido em **Ryzen 5 5600 (6C/12T), Radeon RX 9060 XT 16 GB, 16 GB DDR4, Windows 
 - **Memória e OOM (`0x8007000E`):** pool global limitado de prelúdios `(64, 16)`; reciclagem imediata de listas e alocadores (`recycle_landed`) com liberação diferida (`bury_lag`); limpeza e retry em `E_OUTOFMEMORY` em `make_list()` e `record_prelude()`; controle `NON_LOCAL` (`92%`, histerese `-10%`); páginas físicas opcionais em NVMe (`FILE_FLAG_DELETE_ON_CLOSE` em `%LOCALAPPDATA%\victory\physical`, >11 GB livres no carregamento).
 - **Apresentação e Frame Generation:** captura `HUDLessColor` RGBA8 de 3 slots antes de compor UI/legendas/HUD; swapchain triple-buffer com `DXGI_PRESENT_ALLOW_TEARING`; AMD FSR 4.1.2 ML nativo (fallback FSR 3.1 em placas anteriores).
 - **Envio CPU e copy-back:** escritas write-combined mantidas em VRAM (`27 -> 0.5 MB/quadro`); skip AVX2 `vptest` de 128 B e `merge_piece` vetorizado; pool lock-free work-stealing em `land`; shards write-watch alinhados em 64 B; varredura fundida `ask_once`/`stale_under_flights`; `mirror` lock-free; `OnceLock` em assinaturas de comando; `Few<Barrier, 16>` na pilha; `PLACED_TEXTURES` em 64 shards; `unfold` sem lock e `wake()` lock-free; zeragem de `upload::ARENAS` fora do mutex; prioridade elevada em 6 núcleos; listas pré-planejadas; hash antes de detile; reuso de buffers de upload.
+- **Frame pacing e eliminação de picos (nativo sem FG):** `sweep()` assíncrono incremental (`victory-sweep`, `VICTORY_SWEEP_ASYNC=1`) removendo o dreno síncrono `settle(WHY_SYNC)` a cada 1.5 s; coletor em segundo plano `bury()` com throttling (`victory-bury`, `VICTORY_BURY_ASYNC=1`); esperas `WHY_FENCE`/`WHY_VALUE` via `Line.seq` sem travar `host.submitted`; omissão de `sync_heaps` redundante em `execute_own` (`0.0` rodadas sem marca); varredura de 64 bits `AtomicU64` em `port_descriptors::take()` (`2–3×` mais rápida); `frame::wait` preciso sem `Sleep(0)`; telemetria por quadro `present pacing` (`avg / p50 / p95 / p99 / 1% low / max / >50 ms / >100 ms`, `VICTORY_FRAME_TIMES_FILE`) e `heap buffers` plano (`VICTORY_TEXTURE_STAGE_MS=4`, `VICTORY_TEXTURE_CATCHUP=0`, `0` picos >50 ms).
 - **Correções e controles:** orçamento de espera compute (`5000 ms`) corrigindo rostos ausentes; skip do shader problemático em RDNA4 (`240cb516c1af0bc3`); filtro de probes roxos; flips assíncronos seguros; retry de detile; teclado e mouse PC (`F2`/`~` câmera, `F3` overlay FPS).
 
 ## Limites conhecidos (em andamento na `dev`)
