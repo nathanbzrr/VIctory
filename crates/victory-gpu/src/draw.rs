@@ -1448,20 +1448,30 @@ impl State {
             return;
         }
         self.host_targets = Some((keys.to_vec(), dsv_key));
-        let mut rtvs: Few<D3D12_CPU_DESCRIPTOR_HANDLE, 8> = Few::default();
-        for &(texture, ref desc) in views.iter() {
-            rtvs.push(host.rtv(texture, desc.as_ref()));
+        const MAX_TARGETS: usize = D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT as usize;
+        let mut rtv_views = [const { None }; MAX_TARGETS];
+        let mut rtvs = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); MAX_TARGETS];
+        let mut count = 0;
+        for &(texture, ref desc) in views.iter().take(MAX_TARGETS) {
+            let Some(view) = host.rtv(texture, desc.as_ref()) else {
+                continue;
+            };
+            rtvs[count] = view.handle;
+            rtv_views[count] = Some(view);
+            count += 1;
         }
-        let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
-        // SAFETY: an open list; the views were just made.
+        let dsv = dsv.and_then(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
+        // SAFETY: an open list; the views were just made and stay held across the call.
         unsafe {
             list.list.OMSetRenderTargets(
-                rtvs.len() as u32,
-                (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
+                count as u32,
+                (count != 0).then_some(rtvs.as_ptr()),
                 false,
-                dsv.as_ref().map(std::ptr::from_ref),
+                dsv.as_ref().map(|view| &raw const view.handle),
             )
         };
+        drop(rtv_views);
+        drop(dsv);
     }
 
     /// Viewports, scissors, the blend factor and the stencil reference: set

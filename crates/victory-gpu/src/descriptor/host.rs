@@ -1467,14 +1467,55 @@ fn view_elements(view: &View) -> Option<(u32, bool, u32)> {
 /// an untyped structured view also needs that copy to be 16-byte aligned.
 /// A typed view of 12-byte elements also needs its own copy when its start
 /// is a multiple of 16 but not a multiple of 12.
+/// Where in its host copy a buffer view may start: on its element, and a
+/// raw view on 16 bytes. The host refuses a raw view whose first byte is
+/// not 16-byte aligned in its buffer (`DXGI_ERROR_INVALID_CALL`), where
+/// the console takes any dword.
+fn copy_alignment(element: u64, raw: bool) -> u64 {
+    if raw {
+        element.max(u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT))
+    } else {
+        element
+    }
+}
+
+/// Whether `view` is made as a raw buffer view on the host: constant
+/// buffers and buffer views with the raw flag.
+#[cfg(test)]
+fn view_raw(view: &View) -> bool {
+    let (unordered, words): (bool, &[u32; 10]) = match view {
+        View::Constant(..) => return true,
+        View::Shader(_, Some(desc)) => (false, desc),
+        View::Unordered(_, _, Some(desc)) => (true, desc),
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => match desc[..10].try_into() {
+            Ok(words) => (*unordered, words),
+            Err(_) => return false,
+        },
+        _ => return false,
+    };
+    if words[1] != 1 {
+        return false;
+    }
+    if unordered {
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { uav_desc(words).Anonymous.Buffer };
+        buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0
+    } else {
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { srv_desc(words).Anonymous.Buffer };
+        buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0
+    }
+}
+
 fn off_elements(offset: u64, stride: u32, raw: bool, element: u64, has_raw_twins: bool) -> bool {
     let needs_raw = stride > 0 && stride.is_multiple_of(4) && !has_raw_twins;
+    let align = copy_alignment(element, raw || needs_raw);
     if raw || needs_raw {
-        !offset.is_multiple_of(16)
+        !offset.is_multiple_of(align)
     } else if stride > 0 {
         !offset.is_multiple_of(16) && !offset.is_multiple_of(u64::from(stride))
     } else {
-        element > 0 && !offset.is_multiple_of(element)
+        align > 0 && !offset.is_multiple_of(align)
     }
 }
 
@@ -4443,6 +4484,34 @@ fn buffer_uav(
 /// family takes the texture's format.
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
 /// conversion; cast with castable formats if colors come out wrong.
+/// Whether the host can store to a typed unordered access view in `format`.
+fn typed_store(format: u32) -> bool {
+    static SEEN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = seen.iter().find(|&&(f, _)| f == format) {
+        return ok;
+    }
+    let Some(host) = host() else {
+        return false;
+    };
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: plain feature query on a live device.
+    let ok = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    }
+    .is_ok()
+        && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0;
+    seen.push((format, ok));
+    ok
+}
+
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
@@ -4476,6 +4545,14 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // A typed unordered view in a format the host cannot store to (such as
+    // B5G5R5A1_UNORM on some drivers) removes the device when made: keep the
+    // slot null instead. Check the format the view is actually made in.
+    let made_format = if view == 0 || !typeless { own } else { view };
+    if unordered && !(view == 0 && typeless) && !typed_store(made_format) {
+        once!(view = made_format, own, "an unordered view in a format the host cannot store");
+        return false;
+    }
     if view == 0 {
         return !typeless;
     }
@@ -5430,6 +5507,74 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Raw views (constant buffers are made raw too) start on 16 bytes of
+    /// their host copy, other views on their element: the host refuses a
+    /// raw view 4, 8 or 12 bytes past a 16-byte boundary and removes the
+    /// device (`DXGI_ERROR_INVALID_CALL`).
+    #[test]
+    fn raw_views_start_on_16_bytes_of_their_copy() {
+        let uav = |format, stride, flags| {
+            View::Unordered(0, 0, Some([format, 1, 0, 0, 64, stride, 0, 0, flags, 0]))
+        };
+        let srv = |flags| View::Shader(0, Some([0, 1, 5768, 0, 0, 0, 64, 0, flags, 0]));
+        for (view, raw) in [
+            (uav(0, 0, 1), true),
+            (srv(1), true),
+            (View::Constant(0x1008, 256), true),
+            (uav(12, 0, 0), false),
+            (uav(0, 16, 0), false),
+            (srv(0), false),
+        ] {
+            assert_eq!(view_raw(&view), raw, "{view:?}");
+        }
+        assert_eq!(copy_alignment(4, true), 16);
+        assert_eq!(copy_alignment(4, false), 4);
+        assert_eq!(copy_alignment(12, false), 12);
+        assert_eq!(copy_alignment(32, true), 32);
+        assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 2, 16, 0, true, 128));
+        assert!(buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 4, 16, 0, true, 128));
+    }
+
+    #[test]
+    fn typed_store_checks_host_uav_format_support() {
+        let Some(host) = host() else { return };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_B5G5R5A1_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut tex: Option<ID3D12Resource> = None;
+        // SAFETY: valid test resource query.
+        if unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                None,
+                &mut tex,
+            )
+        }
+        .is_ok()
+        {
+            let tex = tex.unwrap();
+            let mut f = DXGI_FORMAT_B5G5R5A1_UNORM;
+            let expected = typed_store(DXGI_FORMAT_B5G5R5A1_UNORM.0 as u32);
+            assert_eq!(fits(&tex, Some(&mut f), true), expected);
+            assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        }
+    }
 
     /// Every host sampler heap backs all 2,048 hardware descriptors and
     /// reserves slot 2,047 as a null sentinel so `umin(index, 2047)` in

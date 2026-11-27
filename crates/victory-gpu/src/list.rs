@@ -312,6 +312,9 @@ fn pools() -> bool {
 /// after its reset, or a new one.
 #[cfg(windows)]
 fn fresh_list() -> Option<crate::host::HostList> {
+    if crate::host::emergency_pressure() {
+        trim_idle(8);
+    }
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.lists.pop();
@@ -323,7 +326,10 @@ fn fresh_list() -> Option<crate::host::HostList> {
     };
     match idle {
         Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        None => crate::host::host().and_then(|h| {
+            h.maybe_emergency_reclaim("fresh_list");
+            h.new_list().ok()
+        }),
     }
 }
 
@@ -400,8 +406,16 @@ pub(crate) fn recycle_landed(lists: Vec<Detached>, ran: &[usize]) {
 
 #[cfg(windows)]
 fn keep_idle(lists: impl Iterator<Item = crate::host::HostList>, ran: &[usize]) {
+    let limit = if crate::host::emergency_pressure() {
+        idle_most().min(8)
+    } else {
+        idle_most()
+    };
     for (i, host) in lists.enumerate() {
-        if !ran.contains(&i) || host.should_retire() || IDLE.lock().unwrap_or_else(|e| e.into_inner()).lists.len() >= idle_most() {
+        if !ran.contains(&i)
+            || host.should_retire()
+            || IDLE.lock().unwrap_or_else(|e| e.into_inner()).lists.len() >= limit
+        {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -409,7 +423,7 @@ fn keep_idle(lists: impl Iterator<Item = crate::host::HostList>, ran: &[usize]) 
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.lists.len() < idle_most() && idle.bytes + bytes <= IDLE_BYTES {
+        if idle.lists.len() < limit && idle.bytes + bytes <= IDLE_BYTES {
             idle.lists.push(Idle(host, bytes));
             idle.bytes += bytes;
         }
@@ -1523,7 +1537,9 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
-        let rtv = host.rtv(Some(texture), record.desc().as_ref());
+        let Some(rtv) = host.rtv(Some(texture), record.desc().as_ref()) else {
+            return;
+        };
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
@@ -1534,7 +1550,7 @@ extern "system" fn clear_rtv(
                     State(RENDER_TARGET as i32),
                 )]);
             }
-            list.list.ClearRenderTargetView(rtv, color, rects);
+            list.list.ClearRenderTargetView(rtv.handle, color, rects);
         }
     }
     #[cfg(not(windows))]
@@ -1577,11 +1593,13 @@ extern "system" fn clear_dsv(
         if crate::resource::depth_and_unordered(record.resource) {
             crate::resource::DEPTH_UNORDERED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        let Some(dsv) = host.dsv(texture, record.depth_desc().as_ref()) else {
+            return;
+        };
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+                .ClearDepthStencilView(dsv.handle, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
         };
     }
     #[cfg(not(windows))]

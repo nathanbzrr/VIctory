@@ -174,8 +174,8 @@ impl Composer {
                 host.device
                     .CreateShaderResourceView(Some(plane.0), Some(&desc), at);
             }
-            let rtv = host.rtv(Some(back), None);
-            list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            let rtv = host.rtv(Some(back), None).unwrap();
+            list.OMSetRenderTargets(1, Some(&rtv.handle), false, None);
             list.SetDescriptorHeaps(&[Some(views.clone())]);
             list.SetGraphicsRootSignature(&self.root);
             list.SetPipelineState(&self.pso);
@@ -276,8 +276,9 @@ mod tests {
         let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         let cmds = &list.list;
         unsafe {
-            cmds.ClearRenderTargetView(host.rtv(Some(&base), None), &[0.5, 0.0, 0.0, 1.0], None);
-            let overlay_rtv = host.rtv(Some(&overlay), None);
+            let base_rtv = host.rtv(Some(&base), None).unwrap();
+            cmds.ClearRenderTargetView(base_rtv.handle, &[0.5, 0.0, 0.0, 1.0], None);
+            let overlay_rtv = host.rtv(Some(&overlay), None).unwrap();
             let colors = [
                 [0.0, 0.0, 0.0, 0.0],
                 [0.0, 0.5, 0.0, 0.5],
@@ -290,7 +291,7 @@ mod tests {
                     top: 0,
                     bottom: 1,
                 };
-                cmds.ClearRenderTargetView(overlay_rtv, color, Some(&[rect]));
+                cmds.ClearRenderTargetView(overlay_rtv.handle, color, Some(&[rect]));
             }
             cmds.ResourceBarrier(&[
                 crate::host::transition(&base, target, read),

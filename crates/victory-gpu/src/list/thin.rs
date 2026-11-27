@@ -168,6 +168,47 @@ static WORK: Condvar = Condvar::new();
 static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 const BACKS_MOST: usize = 64;
 
+/// Active worker count translating thin recordings; unbounded during normal
+/// operation, throttled during low commit or Shared GPU spikes so 4+ command
+/// allocators never expand simultaneously into `E_OUTOFMEMORY`.
+static ACTIVE_WORKERS: Mutex<usize> = Mutex::new(0);
+static WORKER_DONE: Condvar = Condvar::new();
+
+struct WorkPermit(bool);
+
+impl WorkPermit {
+    fn acquire() -> Self {
+        let cap = crate::host::recording_concurrency_cap();
+        if cap == usize::MAX {
+            return WorkPermit(false);
+        }
+        let mut active = ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spins = 0u32;
+        while *active >= cap && spins < 2 {
+            spins += 1;
+            let (guard, _) = WORKER_DONE
+                .wait_timeout(active, std::time::Duration::from_millis(15))
+                .unwrap_or_else(|e| e.into_inner());
+            active = guard;
+            if *active < crate::host::recording_concurrency_cap() {
+                break;
+            }
+        }
+        *active += 1;
+        WorkPermit(true)
+    }
+}
+
+impl Drop for WorkPermit {
+    fn drop(&mut self) {
+        if self.0 {
+            let mut active = ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
+            *active = active.saturating_sub(1);
+            WORKER_DONE.notify_all();
+        }
+    }
+}
+
 pub(crate) fn trim_backs(keep: usize) {
     let gone: Vec<usize> = {
         let mut backs = held(&BACKS);
@@ -246,6 +287,14 @@ impl Recording {
     /// Translates what there is.
     fn run(&self) {
         loop {
+            let _permit = WorkPermit::acquire();
+            let need_list = held(&self.inner).back == 0;
+            if need_list
+                && crate::host::emergency_pressure()
+                && let Some(host) = crate::host::host()
+            {
+                host.maybe_emergency_reclaim("thin recording back_list pressure");
+            }
             let (chunk, back) = {
                 let mut inner = held(&self.inner);
                 let Some(chunk) = inner.chunks.pop_front() else {
@@ -290,8 +339,9 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
+            let limit = if crate::host::emergency_pressure() { 2 } else { BACKS_MOST };
             let mut backs = held(&BACKS);
-            if backs.len() < BACKS_MOST {
+            if backs.len() < limit {
                 backs.push(inner.back);
             } else {
                 drop(backs);

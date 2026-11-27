@@ -22,9 +22,10 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
-    MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
-    MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    MEM_RESERVE_PLACEHOLDER, MEM_RESET, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS,
+    MapViewOfFile3, MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE,
+    SEC_COMMIT, SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree,
+    VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -820,6 +821,32 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     // Dropped without the lock: the last page of a section unmaps its window.
     let gone: Vec<Slice> = numbers.iter().filter_map(|number| table.pages.remove(number)).collect();
     drop(table);
+    if !gone.is_empty() {
+        let shown = SHOWN.read().unwrap_or_else(|e| e.into_inner());
+        for slice in &gone {
+            if slice.section.backing.is_none()
+                && !on_wine()
+                && let Some(&base) = slice.section.window.get()
+                && base != 0
+                && shown.at(slice).is_empty()
+                && (slice.section.committed[slice.index / 64].load(Ordering::Acquire)
+                    >> (slice.index % 64)
+                    & 1)
+                    != 0
+            {
+                // SAFETY: removed from `table.pages` and not present in `SHOWN`;
+                // resetting allows Windows to discard RAM pages without pagefile I/O.
+                unsafe {
+                    VirtualAlloc(
+                        (base + slice.index * PAGE) as *const c_void,
+                        PAGE,
+                        MEM_RESET,
+                        PAGE_READWRITE,
+                    );
+                }
+            }
+        }
+    }
     drop(gone);
     1
 }

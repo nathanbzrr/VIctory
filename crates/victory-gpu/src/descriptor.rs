@@ -944,8 +944,19 @@ pub(crate) fn constant_slots_batch(
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
+        let host_key = self
+            .host
+            .get()
+            .and_then(|h| h.as_ref())
+            .map(|h| std::ptr::from_ref(h) as usize);
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        // `memory::release_heap` locks `MEMORY`, never `SHADER_HEAPS`; drop
+        // the heaps lock first to preserve lock ordering.
+        drop(heaps);
+        if let Some(key) = host_key {
+            crate::memory::release_heap(key);
+        }
         crate::port_descriptors::let_go(self.start);
     }
 }
@@ -1891,6 +1902,37 @@ mod tests {
             ),
             5..5
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_released_view_heap_drops_its_memory_binding() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 1000,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let heap_ref = heap(h);
+        let Some(host_heap) = heap_ref.host() else {
+            let _ = slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+            return;
+        };
+        let key = std::ptr::from_ref(host_heap) as usize;
+        let list = host.new_list().unwrap();
+        let _ = crate::memory::ready(&list, host_heap, &[], &[], &[], crate::memory::Use::Reads, None);
+        assert!(crate::memory::has_heap(key));
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+        assert!(!crate::memory::has_heap(key), "released with its heap");
     }
 
     #[test]

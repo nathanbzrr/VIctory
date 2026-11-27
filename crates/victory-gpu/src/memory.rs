@@ -211,6 +211,25 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+/// View heap `key` was released: drop its entry in [`Memory::heaps`] so
+/// reused heap addresses never inherit stale descriptors or bindings.
+#[cfg(windows)]
+pub(crate) fn release_heap(key: usize) {
+    if let Some(m) = &mut *MEMORY.lock().unwrap_or_else(|e| e.into_inner()) {
+        m.heaps.remove(&key);
+    }
+}
+
+/// Whether `Memory::heaps` currently tracks view heap `key`.
+#[cfg(test)]
+pub(crate) fn has_heap(key: usize) -> bool {
+    MEMORY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|m| m.heaps.contains_key(&key))
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,

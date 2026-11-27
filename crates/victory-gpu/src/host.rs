@@ -5,7 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -32,9 +32,108 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
-/// Render target views live only until their command is recorded, so a
-/// ring of host descriptors is enough.
-const RTV_RING: u32 = 1024;
+/// CPU-only descriptor slots held until their commands are recorded (#2844).
+const CPU_VIEW_SLOTS: u32 = 1024;
+
+struct CpuViews {
+    _heap: ID3D12DescriptorHeap,
+    kind: D3D12_DESCRIPTOR_HEAP_TYPE,
+    start: usize,
+    stride: usize,
+    available: Mutex<Vec<u32>>,
+}
+
+enum CpuViewStorage<'a> {
+    Pooled(&'a CpuViews, u32),
+    Standalone { _heap: ID3D12DescriptorHeap },
+}
+
+pub(crate) struct CpuView<'a> {
+    pub(crate) handle: D3D12_CPU_DESCRIPTOR_HANDLE,
+    storage: CpuViewStorage<'a>,
+}
+
+impl Drop for CpuView<'_> {
+    fn drop(&mut self) {
+        if let CpuViewStorage::Pooled(pool, slot) = self.storage {
+            pool.available
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(slot);
+        }
+    }
+}
+
+impl CpuViews {
+    fn heap(
+        device: &ID3D12Device,
+        kind: D3D12_DESCRIPTOR_HEAP_TYPE,
+        count: u32,
+    ) -> windows::core::Result<ID3D12DescriptorHeap> {
+        let create = || {
+            // SAFETY: a plain description of a CPU-only heap.
+            unsafe {
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: count,
+                    ..Default::default()
+                })
+            }
+        };
+        match create() {
+            Ok(h) => Ok(h),
+            Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY => {
+                crate::residency::allocation_error(&e);
+                if let Some(h) = host() {
+                    h.emergency_reclaim(true, "CpuViews::heap E_OUTOFMEMORY");
+                }
+                create()
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn new(
+        device: &ID3D12Device,
+        kind: D3D12_DESCRIPTOR_HEAP_TYPE,
+    ) -> windows::core::Result<Self> {
+        let heap = Self::heap(device, kind, CPU_VIEW_SLOTS)?;
+        // SAFETY: the device and its newly made heap are live.
+        let (start, stride) = unsafe {
+            (
+                heap.GetCPUDescriptorHandleForHeapStart().ptr,
+                device.GetDescriptorHandleIncrementSize(kind) as usize,
+            )
+        };
+        Ok(Self {
+            _heap: heap,
+            kind,
+            start,
+            stride,
+            available: Mutex::new((0..CPU_VIEW_SLOTS).rev().collect()),
+        })
+    }
+
+    fn take(&self, device: &ID3D12Device) -> Option<CpuView<'_>> {
+        if let Some(slot) = self.available.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+            return Some(CpuView {
+                handle: D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: self.start + slot as usize * self.stride,
+                },
+                storage: CpuViewStorage::Pooled(self, slot),
+            });
+        }
+        let heap = Self::heap(device, self.kind, 1)
+            .inspect_err(|error| tracing::warn!(?self.kind, %error, "no CPU descriptor slot"))
+            .ok()?;
+        // SAFETY: the heap stays live in the returned view.
+        let handle = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        Some(CpuView {
+            handle,
+            storage: CpuViewStorage::Standalone { _heap: heap },
+        })
+    }
+}
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -43,16 +142,11 @@ pub(crate) struct Host {
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
-    rtvs: ID3D12DescriptorHeap,
-    rtv_size: u32,
-    /// A ring of depth views, used as `rtvs`.
-    dsvs: ID3D12DescriptorHeap,
-    dsv_size: u32,
-    next_dsv: AtomicU32,
+    rtvs: CpuViews,
+    dsvs: CpuViews,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
-    next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
@@ -152,6 +246,90 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
     ok.then_some(m.ullAvailPhys)
+}
+
+/// System commit headroom (`CommitLimit - CommitTotal`) in bytes.
+#[cfg(windows)]
+pub(crate) fn available_commit_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+    ok.then_some(m.ullAvailPageFile)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn available_commit_bytes() -> Option<u64> {
+    None
+}
+
+const EMERGENCY_COMMIT_BYTES: u64 = 2560 << 20;
+const ELEVATED_COMMIT_BYTES: u64 = 3584 << 20;
+
+static IN_EMERGENCY: AtomicBool = AtomicBool::new(false);
+static CACHED_COMMIT_BYTES: AtomicU64 = AtomicU64::new(u64::MAX);
+static CACHED_SHARED_PCT: AtomicU32 = AtomicU32::new(0);
+static LAST_PRESSURE_SAMPLE_MS: AtomicU64 = AtomicU64::new(0);
+
+fn classify_pressure(commit_bytes: u64, shared_budget: u64, shared_used: u64) -> u8 {
+    let shared_pct = if shared_budget > 0 {
+        ((u128::from(shared_used) * 100) / u128::from(shared_budget)) as u32
+    } else {
+        0
+    };
+    if commit_bytes < EMERGENCY_COMMIT_BYTES || shared_pct >= 88 {
+        2
+    } else if commit_bytes < ELEVATED_COMMIT_BYTES || shared_pct >= 80 {
+        1
+    } else {
+        0
+    }
+}
+
+fn sample_pressure(force: bool) -> (u64, u32) {
+    let now = now_ms();
+    let last = LAST_PRESSURE_SAMPLE_MS.load(Ordering::Relaxed);
+    if force
+        || now.saturating_sub(last) >= 50
+            && LAST_PRESSURE_SAMPLE_MS
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+    {
+        if let Some(commit) = available_commit_bytes() {
+            CACHED_COMMIT_BYTES.store(commit, Ordering::Relaxed);
+        }
+        if let Some([_, _, s_budget, s_used]) = host().and_then(|h| h.video_memory())
+            && s_budget > 0
+        {
+            let pct = ((u128::from(s_used) * 100) / u128::from(s_budget)) as u32;
+            CACHED_SHARED_PCT.store(pct, Ordering::Relaxed);
+        }
+    }
+    (
+        CACHED_COMMIT_BYTES.load(Ordering::Relaxed),
+        CACHED_SHARED_PCT.load(Ordering::Relaxed),
+    )
+}
+
+pub(crate) fn current_pressure_level() -> u8 {
+    if IN_EMERGENCY.load(Ordering::Relaxed) {
+        return 2;
+    }
+    let (commit, shared_pct) = sample_pressure(false);
+    classify_pressure(commit, 100, u64::from(shared_pct))
+}
+
+pub(crate) fn emergency_pressure() -> bool {
+    current_pressure_level() >= 2
+}
+
+pub(crate) fn recording_concurrency_cap() -> usize {
+    match current_pressure_level() {
+        0 => usize::MAX,
+        1 => 2,
+        _ => 1,
+    }
 }
 
 /// How long host copies of textures the title fills must have been idle to
@@ -667,6 +845,22 @@ fn sweep() {
     } else {
         trim_upload_pool(upload_pool_budget());
     }
+    if let Some([_, _, s_budget, s_used]) = mem
+        && s_budget > 0
+    {
+        CACHED_SHARED_PCT.store(
+            ((u128::from(s_used) * 100) / u128::from(s_budget)) as u32,
+            Ordering::Relaxed,
+        );
+    }
+    if let Some(commit) = available_commit_bytes() {
+        CACHED_COMMIT_BYTES.store(commit, Ordering::Relaxed);
+    }
+    if current_pressure_level() >= 2
+        && let Some(h) = host()
+    {
+        h.emergency_reclaim(false, "sweep low commit or shared GPU pressure");
+    }
     static LAST_MEM_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some([v_budget, v_used, s_budget, s_used]) = mem
         && now.saturating_sub(LAST_MEM_LOG.load(Ordering::Relaxed)) >= 15_000
@@ -763,6 +957,10 @@ fn bury_async() -> bool {
 /// Drops what waited for submissions up to `finished` ([`bury_lag`]) inline.
 fn bury_now(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
+    bury_raw(finished);
+}
+
+fn bury_raw(finished: u64) {
     for part in &RETIRED {
         let done: Vec<(u64, Retired)> = {
             let mut retired = part.lock().unwrap_or_else(|e| e.into_inner());
@@ -1279,20 +1477,8 @@ fn create() -> windows::core::Result<Host> {
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
-        let rtvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                NumDescriptors: RTV_RING,
-                ..Default::default()
-            })?;
-        let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        let dsvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
-                NumDescriptors: RTV_RING,
-                ..Default::default()
-            })?;
-        let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        let rtvs = CpuViews::new(&device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV)?;
+        let dsvs = CpuViews::new(&device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV)?;
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
@@ -1326,12 +1512,8 @@ fn create() -> windows::core::Result<Host> {
             submitted: Mutex::new(0),
             event,
             rtvs,
-            rtv_size,
             dsvs,
-            dsv_size,
-            next_dsv: AtomicU32::new(0),
             messages,
-            next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
             fallback_view: OnceLock::new(),
@@ -1555,6 +1737,14 @@ fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
     drop(overflow);
 }
 
+fn trim_batch_buffers() {
+    let gone: Vec<BatchBuf> = {
+        let mut spare = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *spare)
+    };
+    drop(gone);
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -1605,6 +1795,7 @@ pub(crate) struct HostList {
     /// same.
     epoch: std::sync::atomic::AtomicU64,
     resets: std::sync::atomic::AtomicU32,
+    oom_retired: AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -1644,14 +1835,19 @@ fn give_prelude(prelude: Prelude) {
     }
 }
 
-/// Drops idle preludes past the tight budget to free NON_LOCAL command memory.
-pub(crate) fn trim_preludes() {
+/// Drops idle preludes past `keep` to free NON_LOCAL command memory.
+fn trim_preludes_to(keep: usize) {
     let gone: Vec<IdlePrelude> = {
         let mut idle = PRELUDES.lock().unwrap_or_else(|e| e.into_inner());
-        let keep = idle.len().min(PRELUDES_MOST.1);
+        let keep = idle.len().min(keep);
         idle.split_off(keep)
     };
     drop(gone);
+}
+
+/// Drops idle preludes past the tight budget to free NON_LOCAL command memory.
+pub(crate) fn trim_preludes() {
+    trim_preludes_to(PRELUDES_MOST.1);
 }
 
 /// Resources a landed host list kept alive for its commands; retired through
@@ -1972,7 +2168,9 @@ fn record_plane_pass(
                 },
                 ..Default::default()
             };
-            let target = host.dsv(depth, Some(&target));
+            let Some(target) = host.dsv(depth, Some(&target)) else {
+                continue;
+            };
             let (width, height) = ((of.Width >> mip).max(1) as u32, (of.Height >> mip).max(1));
             let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
                 ptr: pass.cpu + (slot * pass.step) as usize,
@@ -1989,7 +2187,7 @@ fn record_plane_pass(
                 list.SetGraphicsRootSignature(&root);
                 list.SetPipelineState(&pipeline);
                 list.SetGraphicsRootDescriptorTable(0, gpu);
-                list.OMSetRenderTargets(0, None, false, Some(&target));
+                list.OMSetRenderTargets(0, None, false, Some(&target.handle));
                 list.RSSetViewports(&[D3D12_VIEWPORT {
                     TopLeftX: 0.0,
                     TopLeftY: 0.0,
@@ -4725,25 +4923,83 @@ impl Host {
         list
     }
 
-    /// Reclaim idle NON_LOCAL/shared memory pools after an `E_OUTOFMEMORY`.
-    fn reclaim_for_oom(&self) {
+    /// Proactively reclaim idle memory when free commit falls below 2.5 GiB
+    /// or Shared GPU usage exceeds 88%, skipping if reclaimed recently.
+    pub(crate) fn maybe_emergency_reclaim(&self, reason: &str) {
+        if current_pressure_level() >= 2 {
+            self.emergency_reclaim(false, reason);
+        }
+    }
+
+    /// Reclaim idle GPU/host commit and NON_LOCAL memory pools proactively or
+    /// after an `E_OUTOFMEMORY`. `force_settle` also waits for in-flight work
+    /// (deadlock-free via `try_lock`) and immediately buries retired objects.
+    pub(crate) fn emergency_reclaim(&self, force_settle: bool, reason: &str) {
+        static EMERGENCY_LOCK: Mutex<u64> = Mutex::new(0);
+        struct FlagGuard;
+        impl Drop for FlagGuard {
+            fn drop(&mut self) {
+                IN_EMERGENCY.store(false, Ordering::Release);
+            }
+        }
+        let mut last = EMERGENCY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_ms();
+        let cooldown = if force_settle { 100 } else { 250 };
+        if now.saturating_sub(*last) < cooldown {
+            return;
+        }
+        *last = now;
+        IN_EMERGENCY.store(true, Ordering::Release);
+        let _guard = FlagGuard;
+        let commit_before_mb = available_commit_bytes().map_or(0, |b| b >> 20);
         let drained = crate::list::drain_idle();
-        trim_preludes();
+        crate::list::thin::trim_backs(0);
+        trim_preludes_to(0);
         trim_spare_chunks();
+        trim_batch_buffers();
         trim_upload_pool(0);
         send::trim();
         card_steps::trim();
         crate::shadow::trim_snapshots();
-        crate::list::thin::trim_backs(0);
-        crate::pool::room(self.video_memory(), true);
+        if force_settle && let Ok(mut sub) = self.submitted.try_lock() {
+            self.settle(&mut sub, WHY_SYNC);
+        }
+        if force_settle && STARTED.load(Ordering::Acquire) == FINISHED.load(Ordering::Acquire) {
+            bury_raw(u64::MAX);
+        } else {
+            bury(FINISHED.load(Ordering::Acquire));
+        }
+        let mem = self.video_memory();
+        crate::pool::room(mem, true);
         crate::shadow::let_go_idle();
         crate::texture::let_go_idle();
         crate::resource::let_go_idle();
-        tracing::warn!(drained_idle_lists = drained, "reclaimed idle GPU pools after E_OUTOFMEMORY");
+        if force_settle && STARTED.load(Ordering::Acquire) == FINISHED.load(Ordering::Acquire) {
+            bury_raw(u64::MAX);
+        } else {
+            bury(FINISHED.load(Ordering::Acquire));
+        }
+        let (commit_after, shared_pct) = sample_pressure(true);
+        let commit_after_mb = if commit_after == u64::MAX { 0 } else { commit_after >> 20 };
+        tracing::warn!(
+            reason,
+            force_settle,
+            drained_idle_lists = drained,
+            commit_before_mb,
+            commit_after_mb,
+            shared_pct,
+            "emergency GPU/commit reclaim finished"
+        );
+    }
+
+    /// Reclaim idle NON_LOCAL/shared memory pools after an `E_OUTOFMEMORY`.
+    fn reclaim_for_oom(&self) {
+        self.emergency_reclaim(true, "E_OUTOFMEMORY");
     }
 
     /// An allocator and a closed list for a prelude.
     fn make_prelude(&self) -> Option<Prelude> {
+        self.maybe_emergency_reclaim("pre-make_prelude pressure");
         let try_make = || -> windows::core::Result<Prelude> {
             // SAFETY: plain object creation.
             unsafe {
@@ -4776,6 +5032,7 @@ impl Host {
     }
 
     fn make_list(&self) -> windows::core::Result<HostList> {
+        self.maybe_emergency_reclaim("pre-make_list pressure");
         let create_pair = || -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
             // SAFETY: plain object creation.
             unsafe {
@@ -4842,6 +5099,7 @@ impl Host {
             coming: Mutex::default(),
             epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
             resets: std::sync::atomic::AtomicU32::new(0),
+            oom_retired: AtomicBool::new(false),
             _alive: Counted::new(),
             #[cfg(feature = "diagnostics")]
             notes,
@@ -7136,39 +7394,35 @@ impl Host {
             .as_ref()
     }
 
-    /// A host render target view of `resource`, valid until it is recorded.
+    /// A host render target view of `resource`, held until its command is recorded (#2844).
     pub(crate) fn rtv(
         &self,
         resource: Option<&ID3D12Resource>,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
-    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
-        // SAFETY: a slot of our heap and a live resource, or none with a
-        // description (a typed null view).
+    ) -> Option<CpuView<'_>> {
+        let view = self.rtvs.take(&self.device)?;
+        // SAFETY: the requested slot is reserved and the resource is live,
+        // or `None` with a description (a typed null view).
         unsafe {
-            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.rtv_size) as usize;
             self.device
-                .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
-            handle
+                .CreateRenderTargetView(resource, desc.map(std::ptr::from_ref), view.handle);
         }
+        Some(view)
     }
 
-    /// A host depth view of `resource`, valid until it is recorded.
+    /// A host depth view of `resource`, held until its command is recorded (#2844).
     pub(crate) fn dsv(
         &self,
         resource: &ID3D12Resource,
         desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
-    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
-        // SAFETY: a slot of our heap and a live resource.
+    ) -> Option<CpuView<'_>> {
+        let view = self.dsvs.take(&self.device)?;
+        // SAFETY: the requested slot is reserved and the resource is live.
         unsafe {
-            let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.dsv_size) as usize;
             self.device
-                .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
-            handle
+                .CreateDepthStencilView(resource, desc.map(std::ptr::from_ref), view.handle);
         }
+        Some(view)
     }
 }
 
@@ -7273,11 +7527,59 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        if let Some(h) = host() {
+            h.maybe_emergency_reclaim("HostList::close pressure");
+        }
         // SAFETY: our list.
-        if let Err(e) = unsafe { self.list.Close() } {
-            fail(format_args!(
-                "a host command list did not close ({e}): a command recorded into it was invalid"
-            ));
+        match unsafe { self.list.Close() } {
+            Ok(()) => {}
+            Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY => {
+                crate::residency::allocation_error(&e);
+                if let Some(h) = host() {
+                    h.emergency_reclaim(true, "HostList::close E_OUTOFMEMORY");
+                }
+                // SAFETY: retry closing after reclaiming commit / shared GPU memory.
+                if let Err(e2) = unsafe { self.list.Close() } {
+                    self.oom_retired.store(true, Ordering::Relaxed);
+                    if e2.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
+                        // D3D12 latches OOM recorded mid-list until Reset; recover
+                        // safely into an empty closed list instead of aborting or
+                        // submitting an unclosed command list (`0x887A0020`).
+                        drop(self.take_held());
+                        // SAFETY: this list failed to close and will not be submitted
+                        // with its failed commands; resetting allocator + list puts
+                        // it back into a valid closed state for clean retirement.
+                        let recovered = unsafe {
+                            self.allocator
+                                .Reset()
+                                .and_then(|()| self.list.Reset(&self.allocator, None))
+                                .and_then(|()| self.list.Close())
+                        };
+                        match recovered {
+                            Ok(()) => {
+                                tracing::error!(
+                                    error = %e2,
+                                    "HostList::close recovered from E_OUTOFMEMORY after emergency_reclaim by resetting and retiring allocator"
+                                );
+                            }
+                            Err(e3) => {
+                                fail(format_args!(
+                                    "a host command list did not close after E_OUTOFMEMORY reclaim and recovery ({e2}; reset {e3})"
+                                ));
+                            }
+                        }
+                    } else {
+                        fail(format_args!(
+                            "a host command list did not close after OOM reclaim ({e2}): a command recorded into it was invalid"
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                fail(format_args!(
+                    "a host command list did not close ({e}): a command recorded into it was invalid"
+                ));
+            }
         }
     }
 
@@ -7304,7 +7606,11 @@ impl HostList {
     }
 
     pub(crate) fn should_retire(&self) -> bool {
-        self.resets.load(Ordering::Relaxed) >= 256
+        if self.oom_retired.load(Ordering::Relaxed) {
+            return true;
+        }
+        let max_resets = if emergency_pressure() { 8 } else { 256 };
+        self.resets.load(Ordering::Relaxed) >= max_resets
     }
 
     /// Only after the list's last submission finished (every one is waited
@@ -12656,6 +12962,63 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn pressure_classification_and_concurrency_caps() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(super::classify_pressure(8 * gib, 8 * gib, 4 * gib), 0);
+        assert_eq!(super::classify_pressure(3 * gib, 8 * gib, 4 * gib), 1);
+        assert_eq!(super::classify_pressure(8 * gib, 100, 82), 1);
+        assert_eq!(super::classify_pressure(2 * gib, 8 * gib, 4 * gib), 2);
+        assert_eq!(super::classify_pressure(8 * gib, 100, 90), 2);
+    }
+
+    #[test]
+    fn pending_rtv_slots_stay_unique_while_held() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RENDER_TARGET_VIEW_DESC, D3D12_RTV_DIMENSION_TEXTURE2D,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+        let Some(host) = super::host() else {
+            return;
+        };
+        let held = host.rtv(
+            None,
+            Some(&D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            }),
+        );
+        let Some(held) = held else {
+            return;
+        };
+        let held_ptr = held.handle.ptr;
+        // Exhaust and overflow the 1024-slot pool while `held` stays alive;
+        // no newly leased slot may reuse `held_ptr`.
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut batch = Vec::new();
+                for _ in 0..(super::CPU_VIEW_SLOTS + 16) {
+                    let v = host
+                        .rtv(
+                            None,
+                            Some(&D3D12_RENDER_TARGET_VIEW_DESC {
+                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                                ..Default::default()
+                            }),
+                        )
+                        .unwrap();
+                    assert_ne!(
+                        v.handle.ptr, held_ptr,
+                        "pooled or standalone slot reused an active CpuView"
+                    );
+                    batch.push(v);
+                }
+            });
+        });
     }
 }
 
