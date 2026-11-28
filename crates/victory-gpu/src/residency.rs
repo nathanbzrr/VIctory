@@ -429,14 +429,14 @@ pub(crate) fn compute_vram_policy(
             // card_room_kept on top of raw VRAM) to latch `false` at 2.3 GB
             // textures (432k `card has no room` refusals -> black world).
             texture_keep_percent: if tight_host_ram {
-                if series_s { 84 } else { 80 }
+                if series_s { 86 } else { 82 }
             } else if series_s {
                 91
             } else {
                 88
             },
-            texture_room_percent: if tight_host_ram { 90 } else { 95 },
-            targets_room_mb: if tight_host_ram { 1536 } else { 1280 },
+            texture_room_percent: if tight_host_ram { 94 } else { 95 },
+            targets_room_mb: if tight_host_ram { 1024 } else { 1280 },
             card_buffers_min_kb: 64,
             card_buffers_max_mb: (budget_mb / 4).clamp(3072, 4096),
             card_windows_mb: if tight_host_ram {
@@ -659,9 +659,10 @@ mod tests {
         assert!(p16_32ram.texture_keep_percent < p24.texture_keep_percent);
         assert_eq!(p8.texture_keep_percent, 68);
         assert_eq!(p8.texture_room_percent, 78);
-        // 16 GB GPU on 16 GB RAM avoids OS working-set paging (~12.1 GB VRAM, ~2.2 GB shared)
-        assert_eq!(p16_16ram.texture_keep_percent, 84);
-        assert_eq!(p16_16ram.texture_room_percent, 90);
+        // 16 GB GPU on 16 GB RAM evicts idle textures at 86% while keeping 94% room_pct
+        // so `resource::room()` never false-latches `!room` at 12.8/14.9 GB VRAM.
+        assert_eq!(p16_16ram.texture_keep_percent, 86);
+        assert_eq!(p16_16ram.texture_room_percent, 94);
         assert_eq!(p16_16ram.card_windows_mb, 2816);
         assert_eq!(p16_16ram.staging_nonlocal_cap_mb, 192);
         // 16 GB GPU on >=32 GB RAM unlocks ~90-94% of live DXGI VRAM (~13.2-14.2 GB)

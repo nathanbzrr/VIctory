@@ -3409,12 +3409,23 @@ pub(crate) fn let_go_idle() {
     // Shared-RAM windows, while VRAM windows stay resident until local VRAM
     // crosses (keep_pct + 5)% and are then evicted incrementally (max 8 per
     // 1-second sweep) so there are zero burst-eviction frame spikes.
-    let vram_emergency = vmem.is_some_and(|[v_budget, v_used, ..]| {
-        let line = (crate::residency::vram_policy().texture_keep_percent + 4).min(96);
+    let vram_critical = vmem.is_some_and(|[v_budget, v_used, ..]| {
+        let line = crate::residency::vram_policy().texture_room_percent.min(96);
         v_budget > 0 && u128::from(v_used) * 100 >= u128::from(v_budget) * u128::from(line)
     });
-    let vram_idle_ms = if vram_emergency { 5_000 } else { 600_000 };
-    const MAX_VRAM_EVICT_PER_SWEEP: usize = 8;
+    let vram_emergency = vram_critical
+        || vmem.is_some_and(|[v_budget, v_used, ..]| {
+            let line = (crate::residency::vram_policy().texture_keep_percent + 4).min(96);
+            v_budget > 0 && u128::from(v_used) * 100 >= u128::from(v_budget) * u128::from(line)
+        });
+    let vram_idle_ms = if vram_critical {
+        2_000
+    } else if vram_emergency {
+        5_000
+    } else {
+        600_000
+    };
+    let max_vram_evict: usize = if vram_critical { 32 } else { 8 };
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -3441,7 +3452,7 @@ pub(crate) fn let_go_idle() {
         }
         if !eligible_vram.is_empty() {
             eligible_vram.sort_unstable_by_key(|&(used, _)| used);
-            for (_, key) in eligible_vram.into_iter().take(MAX_VRAM_EVICT_PER_SWEEP) {
+            for (_, key) in eligible_vram.into_iter().take(max_vram_evict) {
                 gone_keys.push(key);
             }
         }

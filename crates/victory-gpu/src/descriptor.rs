@@ -1243,9 +1243,13 @@ const PLACED: u32 = 2;
 /// Bits of a constant buffer view's address in its record: any address a
 /// program can have. The 15 bits above them are its size.
 const CONSTANT_ADDRESS_BITS: u32 = 47;
-/// Bits of a placed view's address in its record: placed memory is title
-/// memory, which lies below 1 TiB. The 22 bits above them number its shape.
-const PLACED_ADDRESS_BITS: u32 = 40;
+/// Bits of a placed view's 4-byte-aligned address stored in its record:
+/// 42 stored bits shifted by `PLACED_ADDR_SHIFT = 2` cover 44 bits (16 TiB,
+/// well above observed Windows x64 addresses like `0x175_838f_a160`) while
+/// leaving 20 bits (1,048,576 distinct shapes) so `Views::shapes` never
+/// overflows into `Views::list`.
+const PLACED_ADDR_SHIFT: u32 = 2;
+const PLACED_ADDRESS_BITS: u32 = 42;
 const SHAPES: usize = 1 << (62 - PLACED_ADDRESS_BITS);
 
 /// A view of placed memory without its address: whether it is unordered
@@ -1314,9 +1318,9 @@ fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, 
 }
 
 /// The record words that name the view of placed memory at `address` with
-/// shape number `shape`.
+/// shape number `shape` (`address` must be aligned to `1 << PLACED_ADDR_SHIFT`).
 fn placed_words(shape: u32, address: u64) -> [u32; 2] {
-    kind_words(PLACED, u64::from(shape) << PLACED_ADDRESS_BITS | address)
+    kind_words(PLACED, u64::from(shape) << PLACED_ADDRESS_BITS | (address >> PLACED_ADDR_SHIFT))
 }
 
 impl Views {
@@ -1339,7 +1343,7 @@ impl Views {
     #[allow(dead_code)]
     fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
         let payload = payload(i, generation);
-        let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
+        let address = (payload & ((1 << PLACED_ADDRESS_BITS) - 1)) << PLACED_ADDR_SHIFT;
         let &(unordered, resource, rest) = self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
         let mut desc = [0u32; 16];
         desc[..10].copy_from_slice(&rest[..10]);
@@ -1367,7 +1371,9 @@ impl Views {
                     }
                     None => {
                         self.list.push((view.clone(), 1));
-                        self.list.len() as u32 - 1
+                        let len = self.list.len();
+                        VIEWS_LEN.store(len as u64, std::sync::atomic::Ordering::Relaxed);
+                        len as u32 - 1
                     }
                 };
                 for r in view.resources().into_iter().filter(|&r| r != 0) {
@@ -1383,12 +1389,20 @@ impl Views {
     }
 }
 
+static VIEWS_LEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Current `Views::list` length (lock-free, for `TEX_HEALTH` telemetry).
+pub(crate) fn views_len() -> u64 {
+    VIEWS_LEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Lock-free segmented per-slot generation table for [`Views::list`].
 /// `forget()` updates ONLY the freed slot's atomic generation so unrelated
 /// entries in every thread's TLS cache remain valid indefinitely.
 const GEN_CHUNK_SHIFT: usize = 12;
 const GEN_CHUNK_SIZE: usize = 1 << GEN_CHUNK_SHIFT;
-const GEN_CHUNKS: usize = 128; // up to 524,288 table slots
+const GEN_CHUNKS: usize = 4096; // up to 16,777,216 table slots (lazily allocated)
+pub(crate) const VIEWS_GEN_CAP: u64 = (GEN_CHUNKS * GEN_CHUNK_SIZE) as u64;
 
 static ENTRY_GENS: [std::sync::OnceLock<Box<[std::sync::atomic::AtomicU32; GEN_CHUNK_SIZE]>>; GEN_CHUNKS] =
     [const { std::sync::OnceLock::new() }; GEN_CHUNKS];
@@ -1571,10 +1585,19 @@ fn words_for(view: View) -> [u32; 2] {
                     NAMED_WHOLE[0].fetch_add(1, Relaxed);
                     return words;
                 }
+                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, Relaxed) {
+                    tracing::warn!(
+                        address = format_args!("{address:#x}"),
+                        size,
+                        "inline constant view overflowed record bits; spilling to Views::list"
+                    );
+                }
             }
             View::Placed(unordered, resource, desc) => {
                 let (shape, address) = shape_of(*unordered, resource, desc);
-                if address >> PLACED_ADDRESS_BITS == 0 {
+                let align_mask = (1u64 << PLACED_ADDR_SHIFT) - 1;
+                if address & align_mask == 0 && address >> (PLACED_ADDRESS_BITS + PLACED_ADDR_SHIFT) == 0 {
                     let cached = TLS_VIEWS.with(|c| c.borrow().shape_ids.get(&shape).copied());
                     let shape_id = match cached {
                         Some(id) => Some(id),
@@ -1594,6 +1617,22 @@ fn words_for(view: View) -> [u32; 2] {
                     if let Some(shape) = shape_id {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
                         return placed_words(shape, address);
+                    }
+                    static WARNED_SHAPES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED_SHAPES.swap(true, Relaxed) {
+                        tracing::warn!(
+                            max_shapes = SHAPES,
+                            "inline placed view shape table full; spilling to Views::list"
+                        );
+                    }
+                } else {
+                    static WARNED_ADDR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED_ADDR.swap(true, Relaxed) {
+                        tracing::warn!(
+                            address = format_args!("{address:#x}"),
+                            bits = PLACED_ADDRESS_BITS + PLACED_ADDR_SHIFT,
+                            "inline placed view address exceeded inline range/alignment; spilling to Views::list"
+                        );
                     }
                 }
             }
@@ -1891,7 +1930,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
         CONSTANT => Some(constant_of(i, generation)),
         PLACED => {
             let p = payload(i, generation);
-            let address = p & ((1 << PLACED_ADDRESS_BITS) - 1);
+            let address = (p & ((1 << PLACED_ADDRESS_BITS) - 1)) << PLACED_ADDR_SHIFT;
             let shape_id = (p >> PLACED_ADDRESS_BITS) as u32;
             let slot_idx = (shape_id as usize) & (TLS_SHAPE_SLOTS - 1);
             let cached = TLS_VIEWS.with(|c| {
@@ -2462,8 +2501,8 @@ mod tests {
         create_placed_uav(null, &resource, &desc, at);
         assert_eq!(view(at), Some(View::Placed(true, resource, desc)));
         assert_eq!(shapes(), 2);
-        // Placed memory past 1 TiB (not title memory) is a table entry.
-        (desc[10], desc[11]) = (0, 0x100);
+        // Placed memory past 16 TiB (not title memory) is a table entry.
+        (desc[10], desc[11]) = (0, 0x1000);
         create_placed_srv(null, &resource, &desc, at);
         assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
         assert_eq!(entries(), 1);
@@ -2558,5 +2597,22 @@ mod tests {
         forget(res_c);
         assert_eq!(view_at(ib, gb), None);
         assert_eq!(view_at(ic, gc), None);
+    }
+
+    #[test]
+    fn placed_views_above_one_tib_stay_inline() {
+        let addr: u64 = 0x175_838f_a160; // > 1 TiB (40 bits), within 64 TiB (46 bits)
+        let resource = [3u32, 0, 0, 0, 512, 0, 512, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        let mut desc = [0u32; 16];
+        desc[0] = 98;
+        desc[1] = 4;
+        desc[10] = addr as u32;
+        desc[11] = (addr >> 32) as u32;
+        let view = View::Placed(false, resource, desc);
+        let before = views_len();
+        let [i, g] = words_for(view.clone());
+        assert_eq!(g >> KIND_SHIFT, PLACED, "placed view above 1 TiB must stay inline");
+        assert_eq!(views_len(), before, "inline placed view must not spill into Views::list");
+        assert_eq!(view_at(i, g), Some(view));
     }
 }

@@ -1859,6 +1859,32 @@ impl State {
         }
     }
 
+    /// Restores only the command-list state that a mid-list `pass_plane`
+    /// (`record_plane_pass`) clobbers: descriptor heaps, root signatures,
+    /// pipeline, topology, render targets, viewports and scissors. Vertex/index
+    /// buffers, blend factor, stencil ref and depth bounds are untouched.
+    fn restore_after_plane_pass(&mut self, list: &HostList) {
+        self.host_pipeline = 0;
+        self.clear_host_roots(None);
+        self.host_heaps = [0; 2];
+        self.host_heaps_set = false;
+        if self.topology_set {
+            self.set_topology(list, self.topology);
+        }
+        self.host_targets = None;
+        if self.targets_set {
+            let handles = std::mem::take(&mut self.target_handles);
+            self.set_targets(list, &handles, self.depth_handle);
+        }
+        if !self.viewports.is_empty() {
+            crate::draw::viewports(list, &self.viewports);
+        }
+        if !self.scissors.is_empty() {
+            let rects = std::mem::take(&mut self.scissors);
+            self.set_scissors(list, &rects);
+        }
+    }
+
     /// The user-data value of a root argument, as translated shaders read
     /// it: a table's byte offset in its heap, a constant's value.
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
@@ -2032,6 +2058,11 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
+        if self.depth != 0 {
+            // Flush any pending depth-plane twin copy before `bind` sets host
+            // heaps/root/PSO so a mid-list `pass_plane` never clobbers them.
+            list.twin_use(self.depth as This, false, false);
+        }
         if !self.bind(list, p, false) {
             return None;
         }
@@ -2153,6 +2184,43 @@ impl State {
             once!("a dispatch without a view heap that needs one gets the title's");
             self.heaps[0] = heap;
         }
+        // The depth target a draw only tests, for the views of it that the
+        // draw's shaders read (`readable`). Set before `tables` so depth-read
+        // transitions and mid-list `pass_plane` flushes complete BEFORE we bind
+        // host descriptor heaps, root signatures, pipeline state and root args.
+        let tested = if !compute && self.depth_state == DEPTH_READ {
+            self.depth
+        } else {
+            0
+        };
+        TESTED_DEPTH.set((tested, false));
+        let mut stage_tables_inline: [Option<Few<(u8, u32), 16>>; 6] = [const { None }; 6];
+        let mut stage_tables_overflow: Vec<Few<(u8, u32), 16>> = Vec::new();
+        for (idx, stage) in p.stages.iter().enumerate() {
+            let t = stage.translated();
+            STORES.set(t.stores);
+            if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
+                crate::picked::runs_in(list);
+            }
+            let made = self.tables(list, &t.tables, compute);
+            STORES.set(true);
+            if made.iter().any(|m| m.1 == u32::MAX) {
+                once!("a draw whose descriptor table found no free slots is dropped");
+                return false;
+            }
+            if stage.shader.ambient.is_some() || stage.shader.probe.is_some() {
+                self.ambient_tables.clear();
+                self.ambient_tables.extend(made.iter().copied());
+            }
+            if let Some(slot) = stage_tables_inline.get_mut(idx) {
+                *slot = Some(made);
+            } else {
+                stage_tables_overflow.push(made);
+            }
+        }
+        if list.take_plane_clobbered() {
+            self.restore_after_plane_pass(list);
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them, with both a view heap and a sampler heap bound.
         // (`VICTORY_FALLBACK_HEAPS=1`, codec-d/cool_fox 641835a4: a host
@@ -2201,14 +2269,6 @@ impl State {
             self.host_heaps_set = true;
             self.clear_host_roots(None);
         }
-        // The depth target a draw only tests, for the views of it that the
-        // draw's shaders read (`readable`).
-        let tested = if !compute && self.depth_state == DEPTH_READ {
-            self.depth
-        } else {
-            0
-        };
-        TESTED_DEPTH.set((tested, false));
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
@@ -2231,22 +2291,13 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
-        for stage in &p.stages {
+        for (idx, stage) in p.stages.iter().enumerate() {
+            let made = if idx < stage_tables_inline.len() {
+                stage_tables_inline[idx].as_ref().unwrap()
+            } else {
+                &stage_tables_overflow[idx - stage_tables_inline.len()]
+            };
             let t = stage.translated();
-            STORES.set(t.stores);
-            if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
-                crate::picked::runs_in(list);
-            }
-            let made = self.tables(list, &t.tables, compute);
-            STORES.set(true);
-            if made.iter().any(|m| m.1 == u32::MAX) {
-                once!("a draw whose descriptor table found no free slots is dropped");
-                return false;
-            }
-            if stage.shader.ambient.is_some() || stage.shader.probe.is_some() {
-                self.ambient_tables.clear();
-                self.ambient_tables.extend(made.iter().copied());
-            }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
@@ -3117,17 +3168,24 @@ impl State {
                 }
             }
             let schedule_recheck = |address, bytes| {
+                // Aliased textures (physical pages mapped at another virtual address where
+                // the title writes/streams in place) are marked `changed_in_place` up front
+                // so they recheck within 4 frames instead of staying black for 192-968 frames.
+                let aliased = !changed_in_place
+                    && !crate::inplace::shown_elsewhere(address as usize & !0xffff, (address + bytes) as usize)
+                        .is_empty();
+                let wait = if aliased { RECHECK_FRAMES[0].min(4) } else { again_in };
                 host.texture_slot_recheck(
                     index,
                     write,
-                    frame + again_in,
+                    frame + wait,
                     TextureRecheck {
                         address,
                         bytes,
                         fingerprint: crate::texture::fingerprint(address, bytes),
                         unchanged_looks: 0,
                         uploaded: frame,
-                        changed_in_place,
+                        changed_in_place: changed_in_place || aliased,
                     },
                 );
             };
@@ -3188,6 +3246,7 @@ impl State {
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
                     refused += 1;
+                    crate::descriptor::host::TEX_HEALTH[4].fetch_add(1, Ordering::Relaxed);
                     if full_card_pass() {
                         // Held back for the frames of about four seconds
                         // (`most`), or until the card has room; the pass
@@ -3453,18 +3512,17 @@ impl State {
         self.window = None;
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
-            {
+            if crate::pipeline::drop_log_on() {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
-                self.list_dropped_roots([x, y, z]);
             }
+            #[cfg(feature = "diagnostics")]
+            self.list_dropped_roots([x, y, z]);
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -3473,11 +3531,9 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_drop(self.pipeline as This);
             #[cfg(feature = "diagnostics")]
-            {
-                crate::pipeline::note_drop(self.pipeline as This);
-                self.list_dropped_roots([x, y, z]);
-            }
+            self.list_dropped_roots([x, y, z]);
             return;
         };
         if !p.compute {
@@ -3980,6 +4036,8 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
+            #[cfg(not(feature = "diagnostics"))]
+            crate::pipeline::note_drop(self.pipeline as This);
         }
     }
 
@@ -4659,6 +4717,8 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
+            #[cfg(not(feature = "diagnostics"))]
+            crate::pipeline::note_drop(self.pipeline as This);
         }
     }
 
@@ -4853,7 +4913,6 @@ impl State {
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
@@ -4864,12 +4923,12 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
-        #[cfg(feature = "diagnostics")]
-        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
-        #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
+        let why = |what: &str| {
+            if crate::pipeline::drop_log_on() {
+                crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+            }
+        };
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };

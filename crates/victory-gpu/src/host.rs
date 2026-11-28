@@ -1847,6 +1847,11 @@ pub(crate) struct HostList {
     epoch: std::sync::atomic::AtomicU64,
     resets: std::sync::atomic::AtomicU32,
     oom_retired: AtomicBool,
+    /// Set when `pass_plane` runs mid-list inside `twin_use` so the next draw
+    /// or dispatch restores the host command-list state `record_plane_pass`
+    /// clobbered (heaps, root signature, PSO, render targets, viewport,
+    /// scissor, topology).
+    plane_clobbered: AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -5160,6 +5165,7 @@ impl Host {
             epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
             resets: std::sync::atomic::AtomicU32::new(0),
             oom_retired: AtomicBool::new(false),
+            plane_clobbered: AtomicBool::new(false),
             _alive: Counted::new(),
             #[cfg(feature = "diagnostics")]
             notes,
@@ -7786,6 +7792,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.plane_clobbered.store(false, Ordering::Relaxed);
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7843,6 +7850,14 @@ impl HostList {
     /// See [`HostList::changed_something`].
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// Returns true once if a mid-list `pass_plane` clobbered command-list
+    /// graphics state since the last restore.
+    #[inline]
+    pub(crate) fn take_plane_clobbered(&self) -> bool {
+        self.plane_clobbered.load(Ordering::Relaxed)
+            && self.plane_clobbered.swap(false, Ordering::AcqRel)
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -7993,18 +8008,32 @@ impl HostList {
         if was != (u.needs, u.behind, u.writing) || copy || colour {
             self.changed_something();
         }
-        // shortcut: the depth plane's twin is not drawn into the plane
-        // here: the pass sets a pipeline and a target of ours, which a list
-        // still recording the title's commands cannot take. This use sees
-        // the plane as it was; the pass runs when the list closes
-        // (`twins_to_depth`). Counted.
-        if copy && !colour && twin.plane.is_some() {
-            u.late = true;
-            crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
+        // When the depth texture's colour/plane twin was written earlier in
+        // this same list and the depth plane is now read or bound, run
+        // `pass_plane` immediately so this pass sees fresh depth instead of
+        // 1-frame-stale depth, and flag `plane_clobbered` so `State::bind`
+        // restores the graphics state `record_plane_pass` touches.
+        let flush_plane = copy && !colour && twin.plane.is_some();
+        if flush_plane
+            && crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed) == 0
+        {
+            // SAFETY: a live host depth texture.
+            let d = unsafe { depth.texture.GetDesc() };
+            tracing::info!(
+                width = d.Width,
+                height = d.Height,
+                format = d.Format.0,
+                mips = d.MipLevels,
+                "first mid-list depth plane pass flushed before depth use (PLANES[2])"
+            );
         }
         drop(twins);
         if copy {
             self.twin_copy(&depth, &twin, colour);
+            if flush_plane {
+                self.pass_plane(&depth, &twin);
+                self.plane_clobbered.store(true, Ordering::Release);
+            }
         } else if colour {
             self.settle(&twin.colour, UNORDERED_ACCESS);
         }
@@ -10997,7 +11026,6 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             let slow = crate::watch::slow_asks();
             // Over the same frames as the counts above.
-            #[cfg(feature = "diagnostics")]
             let drops = crate::pipeline::take_drops();
             if !five {
                 return;
@@ -11035,6 +11063,25 @@ impl Meter {
                     u8::from(crate::descriptor::host::show_new_later()),
                     crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
                 );
+                {
+                    let th = [0, 1, 2, 3, 4, 5, 6].map(|i| crate::descriptor::host::TEX_HEALTH[i].load(Ordering::Relaxed));
+                    tracing::info!(
+                        "TEX_HEALTH (totals): flip_ok={} flip_none_req={} flip_unmap_req={} flip_stale={} neutral={} null_no_room={} null_unmapped={} null_stale={} refused_no_room={} ahead_req={} recheck_chg={} views={}/{}",
+                        th[5],
+                        th[0],
+                        th[1],
+                        th[6],
+                        crate::descriptor::host::neutral_hits(),
+                        th[2],
+                        crate::descriptor::host::STALE[4].load(Ordering::Relaxed),
+                        crate::descriptor::host::STALE[0].load(Ordering::Relaxed),
+                        th[4],
+                        th[3],
+                        crate::draw::HEAP_TEXTURES_RECHECKED[1].load(Ordering::Relaxed),
+                        crate::descriptor::views_len(),
+                        crate::descriptor::VIEWS_GEN_CAP
+                    );
+                }
                 tracing::info!("textures shown, since the start (crate::texlate): {}", crate::texlate::line());
                 if let Some(line) = crate::texstore::line() {
                     tracing::info!("{line}");
@@ -11140,12 +11187,12 @@ impl Meter {
                     );
                     traffic::line(copy_stats_frames);
                     crate::copystat::log(copy_stats_frames);
-                    for (why, n) in drops.iter().take(40) {
-                        tracing::info!(
-                            "dropped {:.1}/frame without a host pipeline: {why}",
-                            *n as f64 / frames
-                        );
-                    }
+                }
+                for (why, n) in drops.iter().take(40) {
+                    tracing::info!(
+                        "dropped {:.1}/frame without a host pipeline: {why}",
+                        *n as f64 / frames
+                    );
                 }
         });
         if !update_caption {

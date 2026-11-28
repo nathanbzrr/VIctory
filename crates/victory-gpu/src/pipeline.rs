@@ -626,10 +626,32 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
-/// Draws and dispatches dropped since the last [`take_drops`], by reason
-/// (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// Whether dropped draws/dispatches are tallied by reason (`VICTORY_DROP_LOG=1`
+/// in release builds; always on with `diagnostics`).
+#[cfg(windows)]
+#[inline]
+pub(crate) fn drop_log_on() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        true
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_DROP_LOG").is_some_and(|v| v != "0"))
+    }
+}
+
+/// Draws and dispatches dropped since the last [`take_drops`], by reason.
+#[cfg(windows)]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+/// Lock-free fast counter for the dominant RT-off drop reason (~2,000/frame across
+/// parallel recording threads), avoiding `String` allocs and global `DROPS` lock contention.
+#[cfg(windows)]
+static DROPS_RT_OFF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+const RT_OFF_REASON: &str = "a stage of the ray-tracing structure builder, which is off";
 
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(windows)]
@@ -668,7 +690,7 @@ fn skipped_shader_in(shaders: &[Arc<Shader>]) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     if !p.skipped {
         return None;
@@ -683,9 +705,12 @@ pub(crate) fn is_skipped(this: This) -> bool {
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
-/// for want of a host pipeline (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// for want of a host pipeline.
+#[cfg(windows)]
 pub(crate) fn note_drop(this: This) {
+    if !drop_log_on() {
+        return;
+    }
     let why = if this.is_null() {
         Some("no pipeline set".to_owned())
     } else {
@@ -699,19 +724,39 @@ pub(crate) fn note_drop(this: This) {
     }
 }
 
-/// Counts a draw or dispatch dropped for `why` (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// Counts a draw or dispatch dropped for `why`.
+#[cfg(windows)]
 pub(crate) fn note_why(why: String) {
+    if !drop_log_on() {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
     crate::capture::op(0, || format!("DROPPED {why}"));
+    if why == RT_OFF_REASON {
+        DROPS_RT_OFF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
     *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
 }
 
-/// The drops counted since the last call, most first (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// The drops counted since the last call, most first.
+#[cfg(windows)]
 pub(crate) fn take_drops() -> Vec<(String, u64)> {
-    let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let mut drops: Vec<(String, u64)> = drops.into_iter().flatten().collect();
+    if !drop_log_on() {
+        return Vec::new();
+    }
+    let rt_off = DROPS_RT_OFF.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let mut drops: Vec<(String, u64)> = DROPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .into_iter()
+        .flatten()
+        .collect();
+    if rt_off > 0 {
+        drops.push((RT_OFF_REASON.to_owned(), rt_off));
+    }
     // Frame reports only show the first 40 reasons. Keep ties ordered so
     // a HashMap iteration order change cannot change which reasons appear.
     drops.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));

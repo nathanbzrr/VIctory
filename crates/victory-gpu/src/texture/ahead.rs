@@ -50,7 +50,10 @@ pub(crate) fn on() -> bool {
 }
 
 enum State {
-    Pending(Vec<Box<dyn FnOnce() + Send>>),
+    Pending {
+        on_ok: Vec<Box<dyn FnOnce() + Send>>,
+        on_fail: Vec<Box<dyn FnOnce() + Send>>,
+    },
     Done,
     Failed,
 }
@@ -69,12 +72,27 @@ impl Job {
     pub(crate) fn then(&self, f: impl FnOnce() + Send + 'static) {
         let mut state = self.then.lock().unwrap_or_else(|e| e.into_inner());
         match &mut *state {
-            State::Pending(cbs) => cbs.push(Box::new(f)),
+            State::Pending { on_ok, .. } => on_ok.push(Box::new(f)),
             State::Done => {
                 drop(state);
                 f();
             }
             State::Failed => {}
+        }
+    }
+
+    /// Calls `f` if the upload fails or cannot detile a complete texture: now
+    /// if it already failed, never if it succeeded. Used to re-queue slots
+    /// that were placed on the neutral placeholder while waiting for this job.
+    pub(crate) fn on_fail(&self, f: impl FnOnce() + Send + 'static) {
+        let mut state = self.then.lock().unwrap_or_else(|e| e.into_inner());
+        match &mut *state {
+            State::Pending { on_fail, .. } => on_fail.push(Box::new(f)),
+            State::Done => {}
+            State::Failed => {
+                drop(state);
+                f();
+            }
         }
     }
 
@@ -98,8 +116,9 @@ static ON_THEIR_WAY: Mutex<Vec<(u64, Option<Arc<Job>>)>> = Mutex::new(Vec::new()
 static LANDED: Condvar = Condvar::new();
 static BYTES: AtomicU64 = AtomicU64::new(0);
 /// Since the start: uploads, bytes, microseconds from the asking until the
-/// copy had run, the longest; askings turned down; waits of lists.
-static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// copy had run, the longest; askings turned down; waits of lists; failed/empty
+/// jobs handed back to lists.
+static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 struct Starting(Option<Arc<HostTexture>>);
 
@@ -192,7 +211,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         staging,
         copy,
         asked: std::time::Instant::now(),
-        then: Mutex::new(State::Pending(Vec::new())),
+        then: Mutex::new(State::Pending { on_ok: Vec::new(), on_fail: Vec::new() }),
     });
     BYTES.fetch_add(job.staging.read as u64, Relaxed);
     {
@@ -302,7 +321,12 @@ impl Worker {
             }
             let failed: Vec<_> = jobs.extract_if(.., |job| {
                 job.staging.refresh();
-                job.staging.last.lock().unwrap_or_else(|e| e.into_inner()).incomplete
+                let last = job.staging.last.lock().unwrap_or_else(|e| e.into_inner());
+                // Treat an un-detiled staging buffer (`hash.is_none()`, e.g.
+                // unlocked read missed remapped pages or read all zeros) as
+                // failed so we never upload uninitialized/zero texels and mark
+                // the texture done.
+                last.incomplete || last.hash.is_none()
             }).collect();
             if !failed.is_empty() {
                 finish(failed, false);
@@ -386,7 +410,13 @@ fn finish(jobs: Vec<Arc<Job>>, ok: bool) {
     }
     for job in &jobs {
         if !ok {
-            *job.then.lock().unwrap_or_else(|e| e.into_inner()) = State::Failed;
+            STATS[6].fetch_add(1, Relaxed);
+            let then = std::mem::replace(&mut *job.then.lock().unwrap_or_else(|e| e.into_inner()), State::Failed);
+            if let State::Pending { on_fail, .. } = then {
+                for f in on_fail {
+                    f();
+                }
+            }
             continue;
         }
         let us = job.asked.elapsed().as_micros() as u64;
@@ -396,17 +426,18 @@ fn finish(jobs: Vec<Arc<Job>>, ok: bool) {
         let most = STATS[3].fetch_max(us, Relaxed).max(us);
         if n == 1 || n.is_multiple_of(5000) {
             tracing::info!(
-                "textures uploaded ahead of the lists (VICTORY_UPLOAD_AHEAD=1), since the start: {n}, {} MB, {:.1} ms from the asking until they were there, the longest {:.0}; {} turned down, {} waited for by lists",
+                "textures uploaded ahead of the lists (VICTORY_UPLOAD_AHEAD=1), since the start: {n}, {} MB, {:.1} ms from the asking until they were there, the longest {:.0}; {} turned down, {} waited for by lists, {} failed/requeued",
                 bytes >> 20,
                 all as f64 / n as f64 / 1e3,
                 most as f64 / 1e3,
                 STATS[4].load(Relaxed),
-                STATS[5].load(Relaxed)
+                STATS[5].load(Relaxed),
+                STATS[6].load(Relaxed)
             );
         }
         let then = std::mem::replace(&mut *job.then.lock().unwrap_or_else(|e| e.into_inner()), State::Done);
-        if let State::Pending(cbs) = then {
-            for f in cbs {
+        if let State::Pending { on_ok, .. } = then {
+            for f in on_ok {
                 f();
             }
         }
@@ -550,12 +581,20 @@ mod tests {
         }
         let Some(Taken::New(job)) = claim(texture, 0, u64::MAX) else { panic!("not taken") };
         let ran = Arc::new(AtomicBool::new(false));
+        let failed_cb = Arc::new(AtomicBool::new(false));
         let ran_cb = ran.clone();
+        let failed_cb_ref = failed_cb.clone();
         job.then(move || ran_cb.store(true, Relaxed));
+        job.on_fail(move || failed_cb_ref.store(true, Relaxed));
         finish(vec![job.clone()], false);
         let ran_late = ran.clone();
+        let failed_late = Arc::new(AtomicBool::new(false));
+        let failed_late_ref = failed_late.clone();
         job.then(move || ran_late.store(true, Relaxed));
+        job.on_fail(move || failed_late_ref.store(true, Relaxed));
         assert!(!ran.load(Relaxed));
+        assert!(failed_cb.load(Relaxed));
+        assert!(failed_late.load(Relaxed));
         assert!(!there(texture));
         assert_eq!(copy.ahead.load(Acquire), LISTED);
         assert!(!job.staging.uploaded.load(Acquire));

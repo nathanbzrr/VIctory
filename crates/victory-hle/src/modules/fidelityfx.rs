@@ -763,6 +763,38 @@ fn record_dispatch(
                 jitter = ?dispatch.jitter, motion_vector_scale = ?dispatch.motion_scale,
                 "FidelityFX 4 recorded the title's temporal dispatch");
         });
+        {
+            static DISPATCH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = DISPATCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 120 || n.is_multiple_of(300) {
+                let f = |i: usize| f32::from_bits(title.settings[i]);
+                tracing::info!(
+                    dispatch = n,
+                    render = ?title.render_size,
+                    output = ?output_size,
+                    jitter = ?title.jitter,
+                    mv_scale = ?title.motion_scale,
+                    frame_ms = f(2),
+                    pre_exp = f(3),
+                    reset = title.settings[4] & 0xff != 0,
+                    cam = ?[f(5), f(6), f(7), f(8)],
+                    disp_flags = format_args!("{:#x}", title.settings[9]),
+                    ctx_flags = format_args!("{:#x}", ctx.creation.description.flags),
+                    has_exp = !title.resources[3].resource.is_null(),
+                    has_reactive = !title.resources[4].resource.is_null(),
+                    has_transp = !title.resources[5].resource.is_null(),
+                    fmt_descs = ?[
+                        title.resources[0].description[1],
+                        title.resources[1].description[1],
+                        title.resources[2].description[1],
+                        title.resources[4].description[1],
+                        title.resources[6].description[1],
+                    ],
+                    states = ?title.resources.map(|r| r.state),
+                    "FSR_TELEMETRY"
+                );
+            }
+        }
     } else {
         once!(
             warn,

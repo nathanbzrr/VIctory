@@ -3389,6 +3389,9 @@ fn open_given(g: &Guards, start: usize, end: usize, given: Option<&[usize]>) -> 
                 None => crate::inplace::pages_of(block * BLOCK).into_iter().map(|p| p / BLOCK).collect(),
             };
             for other in others {
+                // A write through this view also updates any placed texture viewing the
+                // same physical 64 KiB page at an aliased virtual address.
+                crate::descriptor::host::remapped(other * BLOCK, BLOCK);
                 if one {
                     // Before the first can be written.
                     g.clean.remove(other);
@@ -3459,6 +3462,36 @@ pub fn writing(at: usize, len: usize) {
     }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+}
+
+/// Like [`writing`], plus notifies any other title virtual addresses that map
+/// the same physical 64 KiB pages (`crate::inplace::shown_elsewhere`). Used by
+/// DirectStorage plain-address reads (`PAGE_DESTINATION == 0`) so placed
+/// textures viewing the same physical pages at aliased VAs re-upload promptly.
+pub fn writing_with_aliases(at: usize, len: usize) {
+    writing(at, len);
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let aliases = crate::inplace::shown_elsewhere(at & !(BLOCK - 1), end);
+    if aliases.is_empty() {
+        return;
+    }
+    let mut pages: Vec<usize> = aliases.into_iter().flat_map(|(_, others)| others).collect();
+    pages.sort_unstable();
+    pages.dedup();
+    let mut i = 0;
+    while i < pages.len() {
+        let start = pages[i];
+        let mut run_end = start.saturating_add(BLOCK);
+        i += 1;
+        while i < pages.len() && pages[i] == run_end {
+            run_end = run_end.saturating_add(BLOCK);
+            i += 1;
+        }
+        writing(start, run_end - start);
+    }
 }
 
 /// The kernel writes title memory `[at, at + len)` until what this returns
@@ -3602,10 +3635,18 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
 /// again - and are, the pages noted written, which also has the next check
 /// guard the new view ([`cover`]).
 pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
+    let ranges = crate::inplace::views_of_section(section, offset, len);
+    // If these physical pages are aliased across multiple virtual views, notify
+    // placed texture slots at every alias so textures filled via a temporary
+    // write-alias mapping re-upload immediately instead of staying black/stale.
+    if ranges.len() >= 2 {
+        for &(at, n) in &ranges {
+            crate::descriptor::host::remapped(at, n);
+        }
+    }
     if !view_guard() {
         return;
     }
-    let ranges = crate::inplace::views_of_section(section, offset, len);
     // (A block is noted in `PROTECTED` ahead of the look at its page's views
     // that did not find this one yet.)
     if !ranges.iter().any(|&(at, n)| PROTECTED.any(at / BLOCK, (at + n).div_ceil(BLOCK))) {
@@ -3999,8 +4040,15 @@ fn forget_views(first: usize, last: usize) {
 /// block of the range known unmapped.
 fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'static, Guards> {
     // A placed texture there arrives, goes or changes with no descriptor
-    // written.
+    // written. Also notify any other virtual views sharing the same physical
+    // pages BEFORE `views_gone` removes this mapping (fixes temporary write-alias
+    // uploads leaving placed sand/asphalt/vehicle textures black for 500-3800 frames).
     crate::descriptor::host::remapped(at, len);
+    if len != 0 {
+        for other in elsewhere(at, len).into_iter().flat_map(|(_, others)| others) {
+            crate::descriptor::host::remapped(other, BLOCK);
+        }
+    }
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.

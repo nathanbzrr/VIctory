@@ -1184,14 +1184,29 @@ extern "system" fn copy_page_mappings(
     batches: *const PageBatch,
     pool: u64,
     pool_pages: u32,
-    _flags: u32,
+    flags: u32,
 ) -> HRESULT {
+    const FLAG_2MB_PAGES: u32 = 2;
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
+    let page = if flags & FLAG_2MB_PAGES != 0 {
+        static ONCE_2MB: std::sync::Once = std::sync::Once::new();
+        ONCE_2MB.call_once(|| {
+            tracing::info!(
+                pool = format_args!("{pool:#x}"),
+                pool_pages,
+                flags,
+                "CopyPageMappingsBatchX using 2 MiB pages (D3D12XBOX_PAGE_MAPPING_FLAG_2MB_PAGES)"
+            );
+        });
+        2 << 20
+    } else {
+        PAGE
+    };
     let _called = crate::timeline::span("the title's CopyPageMappings");
     let batches = (count > 0).then(|| {
         // SAFETY: the title passes `count` batches.
@@ -1215,12 +1230,12 @@ extern "system" fn copy_page_mappings(
         let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
         let mut at = b.destination;
         for r in ranges {
-            let len = u64::from(r.count) * PAGE;
+            let len = u64::from(r.count) * page;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
-            let source = pool + u64::from(r.start) * PAGE;
+            let source = pool + u64::from(r.start) * page;
             ok &= match r.kind {
                 0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
+                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * page, source, page)),
                 2 => map(at, 0, len),
                 3 => true,
                 _ => false,

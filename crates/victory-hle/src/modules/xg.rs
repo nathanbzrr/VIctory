@@ -56,8 +56,11 @@ const TEXTURE_3D: u32 = 4;
 /// than every copy we could check. Revisit if streamed textures come out
 /// scrambled.
 fn suggested(desc: &ResourceDesc) -> Swizzle {
+    const LAYOUT_64KB_UNDEFINED: u32 = 2;
     if desc.dimension == TEXTURE_1D {
         Swizzle::LINEAR
+    } else if desc.layout == LAYOUT_64KB_UNDEFINED {
+        Swizzle::SW_64KB_D
     } else if desc.flags & ALLOW_DEPTH_STENCIL != 0 {
         Swizzle::SW_64KB_Z_X
     } else if desc.flags & ALLOW_RENDER_TARGET != 0 {

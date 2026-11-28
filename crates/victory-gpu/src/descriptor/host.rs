@@ -535,7 +535,12 @@ fn neutral() -> Option<&'static ID3D12Resource> {
             // SAFETY: the buffer's mapping; plain creation and recording,
             // waited for before what it names goes.
             unsafe {
-                std::ptr::write_bytes(data, 0x80, 256);
+                // RGB = 0x80 (~0.502 neutral midpoint for diffuse/normal/roughness),
+                // A = 0x7F (~0.498 < 0.5) so alpha-cutout foliage/leaf cards cleanly
+                // discard while streaming instead of flashing solid/stippled grey quads.
+                for pixel in std::slice::from_raw_parts_mut(data, 256).chunks_exact_mut(4) {
+                    pixel.copy_from_slice(&[0x80, 0x80, 0x80, 0x7F]);
+                }
                 let mut made: Option<ID3D12Resource> = None;
                 device
                     .CreateCommittedResource(
@@ -638,6 +643,25 @@ fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Res
 }
 
 static FLIPS: Mutex<Vec<Flip>> = Mutex::new(Vec::new());
+
+/// Texture slots whose `ahead` copy-queue upload failed or returned empty/incomplete:
+/// `(heap_ptr, slot_index, handle, record_key)`. Drained by `texture_slots_remapped`
+/// so the slot is immediately re-queued for normal list upload instead of remaining
+/// permanently stuck on the flat grey `neutral` placeholder.
+static AHEAD_REQUEUE: Mutex<Vec<(usize, u32, u64, u64)>> = Mutex::new(Vec::new());
+
+/// Zero-overhead atomic texture-lifecycle health telemetry (logged every 5s as `TEX_HEALTH`):
+/// `[0]` flip `make()` returned `None` (re-queued), `[1]` flip found unmapped (re-queued),
+/// `[2]` `mirror()` dropped `keep_shown` to `NULL` due to `!room_lately()`,
+/// `[3]` `ahead` copy-queue failure/empty re-queued, `[4]` upload refused due to `!room`,
+/// `[5]` successful `texture_slots_flip`, `[6]` flip skipped because slot key changed/gone.
+pub(crate) static TEX_HEALTH: [std::sync::atomic::AtomicU64; 7] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+fn requeue_ahead(heap: usize, index: u32, handle: u64, key: u64) {
+    TEX_HEALTH[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    AHEAD_REQUEUE.lock().unwrap_or_else(|e| e.into_inner()).push((heap, index, handle, key));
+}
 
 /// Makes the slots whose new texture's upload has run
 /// ([`HostHeap::texture_slots_flip`]); on any thread. Not if the heap is at
@@ -804,12 +828,22 @@ impl Spans {
             return Vec::new();
         }
         let rule = self.rule;
-        // The spans the view cannot be there with.
+        // The spans the view cannot be there with. Under `Rule::Start`, two
+        // textures only clash if their byte ranges actually overlap AND one
+        // starts inside the other's head block (`min(HEAD, len)`): small
+        // packed textures (`256B_*` / `LINEAR`, 256-byte aligned on Scarlett)
+        // placed adjacent (`old_end <= start`) must never evict each other.
+        let new_head = HEAD.min(end - start);
         let clashing: Vec<u64> = match rule {
             Rule::Start => self
                 .by_start
-                .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
-                .map(|(at, _)| *at)
+                .range(start.saturating_sub(HEAD - 1)..start.saturating_add(new_head))
+                .filter(|&(&at, &(old_end, _))| {
+                    at < end
+                        && start < old_end
+                        && (at >= start || start < at.saturating_add(HEAD.min(old_end - at)))
+                })
+                .map(|(&at, _)| at)
                 .collect(),
             Rule::Overlap | Rule::Never => self.overlapping(start, end),
         };
@@ -865,9 +899,10 @@ impl Spans {
     }
 
     /// The first span that starts inside `[start, end)` past the first
-    /// [`HEAD`] bytes of it.
+    /// `min(HEAD, len)` bytes of it.
     fn next_start(&self, start: u64, end: u64) -> Option<u64> {
-        self.by_start.range(start.saturating_add(HEAD)..end).next().map(|(at, _)| *at)
+        let head = HEAD.min(end.saturating_sub(start));
+        self.by_start.range(start.saturating_add(head)..end).next().map(|(at, _)| *at)
     }
 
     /// The slots that hold a view of the texture at `start`.
@@ -2132,7 +2167,8 @@ impl HostHeap {
     pub(crate) fn texture_news(&self) -> (u64, bool) {
         let writes = self.textures.lock().unwrap_or_else(|e| e.into_inner()).writes;
         let noted = |ranges: &Mutex<Vec<(u64, u64)>>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
-        (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN))
+        let ahead_retry = !AHEAD_REQUEUE.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+        (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN) || ahead_retry)
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -2215,9 +2251,28 @@ impl HostHeap {
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
+        let mut requeued = 0usize;
+        {
+            let mut pending = AHEAD_REQUEUE.lock().unwrap_or_else(|e| e.into_inner());
+            if !pending.is_empty() {
+                let own = std::ptr::from_ref(self) as usize;
+                let (mine, rest): (Vec<_>, Vec<_>) = pending.drain(..).partition(|&(h, _, _, _)| h == own);
+                *pending = rest;
+                drop(pending);
+                if !mine.is_empty() {
+                    let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+                    for (_, index, handle, key) in mine {
+                        if key != 0 && record_key(handle) == key && !self.tabled_lately(index, frame) {
+                            textures.changed(index, frame, frame);
+                            requeued += 1;
+                        }
+                    }
+                }
+            }
+        }
         let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
-            return 0;
+            return requeued;
         }
         join(&mut ranges);
         let mut slots: Vec<u32> = {
@@ -2232,7 +2287,7 @@ impl HostHeap {
             textures.changed(slot, frame, frame + 1);
         }
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
-        slots.len()
+        slots.len() + requeued
     }
 
     /// Makes the slots of the textures filled with less than was mapped
@@ -2456,6 +2511,9 @@ impl HostHeap {
         let wait = *WAIT.get_or_init(|| {
             std::env::var("VICTORY_TEXTURE_AWAY_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(AWAY_MS)
         });
+        // Under VRAM pressure (`!room_lately`), release already-unmapped textures
+        // promptly (500 ms) so dead streamed-out slots do not starve live cutscene textures.
+        let wait = if crate::resource::room_lately() { wait } else { wait.min(500) };
         let _made = self.made.lock(index);
         let Some(key) = self.made.get(index).filter(|&key| key != 0) else {
             return false;
@@ -2532,7 +2590,7 @@ impl HostHeap {
             let stale = self.note_buffer(index, Some(&view), true);
             let old = view_at(shown as u32, (shown >> 32) as u32);
             let kept = old.is_some_and(|old| match kin(&old, &view) {
-                Kin::Same => true,
+                Kin::Same | Kin::Moved | Kin::Sized => kin(&old, &view).kept(keep_shown()),
                 kin => crate::resource::room_lately() && kin.kept(keep_shown()),
             });
             if shown == 0 || !kept {
@@ -2574,6 +2632,7 @@ impl HostHeap {
             let flip = Flip { after, heap, index, handle, key, late, asked };
             FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
         });
+        job.on_fail(move || requeue_ahead(heap, index, handle, key));
     }
 
     /// [`HostHeap::mirror`] of a slot whose table a draw read: a texture made
@@ -2629,6 +2688,7 @@ impl HostHeap {
             }
         }
         let mut flipped = 0;
+        let mut requeue: Vec<u32> = Vec::new();
         for f in ready {
             let _made = self.made.lock(f.index);
             let Some(shown) = self.made.get(f.index) else {
@@ -2644,9 +2704,10 @@ impl HostHeap {
             let (true, true, Some(view)) = (f.key != 0 && record_key(f.handle) == f.key, there, view) else {
                 FLIPPED[1].fetch_add(1, Relaxed);
                 LATE[4].fetch_add(u64::from(f.late.is_some()), Relaxed);
+                TEX_HEALTH[6].fetch_add(1, Relaxed);
                 continue;
             };
-            // Its memory went meanwhile: the texture pass finds that.
+            // Its memory went meanwhile: re-queue so the texture pass picks it up once mapped again.
             if f.late.is_some()
                 && let View::Placed(_, resource, desc) = &view
             {
@@ -2654,10 +2715,13 @@ impl HostHeap {
                 let len = crate::resource::placed_bytes(resource).unwrap_or(1);
                 if crate::texture::mapped_bytes(address as *const u8, len as usize) == 0 {
                     LATE[4].fetch_add(1, Relaxed);
+                    TEX_HEALTH[1].fetch_add(1, Relaxed);
+                    requeue.push(f.index);
                     continue;
                 }
             }
             if let Some(kept) = make(&view, self.at(f.index)) {
+                TEX_HEALTH[5].fetch_add(1, Relaxed);
                 #[cfg(feature = "diagnostics")]
                 note_before(f.index, shown, if f.late.is_some() { "shown after its upload" } else { "flip" });
                 self.put(f.index);
@@ -2690,6 +2754,18 @@ impl HostHeap {
                 } else {
                     flipped += 1;
                 }
+            } else {
+                // `make()` returned `None` (e.g., host copy evicted before flip ran):
+                // re-queue immediately instead of stranding the slot on `neutral` / `NULL`.
+                TEX_HEALTH[0].fetch_add(1, Relaxed);
+                requeue.push(f.index);
+            }
+        }
+        if !requeue.is_empty() {
+            let frame = crate::frame::current();
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            for slot in requeue {
+                textures.changed(slot, frame, frame + 1);
             }
         }
         FLIPPED[0].fetch_add(flipped as u64, Relaxed);
@@ -3864,7 +3940,15 @@ impl HostHeap {
                 // ([`keep_shown`]): black, then grey for a frame or two is
                 // what popped.
                 if is_texture_view(&old) {
-                    let kept = crate::resource::room_lately() && kin.kept(keep_shown());
+                    let eligible = kin.kept(keep_shown());
+                    // Never drop an already-resident Same/Moved/Sized texture to NULL
+                    // (pitch-black) on a transient `!room_lately()` dip — keeping the
+                    // existing GPU texture costs zero extra VRAM.
+                    let room_ok = matches!(kin, Kin::Moved | Kin::Sized) || crate::resource::room_lately();
+                    let kept = room_ok && eligible;
+                    if !room_ok && eligible {
+                        TEX_HEALTH[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     rewritten(kin, kept);
                     if kept {
                         drop(held);
@@ -3892,9 +3976,12 @@ impl HostHeap {
                     return Some(view);
                 }
                 let old = view_at(shown as u32, (shown >> 32) as u32);
-                let kept = old.is_some_and(|old| match kin(&old, &view) {
-                    Kin::Same => true,
-                    kin => crate::resource::room_lately() && kin.kept(keep_shown()),
+                let kept = old.is_some_and(|old| {
+                    let k = kin(&old, &view);
+                    match k {
+                        Kin::Same | Kin::Moved | Kin::Sized => k.kept(keep_shown()),
+                        _ => crate::resource::room_lately() && k.kept(keep_shown()),
+                    }
                 });
                 if shown == 0 || !kept {
                     #[cfg(feature = "diagnostics")]
@@ -4493,7 +4580,7 @@ fn buffer_srv(
                 }
                 shadow.gpu(shadow.span().0) + first * 4
             };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+            if by > 0 && !(is_cpu_staged_slot(twin) && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
             }
@@ -4618,7 +4705,7 @@ fn buffer_uav(
                 }
                 shadow.gpu(shadow.span().0) + first * 4
             };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+            if by > 0 && !(is_cpu_staged_slot(twin) && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
             }
@@ -6467,6 +6554,30 @@ mod tests {
         assert_eq!(spans.by_slot.get(&9), Some(&b));
     }
 
+    /// Small Scarlett textures (`256B_*` / `LINEAR`, 256-byte aligned) packed
+    /// directly adjacent (`old_end == start`) within 4 KiB of each other do not
+    /// overlap and must never evict each other under `Rule::Start`.
+    #[test]
+    fn packed_small_adjacent_textures_do_not_evict_each_other() {
+        let mut spans = Spans::default();
+        let base = 0x5_5589_7200u64;
+        // 2,560-byte adjacent textures (exact pattern from open-world log).
+        for i in 0..8u64 {
+            let start = base + i * 0xa00;
+            assert!(spans.note(100 + i as u32, start, start + 0xa00, true).is_empty());
+        }
+        // 256-byte adjacent textures.
+        let tiny = 0x6_4308_cb00u64;
+        for i in 0..16u64 {
+            let start = tiny + i * 0x100;
+            assert!(spans.note(200 + i as u32, start, start + 0x100, true).is_empty());
+        }
+        assert_eq!(spans.by_slot.len(), 24);
+        // Replacing one tiny texture at its exact start with a different size evicts only it.
+        assert_eq!(spans.note(300, tiny + 0x300, tiny + 0x380, true), [203]);
+        assert_eq!(spans.by_slot.len(), 24);
+    }
+
     /// A texture written where another starts replaces it: at the same
     /// address with another length, or inside the block of its smallest
     /// levels. The packed neighbours of the one replaced stay.
@@ -6949,6 +7060,7 @@ impl ListViews {
                 .ok()?;
             let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            LIST_VIEWS_RANGE.with(|r| r.set((start, start + step * Self::SLOTS as usize)));
             Some(ListViews { recording: 0, heap, step, start, made: Default::default() })
         }
     }
@@ -6962,6 +7074,21 @@ impl ListViews {
 
 thread_local! {
     static LIST_VIEWS: std::cell::RefCell<Option<ListViews>> = const { std::cell::RefCell::new(None) };
+    /// `(start, end)` CPU handle range of this thread's non-shader-visible `ListViews` heap,
+    /// readable without borrowing `LIST_VIEWS` so `move_raw` can safely patch unaligned raw twins
+    /// built in `make_listed_into` instead of zeroing them to `null_buffer_view`.
+    static LIST_VIEWS_RANGE: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// True when `at` belongs to one of this thread's private CPU-only descriptor heaps
+/// (`staged(false, 1)` or `ListViews`), where `move_raw` may safely patch the AMD descriptor.
+#[inline]
+fn is_cpu_staged_slot(at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
+    if staged(false, 1).is_some_and(|s| s.ptr == at.ptr) {
+        return true;
+    }
+    let (start, end) = LIST_VIEWS_RANGE.with(std::cell::Cell::get);
+    start != 0 && at.ptr >= start && at.ptr < end
 }
 
 /// The view the record `words` names, as this thread made it for `recording`.

@@ -173,6 +173,10 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
         0 if desc.flags & RENDER_TARGET != 0 => Swizzle::SW_64KB_R_X,
         0 => Swizzle::SW_4KB_S,
         1 => Swizzle::LINEAR,
+        // D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE (verified via Scarlett xg_xs.dll: 0x10a)
+        2 => Swizzle::SW_64KB_D,
+        // D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE
+        3 => Swizzle::SW_64KB_S,
         l if l & !0xff == 0x100 => Swizzle(l & 0xff),
         _ => return None,
     };
