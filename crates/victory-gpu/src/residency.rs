@@ -142,20 +142,20 @@ fn next_pressure_for_host(was: bool, physical: u64, commit: u64, total_phys: u64
         return next_pressure_physical(was, physical);
     }
     // On <= 20 GiB RAM hosts (e.g. 16 GB DDR4), Windows normally keeps
-    // `ullAvailPhys` around 650-1100 MiB during Open World gameplay due to
-    // standby file cache even when 4.5-6.0 GiB of commit headroom is free.
-    // Entering pressure at <= 768 MiB and clearing only at >= 1280 MiB latched
-    // `PRESSURED=true` throughout cutscenes and gameplay, throttling texture
-    // streaming to 64 MiB/f (`tex_wait` -> 24,000, missing cutscene textures)
-    // and wiping idle command-list/buffer pools every second.
-    // Enter pressure at <= 384 MiB phys or <= 1792 MiB commit, and clear at
-    // >= 640 MiB phys and >= 2560 MiB commit (all commit safety guards in
-    // `admit_texture_pass`, `critical_commit`, and `emergency_pressure` remain).
+    // `ullAvailPhys` around 200-1100 MiB during Open World gameplay due to
+    // standby file cache even when 4.5-8.5 GiB of commit headroom is free.
+    // Latching pressure at <= 384 MiB phys regardless of commit caused 3x
+    // false pool wipes and 750-1500 ms hitch clusters in Wave 6 while
+    // 4.2-8.5 GiB of commit was free.
+    // Enter pressure when physical is critically low (<= 128 MiB), commit is
+    // low (<= 1792 MiB), or both physical <= 256 MiB and commit < 3072 MiB.
+    // All hard commit safety guards (`admit_texture_pass`, `critical_commit`,
+    // `emergency_pressure`) remain intact.
     if total_phys > 0 && total_phys <= 20 * GIB {
         if was {
-            physical < 640 * MIB || commit < 2560 * MIB
+            physical < 256 * MIB || commit < 2560 * MIB || (physical < 384 * MIB && commit < 3584 * MIB)
         } else {
-            physical <= 384 * MIB || commit <= 1792 * MIB
+            physical <= 128 * MIB || commit <= 1792 * MIB || (physical <= 256 * MIB && commit < 3072 * MIB)
         }
     } else if was {
         physical < 5 * GIB || commit < 6 * GIB
@@ -386,17 +386,17 @@ pub(crate) fn compute_vram_policy(
             dedicated_bytes,
             local_budget_bytes,
             shared_budget_bytes,
-            texture_keep_percent: 72,
-            texture_room_percent: 84,
-            targets_room_mb: 1280,
+            texture_keep_percent: 68,
+            texture_room_percent: 78,
+            targets_room_mb: 1024,
             card_buffers_min_kb: 512,
-            card_buffers_max_mb: (budget_mb / 6).clamp(768, 1280),
+            card_buffers_max_mb: (budget_mb / 6).clamp(768, 1024),
             card_windows_mb: 0,
-            card_windows_percent: 75,
+            card_windows_percent: 72,
             windows_bar_mb: 0,
-            windows_bar_percent: 75,
-            pool_reclaim_percent: 80,
-            pool_spare_kept: 4,
+            windows_bar_percent: 72,
+            pool_reclaim_percent: 76,
+            pool_spare_kept: 2,
             staging_nonlocal_cap_mb: if tight_host_ram { 128 } else { 512 },
             window_budget_mb: if tight_host_ram { 96 } else { 256 },
         },
@@ -424,13 +424,10 @@ pub(crate) fn compute_vram_policy(
             dedicated_bytes,
             local_budget_bytes,
             shared_budget_bytes,
-            // On a 16 GB GPU (~14.9-15.45 GB live DXGI budget):
-            // - With >=32 GB host RAM, fill ~90-94% of live DXGI VRAM (91% keep /
-            //   95% room -> ~13.2-14.2 GB) while leaving ~1.0-1.4 GB against WDDM paging.
-            // - On <=20 GB host RAM (e.g. 16 GB DDR4), cap at 84% keep / 90% room
-            //   (~12.1 GB VRAM, ~2.2 GB shared, ~8.1 GB RAM WS) so Windows does not
-            //   page working set at >10 GB WS (measured +1.8 FPS and -46% max spike
-            //   vs 91% on 16 GB RAM; manual VICTORY_TEXTURE_KEEP_PERCENT still overrides).
+            // Restore proven 90% / 95% texture_room_percent: lowering room_pct
+            // to 84% caused `resource::room()` (which adds targets_room_kept +
+            // card_room_kept on top of raw VRAM) to latch `false` at 2.3 GB
+            // textures (432k `card has no room` refusals -> black world).
             texture_keep_percent: if tight_host_ram {
                 if series_s { 84 } else { 80 }
             } else if series_s {
@@ -439,7 +436,7 @@ pub(crate) fn compute_vram_policy(
                 88
             },
             texture_room_percent: if tight_host_ram { 90 } else { 95 },
-            targets_room_mb: if tight_host_ram { 2048 } else { 1280 },
+            targets_room_mb: if tight_host_ram { 1536 } else { 1280 },
             card_buffers_min_kb: 64,
             card_buffers_max_mb: (budget_mb / 4).clamp(3072, 4096),
             card_windows_mb: if tight_host_ram {
@@ -660,6 +657,8 @@ mod tests {
         assert!(p12.texture_keep_percent <= p16_16ram.texture_keep_percent);
         assert!(p16_16ram.texture_keep_percent < p16_32ram.texture_keep_percent);
         assert!(p16_32ram.texture_keep_percent < p24.texture_keep_percent);
+        assert_eq!(p8.texture_keep_percent, 68);
+        assert_eq!(p8.texture_room_percent, 78);
         // 16 GB GPU on 16 GB RAM avoids OS working-set paging (~12.1 GB VRAM, ~2.2 GB shared)
         assert_eq!(p16_16ram.texture_keep_percent, 84);
         assert_eq!(p16_16ram.texture_room_percent, 90);
@@ -690,11 +689,16 @@ mod tests {
         assert_eq!(vram_keep_for(budget, 12_000 * MIB, 83, Some(2 * GIB)).0, 5_000);
         // Critical commit (<1.5 GiB) steps watermark down to 63% (~9.7 GB)
         assert_eq!(vram_keep_for(budget, 12_000 * MIB, 83, Some(1 * GIB)).0, 3_000);
-        // 16 GB RAM hosts do not latch permanent pressure at 700-1100 MiB free RAM + 4.5-6 GiB commit
+        // 16 GB RAM hosts do not false-latch pool wipes on Windows standby dips when commit >= 3.5 GiB
         assert!(!next_pressure_for_host(false, 768 * MIB, 6 * GIB, 16 * GIB));
-        assert!(next_pressure_for_host(false, 384 * MIB, 6 * GIB, 16 * GIB));
+        assert!(!next_pressure_for_host(false, 362 * MIB, 5594 * MIB, 16 * GIB));
+        assert!(!next_pressure_for_host(false, 192 * MIB, 4174 * MIB, 16 * GIB));
+        assert!(next_pressure_for_host(false, 128 * MIB, 6 * GIB, 16 * GIB));
+        assert!(next_pressure_for_host(false, 256 * MIB, 2500 * MIB, 16 * GIB));
         assert!(next_pressure_for_host(false, 2500 * MIB, 1792 * MIB, 16 * GIB));
-        assert!(next_pressure_for_host(true, 512 * MIB, 4 * GIB, 16 * GIB));
-        assert!(!next_pressure_for_host(true, 640 * MIB, 2560 * MIB, 16 * GIB));
+        assert!(next_pressure_for_host(true, 200 * MIB, 4 * GIB, 16 * GIB));
+        assert!(next_pressure_for_host(true, 300 * MIB, 3000 * MIB, 16 * GIB));
+        assert!(!next_pressure_for_host(true, 300 * MIB, 4000 * MIB, 16 * GIB));
+        assert!(!next_pressure_for_host(true, 384 * MIB, 2560 * MIB, 16 * GIB));
     }
 }

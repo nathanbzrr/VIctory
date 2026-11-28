@@ -4208,8 +4208,13 @@ impl State {
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
-                    let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
+                    let k = u.table_offset_dwords / 8;
+                    let view = if (k as usize) < 64 && u.table_offset_dwords.is_multiple_of(8) {
+                        crate::descriptor::view_words(cached_words[k as usize])
+                    } else {
+                        crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+                    };
+                    if let Some(view) = view {
                         readable(list, u.kind, &view);
                     }
                 }
@@ -4217,8 +4222,12 @@ impl State {
                     if group.entry(k).is_some() {
                         continue;
                     }
-                    let handle = table + u64::from(k) * 32;
-                    if let Some(view) = crate::descriptor::view(handle)
+                    let view = if (k as usize) < 64 {
+                        crate::descriptor::view_words(cached_words[k as usize])
+                    } else {
+                        crate::descriptor::view(table + u64::from(k) * 32)
+                    };
+                    if let Some(view) = view
                         && let Some(kind) = view_kind(&view)
                     {
                         readable(list, kind, &view);
@@ -4318,11 +4327,23 @@ impl State {
                 }
                 // A view this list has made before: its descriptor copied in a
                 // coalesced batch, and nothing more if nothing changed since.
+                let used = group.entry(k);
+                let is_selected = used.is_none() && selected.binary_search(&k).is_ok();
                 if list_views
                     && words[0] == crate::descriptor::VIEW_TAG
-                    && let Some(mut listed) = {
+                    && let Some((mut listed, listed_view_opt)) = {
                         let _p2_li = crate::phase2_prof::span(crate::phase2_prof::t::DRAW_LISTED);
-                        host.make_listed_into(recording, words, index, &mut copy_batch)
+                        let tested = TESTED_DEPTH.get();
+                        host.make_listed_into(
+                            recording,
+                            words,
+                            index,
+                            list.epoch(),
+                            tested.0,
+                            used.map(|u| u.kind),
+                            is_selected,
+                            &mut copy_batch,
+                        )
                     }
                 {
                     if listed.cbv_direct != 0 {
@@ -4352,10 +4373,7 @@ impl State {
                     if listed.kind == Some(victory_shader::native::ResourceType::Cbv) {
                         crate::phase2_prof::inc(crate::phase2_prof::c::CBV_SEEN_LISTED_COPY);
                     }
-                    let kind = group
-                        .entry(k)
-                        .map(|u| u.kind)
-                        .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
+                    let kind = used.map(|u| u.kind).or_else(|| is_selected.then_some(()).and(listed.kind));
                     let was = (listed.ready, listed.tabled);
                     if let Some(kind) = kind {
                         let tested = TESTED_DEPTH.get();
@@ -4363,7 +4381,7 @@ impl State {
                             if listed.ready.2 {
                                 TESTED_DEPTH.set((tested.0, true));
                             }
-                        } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
+                        } else if let Some(view) = listed_view_opt {
                             TESTED_DEPTH.set((tested.0, false));
                             readable(list, kind, &view);
                             let depth = TESTED_DEPTH.get().1;
@@ -4389,7 +4407,6 @@ impl State {
                     }
                     continue;
                 }
-                let used = group.entry(k);
                 match crate::descriptor::view_from_words(words) {
                     Some(View::Constant(address, size)) => {
                         crate::phase2_prof::inc(crate::phase2_prof::c::CBV_SEEN_FALLBACK);
@@ -5606,15 +5623,20 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 }
 
 /// The longest wait, in milliseconds, between two looks at a texture slot
-/// whose memory is not there yet (`VICTORY_TEXTURE_LOOK_MS`; unset: about
-/// four seconds counted in passes, as before). The looks back off 1, 2, 4,
-/// ... frames up to it. Measured (run light-22, `crate::texlate`): from
-/// the last look that found a slot's memory away to its upload, half under
-/// 0.5 s but nine in ten under 32 s: the memory had come long before.
+/// whose memory is not there yet (`VICTORY_TEXTURE_LOOK_MS`; unset: 350 ms;
+/// `0`: legacy pass-based `4000 / took` which often saturated to 256 frames /
+/// 15-32 s and left streamed cutscene & open-world textures missing or gray).
 fn look_ms() -> Option<u64> {
     static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *MS.get_or_init(|| {
-        let ms = std::env::var("VICTORY_TEXTURE_LOOK_MS").ok()?.trim().parse::<u64>().ok().filter(|&ms| ms > 0)?;
+        let ms = match std::env::var("VICTORY_TEXTURE_LOOK_MS") {
+            Ok(v) => match v.trim().parse::<u64>() {
+                Ok(0) => return None,
+                Ok(ms) => ms,
+                Err(_) => 350,
+            },
+            Err(_) => 350,
+        };
         tracing::info!(ms, "texture slots waiting for their memory are looked at at least this often (VICTORY_TEXTURE_LOOK_MS)");
         Some(ms)
     })

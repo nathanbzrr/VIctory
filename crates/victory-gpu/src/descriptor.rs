@@ -1143,7 +1143,7 @@ const DSV_TAG: u32 = u32::from_le_bytes(*b"vDSV");
 
 /// A shader view or sampler as the title described it (descriptions in the
 /// host's layout, kept as words), for the host to build its own from.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum View {
     /// Constant buffer: GPU address and size.
     Constant(u64, u32),
@@ -1200,29 +1200,33 @@ impl View {
 /// without the address: as many as the title has kinds of textures and
 /// buffers, however often it moves them).
 /// `VICTORY_VIEW_INLINE=0`: every view is an entry, as before.
+type FastViewMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<crate::host::AddressHash>>;
+
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
-    index: std::collections::BTreeMap<View, u32>,
+    index: FastViewMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
     free: Vec<u32>,
     /// The shapes of views of placed memory, and where each is.
     shapes: Vec<Shape>,
-    shape_index: std::collections::BTreeMap<Shape, u32>,
+    shape_index: FastViewMap<Shape, u32>,
 }
 
 /// Read far more often than written: every slot a draw reads through a
 /// table is looked up here, on several recording threads at once in the
 /// world. Readers share it; only a view not seen before (a new table entry
 /// or shape) and a released resource take it alone.
-static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
-    list: Vec::new(),
-    index: std::collections::BTreeMap::new(),
-    by_resource: std::collections::BTreeMap::new(),
-    free: Vec::new(),
-    shapes: Vec::new(),
-    shape_index: std::collections::BTreeMap::new(),
+static VIEWS: std::sync::LazyLock<std::sync::RwLock<Views>> = std::sync::LazyLock::new(|| {
+    std::sync::RwLock::new(Views {
+        list: Vec::new(),
+        index: FastViewMap::default(),
+        by_resource: std::collections::BTreeMap::new(),
+        free: Vec::new(),
+        shapes: Vec::new(),
+        shape_index: FastViewMap::default(),
+    })
 });
 pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
@@ -1415,9 +1419,8 @@ fn entry_gen_load(i: u32) -> u32 {
 }
 
 const TLS_SHAPE_SLOTS: usize = 4096;
-const TLS_SHAPE_ID_SLOTS: usize = 2048;
 const TLS_ENTRY_SLOTS: usize = 8192;
-const TLS_VIEW_WORDS_SLOTS: usize = 8192;
+const TLS_VIEW_WORDS_BUCKETS: usize = 4096;
 
 #[derive(Clone, Default)]
 struct TlsViewEntry {
@@ -1429,22 +1432,23 @@ struct TlsViewEntry {
 struct TlsViewsCache {
     /// Append-only `Views::shapes` cache (`shape_id -> Shape`). Never invalidated.
     shapes: Box<[Option<(u32, Shape)>; TLS_SHAPE_SLOTS]>,
-    /// Reverse `Shape -> shape_id` cache for `words_for(View::Placed(..))`. Never invalidated.
-    shape_ids: Box<[Option<(Shape, u32)>; TLS_SHAPE_ID_SLOTS]>,
+    /// Reverse `Shape -> shape_id` map for `words_for(View::Placed(..))`.
+    /// Append-only and never invalidated, eliminating conflict thrashing on `VIEWS_R`.
+    shape_ids: FastViewMap<Shape, u32>,
     /// Per-slot generation-validated table entry cache (`(i, generation) -> View`).
     entries: Box<[TlsViewEntry; TLS_ENTRY_SLOTS]>,
-    /// Reverse `View -> (i, generation)` cache for `words_for()` on table entries,
+    /// 2-way set-associative reverse `View -> (i, generation)` cache for `words_for()`,
     /// validated lock-free via `entry_gen_load(i) == generation`.
-    view_words: Box<[Option<(View, u32, u32)>; TLS_VIEW_WORDS_SLOTS]>,
+    view_words: Box<[[Option<(View, u32, u32)>; 2]; TLS_VIEW_WORDS_BUCKETS]>,
 }
 
 impl TlsViewsCache {
     fn new() -> Self {
         Self {
             shapes: vec![None; TLS_SHAPE_SLOTS].into_boxed_slice().try_into().ok().unwrap(),
-            shape_ids: vec![None; TLS_SHAPE_ID_SLOTS].into_boxed_slice().try_into().ok().unwrap(),
+            shape_ids: FastViewMap::default(),
             entries: vec![TlsViewEntry::default(); TLS_ENTRY_SLOTS].into_boxed_slice().try_into().ok().unwrap(),
-            view_words: vec![None; TLS_VIEW_WORDS_SLOTS].into_boxed_slice().try_into().ok().unwrap(),
+            view_words: vec![[None, None]; TLS_VIEW_WORDS_BUCKETS].into_boxed_slice().try_into().ok().unwrap(),
         }
     }
 }
@@ -1547,18 +1551,6 @@ thread_local! {
 }
 
 #[inline]
-fn hash_shape(shape: &Shape) -> usize {
-    let mut h = u64::from(shape.0) ^ 0x9E37_79B9_7F4A_7C15;
-    for &w in &shape.1 {
-        h = (h.rotate_left(5) ^ u64::from(w)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    }
-    for &w in &shape.2 {
-        h = (h.rotate_left(5) ^ u64::from(w)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    }
-    (h ^ (h >> 32)) as usize
-}
-
-#[inline]
 fn build_placed_view(shape: &Shape, address: u64) -> View {
     let (unordered, resource, rest) = *shape;
     let mut desc = [0u32; 16];
@@ -1583,11 +1575,7 @@ fn words_for(view: View) -> [u32; 2] {
             View::Placed(unordered, resource, desc) => {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
-                    let h = hash_shape(&shape) & (TLS_SHAPE_ID_SLOTS - 1);
-                    let cached = TLS_VIEWS.with(|c| {
-                        let c = c.borrow();
-                        c.shape_ids[h].as_ref().and_then(|(s, id)| (*s == shape).then_some(*id))
-                    });
+                    let cached = TLS_VIEWS.with(|c| c.borrow().shape_ids.get(&shape).copied());
                     let shape_id = match cached {
                         Some(id) => Some(id),
                         None => {
@@ -1596,7 +1584,7 @@ fn words_for(view: View) -> [u32; 2] {
                             if let Some(id) = resolved {
                                 TLS_VIEWS.with(|c| {
                                     let mut c = c.borrow_mut();
-                                    c.shape_ids[h] = Some((shape, id));
+                                    c.shape_ids.insert(shape, id);
                                     c.shapes[(id as usize) & (TLS_SHAPE_SLOTS - 1)] = Some((id, shape));
                                 });
                             }
@@ -1612,13 +1600,19 @@ fn words_for(view: View) -> [u32; 2] {
             _ => {}
         }
     }
-    // A view written before keeps its entry and generation: check lock-free TLS first.
-    let vh = hash_view(&view) & (TLS_VIEW_WORDS_SLOTS - 1);
+    // A view written before keeps its entry and generation: check lock-free 2-way TLS first.
+    let vh = hash_view(&view) & (TLS_VIEW_WORDS_BUCKETS - 1);
     let cached_words = TLS_VIEWS.with(|c| {
         let c = c.borrow();
-        c.view_words[vh].as_ref().and_then(|(v, i, g)| {
-            (*v == view && entry_gen_load(*i) == *g).then_some([*i, *g])
-        })
+        for way in &c.view_words[vh] {
+            if let Some((v, i, g)) = way.as_ref()
+                && *v == view
+                && entry_gen_load(*i) == *g
+            {
+                return Some([*i, *g]);
+            }
+        }
+        None
     });
     if let Some(words) = cached_words {
         return words;
@@ -1632,7 +1626,9 @@ fn words_for(view: View) -> [u32; 2] {
     if entry_gen_load(i) == g {
         TLS_VIEWS.with(|c| {
             let mut c = c.borrow_mut();
-            c.view_words[vh] = Some((view.clone(), i, g));
+            let bucket = &mut c.view_words[vh];
+            bucket[1] = bucket[0].take();
+            bucket[0] = Some((view.clone(), i, g));
             let slot_idx = (i as usize ^ (g as usize).wrapping_mul(0x9E37_79B9)) & (TLS_ENTRY_SLOTS - 1);
             c.entries[slot_idx] = TlsViewEntry { i, generation: g, view: Some(view) };
         });
@@ -1935,16 +1931,21 @@ pub(crate) fn view_from_words(words: [u32; 3]) -> Option<View> {
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
+pub(crate) fn view_words(words: [u32; 3]) -> Option<View> {
+    let [tag, i, generation] = words;
+    if tag != VIEW_TAG {
+        return None;
+    }
+    view_at(i, generation)
+}
+
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
         return None;
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
-    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    if tag != VIEW_TAG {
-        return None;
-    }
-    view_at(i, generation)
+    let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    view_words(words)
 }
 
 /// A description of `N` words, if the title passes one.

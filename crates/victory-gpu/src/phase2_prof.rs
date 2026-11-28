@@ -316,7 +316,7 @@ pub(crate) mod lock {
     ];
 }
 
-static TIMER_US: [AtomicU64; t::COUNT] = [const { AtomicU64::new(0) }; t::COUNT];
+static TIMER_NS: [AtomicU64; t::COUNT] = [const { AtomicU64::new(0) }; t::COUNT];
 static TIMER_CALLS: [AtomicU64; t::COUNT] = [const { AtomicU64::new(0) }; t::COUNT];
 static HIT_COUNTERS: [AtomicU64; c::COUNT] = [const { AtomicU64::new(0) }; c::COUNT];
 
@@ -327,6 +327,8 @@ static LOCK_WAIT_US: [AtomicU64; lock::COUNT] = [const { AtomicU64::new(0) }; lo
 const TLS_BATCH_FLUSH: u64 = 512;
 
 struct TlsState {
+    timer_ns: [Cell<u64>; t::COUNT],
+    timer_calls: [Cell<u64>; t::COUNT],
     hits: [Cell<u64>; c::COUNT],
     lock_acq: [Cell<u64>; lock::COUNT],
     pending: Cell<u64>,
@@ -335,6 +337,8 @@ struct TlsState {
 impl TlsState {
     const fn new() -> Self {
         Self {
+            timer_ns: [const { Cell::new(0) }; t::COUNT],
+            timer_calls: [const { Cell::new(0) }; t::COUNT],
             hits: [const { Cell::new(0) }; c::COUNT],
             lock_acq: [const { Cell::new(0) }; lock::COUNT],
             pending: Cell::new(0),
@@ -346,6 +350,18 @@ impl TlsState {
             return;
         }
         self.pending.set(0);
+        for (i, cell) in self.timer_ns.iter().enumerate() {
+            let v = cell.replace(0);
+            if v != 0 {
+                TIMER_NS[i].fetch_add(v, Relaxed);
+            }
+        }
+        for (i, cell) in self.timer_calls.iter().enumerate() {
+            let v = cell.replace(0);
+            if v != 0 {
+                TIMER_CALLS[i].fetch_add(v, Relaxed);
+            }
+        }
         for (i, cell) in self.hits.iter().enumerate() {
             let v = cell.replace(0);
             if v != 0 {
@@ -382,8 +398,19 @@ impl Drop for Span {
     #[inline(always)]
     fn drop(&mut self) {
         if let Some((slot, started)) = self.slot {
-            TIMER_US[slot].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
-            TIMER_CALLS[slot].fetch_add(1, Relaxed);
+            let ns = started.elapsed().as_nanos() as u64;
+            let _ = TLS.try_with(|t| {
+                let tn = &t.timer_ns[slot];
+                tn.set(tn.get().saturating_add(ns));
+                let tc = &t.timer_calls[slot];
+                tc.set(tc.get().saturating_add(1));
+                let p = t.pending.get() + 1;
+                if p >= TLS_BATCH_FLUSH {
+                    t.flush();
+                } else {
+                    t.pending.set(p);
+                }
+            });
         }
     }
 }
@@ -391,7 +418,7 @@ impl Drop for Span {
 #[inline(always)]
 pub(crate) fn record_time(slot: usize, elapsed_us: u64) {
     if on() {
-        TIMER_US[slot].fetch_add(elapsed_us, Relaxed);
+        TIMER_NS[slot].fetch_add(elapsed_us.saturating_mul(1000), Relaxed);
         TIMER_CALLS[slot].fetch_add(1, Relaxed);
     }
 }
@@ -535,7 +562,7 @@ impl Snapshot {
         Self {
             at: Instant::now(),
             presented,
-            timer_us: std::array::from_fn(|i| TIMER_US[i].load(Relaxed)),
+            timer_us: std::array::from_fn(|i| TIMER_NS[i].load(Relaxed) / 1000),
             timer_calls: std::array::from_fn(|i| TIMER_CALLS[i].load(Relaxed)),
             hits: std::array::from_fn(|i| HIT_COUNTERS[i].load(Relaxed)),
             lock_acq: std::array::from_fn(|i| LOCK_ACQ[i].load(Relaxed)),
@@ -1038,22 +1065,23 @@ struct FrameSnap {
 
 impl FrameSnap {
     fn now() -> Self {
+        let us = |idx: usize| TIMER_NS[idx].load(Relaxed) / 1000;
         Self {
-            sub_total: TIMER_US[t::SUB_TOTAL].load(Relaxed),
-            own_cs: TIMER_US[t::SUB_OWN_CARD_STEPS].load(Relaxed),
-            ref_front: TIMER_US[t::SUB_REFRESH_FRONT].load(Relaxed),
-            run_def: TIMER_US[t::SUB_RUN_DEFERRED].load(Relaxed),
-            prel: TIMER_US[t::SUB_PRELUDE].load(Relaxed),
-            card_bef: TIMER_US[t::SUB_CARD_BEFORE].load(Relaxed),
-            send_take: TIMER_US[t::CB_SEND_TAKE].load(Relaxed),
-            watch_ask: TIMER_US[t::SUB_WATCH_ASK].load(Relaxed),
-            settle_stale: TIMER_US[t::SUB_SETTLE_STALE].load(Relaxed),
-            late_blk: TIMER_US[t::SUB_LATE_BLOCKED].load(Relaxed),
-            heaps_wt: TIMER_US[t::SUB_HEAPS_WAIT].load(Relaxed),
-            pres: TIMER_US[t::SUB_PRESENT].load(Relaxed),
-            pso_us: TIMER_US[t::PSO_CREATE_GFX].load(Relaxed) + TIMER_US[t::PSO_CREATE_CS].load(Relaxed),
-            alloc_us: TIMER_US[t::D3D_ALLOC_COMMIT].load(Relaxed),
-            res_us: TIMER_US[t::D3D_MAKE_RESIDENT].load(Relaxed),
+            sub_total: us(t::SUB_TOTAL),
+            own_cs: us(t::SUB_OWN_CARD_STEPS),
+            ref_front: us(t::SUB_REFRESH_FRONT),
+            run_def: us(t::SUB_RUN_DEFERRED),
+            prel: us(t::SUB_PRELUDE),
+            card_bef: us(t::SUB_CARD_BEFORE),
+            send_take: us(t::CB_SEND_TAKE),
+            watch_ask: us(t::SUB_WATCH_ASK),
+            settle_stale: us(t::SUB_SETTLE_STALE),
+            late_blk: us(t::SUB_LATE_BLOCKED),
+            heaps_wt: us(t::SUB_HEAPS_WAIT),
+            pres: us(t::SUB_PRESENT),
+            pso_us: us(t::PSO_CREATE_GFX) + us(t::PSO_CREATE_CS),
+            alloc_us: us(t::D3D_ALLOC_COMMIT),
+            res_us: us(t::D3D_MAKE_RESIDENT),
             views_r_wt: LOCK_WAIT_US[lock::L_VIEWS_R].load(Relaxed),
             line_wt: LOCK_WAIT_US[lock::L_LINE].load(Relaxed),
             pso_live: HIT_COUNTERS[c::PSO_LIVE_COMPILES].load(Relaxed),

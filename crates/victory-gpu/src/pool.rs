@@ -162,11 +162,37 @@ impl Ranges {
     }
 
     /// The lowest place for `len` bytes at a multiple of `align`.
+    #[cfg(test)]
     fn take(&mut self, len: u64, align: u64) -> Option<u64> {
         let (start, size, at) = self.0.iter().find_map(|(&start, &size)| {
             let at = start.next_multiple_of(align);
             (at + len <= start + size).then_some((start, size, at))
         })?;
+        self.0.remove(&start);
+        if at > start {
+            self.0.insert(start, at - start);
+        }
+        if at + len < start + size {
+            self.0.insert(at + len, start + size - at - len);
+        }
+        Some(at)
+    }
+
+    /// Smallest-sufficient free span for `len` bytes at a multiple of `align`
+    /// (best-fit, tie-breaking by lowest offset). Reduces internal block
+    /// fragmentation so low-occupancy tail blocks drain to empty and return
+    /// physical VRAM to WDDM.
+    fn take_best_fit(&mut self, len: u64, align: u64) -> Option<u64> {
+        let mut best: Option<(u64, u64, u64)> = None;
+        for (&start, &size) in &self.0 {
+            let at = start.next_multiple_of(align);
+            if at + len <= start + size {
+                if best.is_none_or(|(_, best_size, _)| size < best_size) {
+                    best = Some((start, size, at));
+                }
+            }
+        }
+        let (start, size, at) = best?;
         self.0.remove(&start);
         if at > start {
             self.0.insert(start, at - start);
@@ -206,6 +232,8 @@ pub(crate) struct Piece {
 struct Block<B> {
     memory: B,
     free: Ranges,
+    /// Total free bytes currently available in `free` (excluding resting pieces).
+    free_bytes: u64,
     /// The end of the highest piece ever taken: above it the memory is as
     /// it was made (zeros).
     used_to: u64,
@@ -263,12 +291,26 @@ impl<B: Clone> Pool<B> {
             return None;
         }
         self.rested(now);
+        // Best-fit block packing (from commit 6430d57): prefer higher-occupancy
+        // non-empty ripe blocks (smallest `free_bytes < BLOCK`) first so
+        // low-occupancy tail blocks drain to empty and return 64 MiB heaps to
+        // WDDM; fall back to an empty ripe block only if no non-empty block fits.
+        let mut candidates: Vec<(bool, u64, usize)> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                let b = b.as_ref()?;
+                (ripe.is(b) && b.free_bytes >= len).then_some((b.free.whole(BLOCK), b.free_bytes, i))
+            })
+            .collect();
+        candidates.sort_unstable();
         let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
+        for (_, _, i) in candidates {
+            if let Some(block) = self.blocks[i].as_mut()
+                && let Some(start) = block.free.take_best_fit(len, align)
             {
+                block.free_bytes -= len;
                 found = Some((i, start));
                 break;
             }
@@ -278,14 +320,22 @@ impl<B: Clone> Pool<B> {
             let mut unripe: Vec<(u64, usize)> =
                 self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
             unripe.sort_unstable();
-            found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
+            found = unripe.into_iter().find_map(|(_, i)| {
+                let block = self.blocks[i].as_mut()?;
+                let start = block.free.take_best_fit(len, align)?;
+                block.free_bytes -= len;
+                Some((i, start))
+            });
         }
         let (i, start) = match found {
             Some(found) => found,
             None => {
                 let memory = self.grow(now, &mut make)?;
                 let i = self.add(memory, ripe.started);
-                (i, self.blocks[i].as_mut()?.free.take(len, align)?)
+                let block = self.blocks[i].as_mut()?;
+                let start = block.free.take_best_fit(len, align)?;
+                block.free_bytes -= len;
+                (i, start)
             }
         };
         self.unavailable += len;
@@ -331,7 +381,14 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block {
+            memory,
+            free: Ranges::new(BLOCK),
+            free_bytes: BLOCK,
+            used_to: 0,
+            made,
+            since: crate::host::now_ms(),
+        });
         i
     }
 
@@ -355,6 +412,7 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
+                block.free_bytes += piece.len;
                 self.unavailable -= piece.len;
                 any |= block.free.whole(BLOCK);
             }

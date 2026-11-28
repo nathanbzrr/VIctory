@@ -1487,6 +1487,7 @@ pub(crate) fn want_level(this: This, first: u32) {
     r.host.grown.store(true, Relaxed);
     HELD[2].fetch_add(1, Relaxed);
     if let Some(old) = made.take() {
+        r.host.used.store(0, Relaxed);
         REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
     }
 }
@@ -1723,7 +1724,15 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => host_texture(&r.desc.from_level(base), r.host.state, clear),
         };
         let Some(texture) = texture else {
-            r.host.refused.store(true, Relaxed);
+            // Only permanently mark `refused` when the GPU genuinely rejected
+            // the format/description under healthy VRAM/commit headroom; never
+            // permanently kill a texture on a transient memory/OOM dip.
+            let transient = crate::residency::upload_refused()
+                || crate::host::emergency_pressure()
+                || !room_lately();
+            if !transient {
+                r.host.refused.store(true, Relaxed);
+            }
             return None;
         };
         let twin = twin_texture(&r.desc, &texture);
@@ -2180,14 +2189,44 @@ pub(crate) fn let_go_idle() {
             _ => (crate::host::vram_idle_ms(memory), u64::MAX),
         }
     };
+    // Bounded pressured sweep (from commit 6430d57): eliminates 850+ ms
+    // full-table eviction spikes over 100k+ resident bound-slot textures.
+    const EMPTY_PRESSURE_SWEEP_COOLDOWN_MS: u64 = 2_000;
+    const PRESSURE_SWEEP_WINDOW: usize = 16_384;
+    const PRESSURE_MAX_LOCK_CHECKS: usize = 2_048;
+    const MIN_PRESSURE_SWEEP_PROGRESS_BYTES: u64 = 4 << 20;
+    static PRESSURE_FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static PRESSURE_STREAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static LAST_EMPTY_PRESSURE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static LAST_EMPTY_IDLE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+    let now_sweep = crate::host::now_ms();
+    if most != u64::MAX {
+        let last_empty = LAST_EMPTY_PRESSURE_MS.load(Relaxed);
+        let last_idle = LAST_EMPTY_IDLE_MS.load(Relaxed);
+        if last_empty != 0
+            && idle_ms >= last_idle
+            && now_sweep < last_empty.saturating_add(EMPTY_PRESSURE_SWEEP_COOLDOWN_MS)
+        {
+            return;
+        }
+    }
+
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
-    // With a limit, the longest idle first.
+    let full_len = all.len();
+    // With a limit, scan a bounded rolling window (`PRESSURE_SWEEP_WINDOW`),
+    // collecting idle candidates and sorting longest-idle first.
     let mut by_age: Vec<(u64, usize)> = Vec::new();
+    let mut pressure_scanned = 0usize;
     if most != u64::MAX {
-        for &at in all.iter() {
+        let pfrom = PRESSURE_FROM.load(Relaxed);
+        let mut last_at = 0usize;
+        for &at in all.range(pfrom..).take(PRESSURE_SWEEP_WINDOW) {
+            pressure_scanned += 1;
+            last_at = at;
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
@@ -2195,6 +2234,7 @@ pub(crate) fn let_go_idle() {
                 by_age.push((used & 0xffff_ffff, at));
             }
         }
+        PRESSURE_FROM.store(if pressure_scanned == PRESSURE_SWEEP_WINDOW { last_at + 1 } else { 0 }, Relaxed);
         by_age.sort_unstable();
     }
     // Without one, while textures are kept for minutes, a part of them at
@@ -2213,9 +2253,10 @@ pub(crate) fn let_go_idle() {
     };
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
+    let mut lock_checks = 0usize;
     let began = std::time::Instant::now();
     for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
-        if bytes >= most {
+        if bytes >= most || (most != u64::MAX && lock_checks >= PRESSURE_MAX_LOCK_CHECKS) {
             break;
         }
         looked += 1;
@@ -2230,21 +2271,28 @@ pub(crate) fn let_go_idle() {
         if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
             continue;
         }
+        lock_checks += 1;
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
-            });
-            if idle {
-                // Under the lock: the next use must not find the staging
-                // state of the texture let go (it says "uploaded").
-                crate::texture::unstage(at as This);
-                r.host.wanted.store(u32::MAX, Relaxed);
-                made.take()
-            } else {
+            if made.is_none() {
+                r.host.used.store(0, Relaxed);
                 None
+            } else {
+                let idle = made.as_ref().is_some_and(|(host, _)| {
+                    crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                        && std::sync::Arc::strong_count(host) == 1
+                        && crate::host::references(&host.texture) == 1
+                });
+                if idle {
+                    // Under the lock: the next use must not find the staging
+                    // state of the texture let go (it says "uploaded").
+                    crate::texture::unstage(at as This);
+                    r.host.wanted.store(u32::MAX, Relaxed);
+                    r.host.used.store(0, Relaxed);
+                    made.take()
+                } else {
+                    None
+                }
             }
         };
         if let Some((host, _)) = gone {
@@ -2257,6 +2305,21 @@ pub(crate) fn let_go_idle() {
                 first = Some(at);
             }
             crate::host::retire(host);
+        }
+    }
+    if most != u64::MAX {
+        if bytes >= most || bytes >= MIN_PRESSURE_SWEEP_PROGRESS_BYTES {
+            PRESSURE_STREAK.store(0, Relaxed);
+            LAST_EMPTY_PRESSURE_MS.store(0, Relaxed);
+        } else {
+            let next = PRESSURE_STREAK.load(Relaxed).saturating_add(pressure_scanned.max(1));
+            if full_len == 0 || next >= full_len {
+                PRESSURE_STREAK.store(0, Relaxed);
+                LAST_EMPTY_PRESSURE_MS.store(crate::host::now_ms(), Relaxed);
+                LAST_EMPTY_IDLE_MS.store(idle_ms, Relaxed);
+            } else {
+                PRESSURE_STREAK.store(next, Relaxed);
+            }
         }
     }
     SWEPT_US[0].fetch_add(1, Relaxed);

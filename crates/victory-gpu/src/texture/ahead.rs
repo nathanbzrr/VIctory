@@ -143,9 +143,9 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     if copy.ahead.load(Acquire) == PENDING {
         return wait_known(&copy).or_else(turned_down);
     }
-    // (`VICTORY_RESIDENCY=1`: less on its way with 32 GiB of RAM or less,
-    // none while commit is short.)
-    let most = if crate::residency::limited_host_ram() { 32 << 20 } else { MOST };
+    // (`VICTORY_RESIDENCY=1`: bounded on 16-32 GiB RAM hosts, still gated by
+    // `allow_staging_growth(false)` when commit is short.)
+    let most = if crate::residency::limited_host_ram() { 64 << 20 } else { MOST };
     if !crate::residency::allow_staging_growth(false)
         || BYTES.load(Relaxed) >= most
         || copy.flags() & 0x7 != 0

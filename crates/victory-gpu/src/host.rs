@@ -1516,13 +1516,32 @@ fn create() -> windows::core::Result<Host> {
             .ok();
         if let Some(desc) = adapter.as_ref().and_then(|a| a.GetDesc1().ok()) {
             let name = String::from_utf16_lossy(&desc.Description);
+            let adapter_name = name.trim_end_matches('\0');
             tracing::info!(
-                adapter = name.trim_end_matches('\0'),
+                adapter = adapter_name,
                 vendor = format_args!("{:#06x}", desc.VendorId),
                 device = format_args!("{:#06x}", desc.DeviceId),
                 vram_mb = desc.DedicatedVideoMemory >> 20,
                 "host D3D12 adapter"
             );
+            if desc.VendorId != 0x1002 {
+                tracing::warn!(
+                    adapter = adapter_name,
+                    vendor = format_args!("{:#06x}", desc.VendorId),
+                    "non-AMD GPU detected: RAZDA4A XEN is built for AMD RDNA GPUs; \
+                     NVIDIA/Intel adapters may experience black screens or pre-scene crashes"
+                );
+            }
+            if let Some(commit_bytes) = available_commit_bytes() {
+                let commit_gib = commit_bytes >> 30;
+                if commit_gib < 12 {
+                    tracing::warn!(
+                        available_commit_mib = commit_bytes >> 20,
+                        "low Windows commit headroom (< 12 GiB): configure a 24-32 GiB NVMe pagefile \
+                         to prevent OOM crashes during initial world streaming"
+                    );
+                }
+            }
         }
         tracing::info!("host D3D12 device ready");
         // Said once here rather than only as one refusal per pipeline

@@ -283,6 +283,9 @@ pub(crate) struct HostHeap {
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
+    /// Raw COM pointer mirror of `kept` for lock-free same-resource fast-path
+    /// on exclusively-owned dynamic slots (`index >= self.count`).
+    kept_raw: Box<[std::sync::atomic::AtomicUsize]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, DynamicBits)>,
@@ -794,7 +797,10 @@ impl Spans {
             return Vec::new();
         }
         self.forget(index);
-        if end <= start {
+        // Uninitialized / placeholder views with address 0 must not enter
+        // `Spans` or evict one another (prevented 146k+ false `unmake_stale`
+        // null wipes and mutex storms in Wave 6).
+        if start == 0 || end <= start {
             return Vec::new();
         }
         let rule = self.rule;
@@ -1244,22 +1250,50 @@ impl TextureQueue {
 
     /// What [`TextureQueue::due`] says of `due` (with nothing held: some
     /// ten thousand slots are sorted).
+    ///
+    /// Alternates newest and oldest within both `again` and `fresh`, and
+    /// interleaves `again` with `fresh` 1:1 so:
+    /// - previously-queried `again` slots still start first,
+    /// - newly-written `fresh` textures for the current shot/cutscene are never
+    ///   starved behind thousands of unmapped `again` retries, and
+    /// - older `again` slots whose memory streamed in later cannot starve for
+    ///   thousands of frames behind newer retries.
     fn in_order([mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let mut order: Vec<(u32, u64)> = Vec::with_capacity(max.min(again.len() + fresh.len()));
+        let (mut a_new, mut a_old) = (0, again.len());
+        let (mut f_new, mut f_old) = (0, fresh.len());
+        let mut a_take_new = true;
+        let mut f_take_new = true;
+        while order.len() < max && (a_new < a_old || f_new < f_old) {
+            if a_new < a_old {
+                let item = if a_take_new {
+                    let v = again[a_new];
+                    a_new += 1;
+                    v
+                } else {
+                    a_old -= 1;
+                    again[a_old]
+                };
+                a_take_new = !a_take_new;
+                order.push((item.1, item.2));
+            }
+            if order.len() < max && f_new < f_old {
+                let item = if f_take_new {
+                    let v = fresh[f_new];
+                    f_new += 1;
+                    v
+                } else {
+                    f_old -= 1;
+                    fresh[f_old]
+                };
+                f_take_new = !f_take_new;
+                order.push((item.1, item.2));
             }
         }
-        order.truncate(max);
         order
     }
 
@@ -1916,6 +1950,7 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
+            kept_raw: (0..count + extra).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect(),
             next: Mutex::new((0, DynamicBits::new(extra as usize))),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -2993,13 +3028,20 @@ impl HostHeap {
     /// made one, else as [`HostHeap::make_at`] does, and keeps that
     /// ([`ListViews`]). Appends the copy operations to `batch` so an entire
     /// table flushes in 1–2 `CopyDescriptors` COM calls instead of `2 * n`.
+    /// Single-probe fast path on `ListViews::made` hits; also returns `Some(View)`
+    /// when the caller still needs `readable()` for this slot, avoiding a second
+    /// TLS borrow and HashMap lookup (`listed_view`).
     pub(crate) fn make_listed_into(
         &self,
         recording: u64,
         words: [u32; 3],
         index: u32,
+        epoch: u64,
+        tested_depth: usize,
+        kind_override: Option<victory_shader::native::ResourceType>,
+        is_selected: bool,
         batch: &mut CopyBatch,
-    ) -> Option<Listed> {
+    ) -> Option<(Listed, Option<View>)> {
         if self.sampler {
             return None;
         }
@@ -3013,8 +3055,14 @@ impl HostHeap {
                 views.recording = recording;
                 views.made.clear();
             }
+            let (v_start, v_step) = (views.start, views.step);
+            let slot_handle = |at: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: v_start + at as usize * v_step,
+            };
             let twins = self.twins.get(index as usize).is_some();
-            if !views.made.contains_key(&words) {
+            let made: &ListView = if let Some(existing) = views.made.get(&words) {
+                existing
+            } else {
                 let view = super::view_at(words[1], words[2])?;
                 let at = 2 * views.made.len() as u32;
                 if at >= ListViews::SLOTS {
@@ -3100,12 +3148,12 @@ impl HostHeap {
                                 BufferLocation: gpu,
                                 SizeInBytes: cbv_size,
                             };
-                            host.device.CreateConstantBufferView(Some(&cbv), views.slot(at));
+                            host.device.CreateConstantBufferView(Some(&cbv), slot_handle(at));
                         } else {
                             let null_cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
-                            host.device.CreateConstantBufferView(Some(&null_cbv), views.slot(at));
+                            host.device.CreateConstantBufferView(Some(&null_cbv), slot_handle(at));
                         }
-                        host.device.CreateShaderResourceView(&shadow.buffer, Some(&raw), views.slot(at + 1));
+                        host.device.CreateShaderResourceView(&shadow.buffer, Some(&raw), slot_handle(at + 1));
                     }
                     let kept = Some(shadow.buffer.clone());
                     let listed = Listed {
@@ -3116,20 +3164,17 @@ impl HostHeap {
                         ready: (0, 0, false),
                         tabled: None,
                     };
-                    views.made.insert(
-                        words,
-                        ListView {
-                            view,
-                            at,
-                            twin: true,
-                            kept,
-                            cbv_shadow: (direct_kind == 2).then_some((shadow, address, size)),
-                            listed,
-                        },
-                    );
+                    views.made.entry(words).or_insert(ListView {
+                        view,
+                        at,
+                        twin: true,
+                        kept,
+                        cbv_shadow: (direct_kind == 2).then_some((shadow, address, size)),
+                        listed,
+                    })
                 } else {
                     let twin = twinned(&view);
-                    let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                    let kept = make_twinned(&view, slot_handle(at), Some(slot_handle(at + 1)))?;
                     let listed = Listed {
                         kind: crate::draw::view_kind(&view),
                         texture: is_texture_view(&view),
@@ -3138,13 +3183,16 @@ impl HostHeap {
                         ready: (0, 0, false),
                         tabled: None,
                     };
-                    views.made.insert(
-                        words,
-                        ListView { view, at, twin, kept, cbv_shadow: None, listed },
-                    );
+                    views.made.entry(words).or_insert(ListView {
+                        view,
+                        at,
+                        twin,
+                        kept,
+                        cbv_shadow: None,
+                        listed,
+                    })
                 }
-            }
-            let made = &views.made[&words];
+            };
             // In shadow_mode == 2, if this cached CBV range later acquired GPU
             // writes, fall back to the normal CBV path for this draw.
             if made.listed.cbv_direct == 2
@@ -3157,15 +3205,23 @@ impl HostHeap {
                 crate::phase2_prof::inc(crate::phase2_prof::c::CBV_FAIL_LISTED_RECHECK);
                 return None;
             }
-            batch.push_main(self, index, views.slot(made.at));
+            batch.push_main(self, index, slot_handle(made.at));
             if made.twin && twins {
-                batch.push_twin(self, self.raw + index, views.slot(made.at + 1));
+                batch.push_twin(self, self.raw + index, slot_handle(made.at + 1));
                 self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
             } else {
                 self.clear_twin(index);
             }
             self.keep_ref(index, made.kept.as_ref());
-            Some(made.listed)
+            let effective_kind = kind_override.or_else(|| is_selected.then_some(()).and(made.listed.kind));
+            let need_view = made.listed.cbv_direct == 0
+                && effective_kind.is_some_and(|k| {
+                    !(k == victory_shader::native::ResourceType::Srv
+                        && made.listed.ready.0 == epoch
+                        && made.listed.ready.1 == tested_depth)
+                });
+            let view = need_view.then(|| made.view.clone());
+            Some((made.listed, view))
         })
     }
 
@@ -3277,16 +3333,26 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's), avoiding
     /// COM `AddRef`/`Release` when the slot already holds the same resource.
+    /// For exclusively-owned dynamic slots (`index >= self.count`), checks the
+    /// raw pointer mirror lock-free before touching the slot Mutex.
     fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
-        let Some(slot) = self.kept.get(index as usize) else {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::core::Interface;
+        let idx = index as usize;
+        let Some(slot) = self.kept.get(idx) else {
             return;
         };
+        let want_raw = resource.map_or(0usize, |r| r.as_raw() as usize);
+        if index >= self.count && self.kept_raw[idx].load(Relaxed) == want_raw {
+            return;
+        }
         let old = {
-            use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-            if slot.as_ref().map(Interface::as_raw) == resource.map(Interface::as_raw) {
+            if slot.as_ref().map_or(0usize, |r| r.as_raw() as usize) == want_raw {
+                self.kept_raw[idx].store(want_raw, Relaxed);
                 return;
             }
+            self.kept_raw[idx].store(want_raw, Relaxed);
             std::mem::replace(&mut *slot, resource.cloned())
         };
         if let Some(old) = old {
@@ -3296,16 +3362,24 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
-        let Some(slot) = self.kept.get(index as usize) else {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::core::Interface;
+        let idx = index as usize;
+        let Some(slot) = self.kept.get(idx) else {
             return;
         };
+        let want_raw = resource.as_ref().map_or(0usize, |r| r.as_raw() as usize);
+        if index >= self.count && self.kept_raw[idx].load(Relaxed) == want_raw {
+            return;
+        }
         let old = {
-            use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             // The same again: nothing to retire.
-            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
+            if slot.as_ref().map_or(0usize, |r| r.as_raw() as usize) == want_raw {
+                self.kept_raw[idx].store(want_raw, Relaxed);
                 return;
             }
+            self.kept_raw[idx].store(want_raw, Relaxed);
             std::mem::replace(&mut *slot, resource)
         };
         // A running submission may still read the old resource through
@@ -6879,6 +6953,7 @@ impl ListViews {
         }
     }
 
+    #[allow(dead_code)]
     fn slot(&self, i: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         debug_assert!(i < Self::SLOTS && !windows::core::Interface::as_raw(&self.heap).is_null());
         D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start + i as usize * self.step }
@@ -6890,6 +6965,7 @@ thread_local! {
 }
 
 /// The view the record `words` names, as this thread made it for `recording`.
+#[allow(dead_code)]
 pub(crate) fn listed_view(recording: u64, words: [u32; 3]) -> Option<View> {
     LIST_VIEWS.with(|views| {
         let views = views.borrow();
