@@ -15,7 +15,8 @@ const MAX_FILE_SIZE: usize = 640 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
-    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd",
+    "bat", "sh",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -236,6 +237,8 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+        assert!(check("presets/4_Safe_Mode_8GB_12GB_VRAM.bat", b"@echo off\n").is_empty());
+        assert!(check(".github/ISSUE_TEMPLATE/bug_report.yml", b"name: Bug Report\n").is_empty());
     }
 
     #[test]

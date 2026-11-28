@@ -1,0 +1,84 @@
+name: Bug Report / Performance Issue
+description: Report a crash, black screen, visual artifact, or low FPS on AMD RDNA hardware
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting!
+        - **Hardware scope:** RAZDA4A XEN targets **AMD RDNA2 / RDNA3 / RDNA4** GPUs (DX12 Ultimate + Mesh Shaders, 8 GB+ VRAM). NVIDIA GPUs are not supported here (use community NVIDIA forks instead).
+        - **Logs:** Run `collect_logs.bat` (or click **Export Bug Report** in the launcher) to generate a sanitized `bug_report_*.txt` with your hardware summary and `logs\last_run.log` — no private paths included.
+        - **Asset policy:** Never attach or link proprietary files, dumps, executables, or shaders.
+
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware & OS
+      description: CPU, GPU (exact VRAM size), System RAM, OS build, Storage (NVMe / SATA SSD / HDD), Pagefile size
+      placeholder: "Ryzen 5 5600 | RX 6600 8 GB | 16 GB DDR4 | Windows 10 19045 | NVMe | 32 GB pagefile"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: profile
+    attributes:
+      label: Launch Profile / Preset
+      options:
+        - "RAZDA4A XEN.bat — Balanced (Default)"
+        - "RAZDA4A XEN.bat — Safe Mode (8-12 GB VRAM)"
+        - "RAZDA4A XEN.bat — Low-Commit NVMe"
+        - "RAZDA4A XEN.bat — Max FPS Experimental (PORT_CBV)"
+        - "presets/1_Low_Commit_NVMe_16GB.bat"
+        - "presets/2_Max_FPS_Experimental_CBV.bat"
+        - "presets/3_Native_No_FG_Zero_Latency.bat"
+        - "presets/4_Safe_Mode_8GB_12GB_VRAM.bat"
+        - "launch_linux_proton.sh (Linux / Proton / VKD3D)"
+        - "Custom / Built from dev source"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: framegen
+    attributes:
+      label: Frame Generation & Launch Count
+      options:
+        - "Frame Gen OFF (Native) — 1st launch (cold shader cache)"
+        - "Frame Gen OFF (Native) — 2nd+ launch (warm cache)"
+        - "Frame Gen ON (FSR 3.1.6) — 1st launch (cold shader cache)"
+        - "Frame Gen ON (FSR 3.1.6) — 2nd+ launch (warm cache)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Issue Category
+      options:
+        - "Crash on startup / Press 'A' crash"
+        - "Black screen / hang after menu"
+        - "Out of Memory (0x8007000E) / Device Removed"
+        - "Low FPS / heavy stutters (specify Native vs FG FPS below)"
+        - "Visual / texture / shader glitch"
+        - "Linux / Proton / VKD3D issue"
+        - "Launcher / preset / installation issue"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Include the scene (title menu / prison / boat / open world / city), Native FPS (FG OFF) vs Displayed FPS (FG ON) if applicable, and steps to reproduce.
+      placeholder: "Describe what happened and when..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (`collect_logs.bat` output or last ~100 lines of `logs\last_run.log`)
+      description: Paste or drag-and-drop `bug_report_*.txt` / `logs\last_run.log`.
+      render: text
+    validations:
+      required: false

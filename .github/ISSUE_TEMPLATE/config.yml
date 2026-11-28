@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: FAQ, Linux Quickstart & Compatibility Matrix (README)
+    url: https://github.com/crossducking/RAZDA4A-XEN#readme
+    about: Check AMD RDNA2/3/4 requirements, 8 GB Safe Mode, Linux/Proton quickstart, and antivirus SHA-256 verification before opening an issue.
+  - name: Looking for NVIDIA GPU support?
+    url: https://github.com/trustno1-coder/VIctory-NVIDIA
+    about: RAZDA4A XEN targets AMD RDNA GPUs only. NVIDIA RTX users should use community NVIDIA forks.
